@@ -1,0 +1,14 @@
+[Unit]
+Description=Didier Orchestrator
+After=network.target
+
+[Service]
+User=tchernobog
+WorkingDirectory=/home/tchernobog/Didier
+Environment=PATH=/home/tchernobog/Didier/venv/bin
+ExecStart=/home/tchernobog/Didier/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,76 @@
+# Fichier docker-compose pour l'orchestrateur Didier et ses services.
+# Inspiré par une architecture robuste et persistante de type OctoBot.
+# Taux de remplissage des disques (df -h) : / 138GO/229GO, /mnt/didier_ssd 0GO/916GO
+
+services:
+  # Service 1: Le cerveau de Didier, l'orchestrateur applicatif.
+  didier-brain:
+    build: .
+    container_name: didier-brain
+    restart: unless-stopped
+
+    # network_mode: host est crucial ici. Il supprime l'isolation réseau entre
+    # le conteneur et l'hôte, donnant à Didier un accès direct aux services
+    # de l'hôte (comme PulseAudio/PipeWire) et simplifiant la découverte Bluetooth.
+    network_mode: "host"
+    
+    # Privileged est souvent nécessaire pour un accès bas niveau au matériel
+    # depuis un conteneur, notamment pour certains périphériques /dev.
+    privileged: true
+    pid: "host"
+    group_add:
+      - "44"
+      - "992"
+
+    environment:
+      - PULSE_SERVER=unix:/run/user/1000/pulse/native
+
+    volumes:
+      # --- Persistance des données et du code ---
+      # Le mapping du répertoire courant permet de voir les modifications du code en direct.
+      - /mnt/didier_ssd/didier/code:/app
+      # Mapping des dossiers de configuration, de voix, et de logs.
+      - /mnt/didier_ssd/didier/code/config:/app/config
+      - /mnt/didier_ssd/didier/models/tts:/app/voices
+      - /mnt/didier_ssd/didier/models/hailo:/app/models/hailo
+      - /mnt/didier_ssd/didier/models/vision:/app/models/vision
+      - /mnt/didier_ssd/didier/logs:/app/logs
+      # Accès en lecture seule au FS hôte pour les métriques disques réelles.
+      - /:/host:ro
+      
+      # --- Bridge Audio & Bluetooth ---
+      # Partage du socket PulseAudio de l'utilisateur hôte (ID 1000)
+      # pour que paplay dans le conteneur puisse parler à la Soundboks via l'hôte.
+      - /run/user/1000/pulse:/run/user/1000/pulse
+      - /var/run/dbus:/var/run/dbus
+      
+    devices:
+      # --- Mapping du matériel ---
+      - /dev/video1:/dev/video1    # Caméra PS3 Eye
+      - /dev/hailo0:/dev/hailo0    # NPU Hailo-8L
+      - /dev/snd:/dev/snd          # Périphérique son
+      
+  # Service 2: Le modèle de langage local, Ollama.
+  ollama:
+    image: ollama/ollama
+    container_name: ollama
+    restart: unless-stopped
+    network_mode: "host"
+    # ports:
+    #   # Exposition du port standard d'Ollama sur l'hôte.
+    #   - "11434:11434"
+    volumes:
+      # Persistance des modèles téléchargés par Ollama.
+      - /mnt/didier_ssd/didier/ollama:/root/.ollama
+
+  reverse-proxy:
+    image: nginx:alpine
+    container_name: didier-proxy
+    restart: unless-stopped
+    network_mode: "host"
+    depends_on:
+      - didier-brain
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./cert.pem:/etc/nginx/certs/cert.pem:ro
+      - ./key.pem:/etc/nginx/certs/key.pem:ro

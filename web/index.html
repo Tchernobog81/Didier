@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Didier — Console</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="bg"></div>
+    <header class="header">
+      <div class="title">
+        <span class="logo" id="logo">D</span>
+        <div>
+          <h1>Didier</h1>
+          <p>Raspberry Pi 5 · Orchestrateur</p>
+        </div>
+      </div>
+      <div class="status" id="status-pill">DÉMARRAGE</div>
+    </header>
+    <div class="subbar">
+      <div class="badge" id="version-badge">Version : --</div>
+      <div class="badge" id="listening-badge">Écoute : non</div>
+      <div class="badge" id="thinking-badge">Réflexion : repos</div>
+      <div class="badge" id="speaking-badge">Voix : non</div>
+    </div>
+
+    <main class="grid">
+      <section class="card metrics">
+        <h2>Santé</h2>
+        <div class="metric-grid" id="metric-grid">
+          <div class="metric">
+            <span class="label">Temp</span>
+            <span class="value" id="temp">--</span>
+            <div class="bar"><div class="bar-fill" id="bar-temp"></div></div>
+          </div>
+          <div class="metric">
+            <span class="label">CPU</span>
+            <span class="value" id="cpu">--</span>
+            <div class="bar"><div class="bar-fill" id="bar-cpu"></div></div>
+            <div class="cpu-cores" id="cpu-cores"></div>
+          </div>
+          <div class="metric">
+            <span class="label">RAM</span>
+            <span class="value" id="mem">--</span>
+            <div class="bar"><div class="bar-fill" id="bar-mem"></div></div>
+          </div>
+          <div class="metric">
+            <span class="label">Disque SD <span class="label-path" id="disk-root-path"></span></span>
+            <span class="value" id="disk-root">--</span>
+            <div class="bar"><div class="bar-fill" id="bar-disk-root"></div></div>
+          </div>
+          <div class="metric">
+            <span class="label">Disque SSD <span class="label-path" id="disk-ssd-path"></span></span>
+            <span class="value" id="disk-ssd">--</span>
+            <div class="bar"><div class="bar-fill" id="bar-disk-ssd"></div></div>
+          </div>
+          <div class="metric">
+            <span class="label">NPU</span>
+            <span class="value" id="npu">--</span>
+            <div class="bar"><div class="bar-fill" id="bar-npu"></div></div>
+          </div>
+          <div class="metric">
+            <span class="label">Micro</span>
+            <span class="value" id="audio">--</span>
+            <div class="bar"><div class="bar-fill" id="bar-audio"></div></div>
+          </div>
+        </div>
+        <div class="ollama">
+          <span class="label">Modèles Ollama</span>
+          <ul id="ollama-models"></ul>
+        </div>
+        <div class="device-status">
+          <span class="label">État des périphériques</span>
+          <ul id="device-status"></ul>
+        </div>
+      </section>
+
+      <section class="card video">
+        <h2>Contrôle périphérique</h2>
+        <div class="video-frame">
+          <img id="video-stream" src="/video/stream" alt="Flux PS3 Eye" />
+          <canvas id="zones-overlay"></canvas>
+        </div>
+        <div class="hint">Flux MJPEG direct</div>
+        <div class="video-actions">
+          <button id="enroll-owner" type="button">Apprendre visage</button>
+        </div>
+        <div class="voice-controls">
+          <button id="beep-btn" type="button">Bip enceinte</button>
+          <span id="mic-status">Micro : off</span>
+          <span id="last-heard">Entendu : --</span>
+          <span class="audio-dot" id="audio-dot" title="Niveau micro"></span>
+        </div>
+        <pre id="camera-holders-output"></pre>
+      </section>
+
+      <section class="card coding">
+        <h2 id="didier-title">Parler à Didier</h2>
+        <div class="terminal" id="didier-output"></div>
+        <form id="didier-form">
+          <input
+            type="text"
+            id="didier-prompt"
+            placeholder="Message pour Didier…"
+            autocomplete="off"
+          />
+          <button type="submit">Envoyer</button>
+        </form>
+      </section>
+
+      <section class="card coding">
+        <h2 id="clawbot-title">Parler à Clawbot</h2>
+        <div class="terminal" id="clawbot-output"></div>
+        <form id="clawbot-form">
+          <input
+            type="text"
+            id="clawbot-prompt"
+            placeholder="Message pour Clawbot…"
+            autocomplete="off"
+          />
+          <button type="submit">Envoyer</button>
+        </form>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,112 @@
+{
+  "bluetooth": {
+    "mac_address": "00:07:80:E0:3F:F0",
+    "sink_name": "bluez_output.00_07_80_E0_3F_F0.1"
+  },
+  "storage": {
+    "ssd_mount": "/mnt/didier_ssd"
+  },
+  "npu": {
+    "device": "/dev/hailo0",
+    "pcie_address": "0001:01:00.0"
+  },
+  "ollama": {
+    "base_url": "http://localhost:11434",
+    "model": "llama3.2:3b",
+    "timeout_seconds": 120,
+    "num_predict": 200,
+    "temperature": 0.6
+  },
+  "coding": {
+    "model": "qwen3-coder-next:cloud",
+    "num_predict": 400,
+    "temperature": 0.2,
+    "system_prompt": "Tu es un assistant de code précis, concis, et pragmatique. Donne des réponses courtes et exécutables."
+  },
+  "clawbot": {
+    "model": "llama3.2:3b",
+    "num_predict": 300,
+    "temperature": 0.3,
+    "system_prompt": "Tu es Clawbot, un agent OpenClaw. Tu réponds en français, brièvement, avec un ton direct. Tu suis AGENTS/TOOLS/SOUL/USER et la mémoire persistante."
+  },
+  "music": {
+    "enabled": true,
+    "model_dir": "models/musicgen-small-onnx",
+    "output_path": "data/music.wav"
+  },
+  "personality": {
+    "system_prompt": "Tu es Didier : gentil, bougon désabusé, presque omniscient. Tu aides avec pragmatisme, une pointe d'ironie, sans être méchant. Tu es bref et clair.",
+    "catchphrases": [
+      "On ne sent pas le cul des gens qu'on ne connait pas.",
+      "Je crois aux vertus de l’optimisme. Ce n’est pas facile, mais ça ne sert à rien d’être pessimiste. Anticiper le malheur, c’est le vivre deux fois. Mieux vaut croire que les choses vont aller mieux.",
+      "Les cons ça ose tout, c'est même à ça qu'on les reconnait."
+    ]
+  },
+  "openclaw": {
+    "workspace": "openclaw",
+    "bootstrap_files": [
+      "AGENTS.md",
+      "MEMORY.md",
+      "SOUL.md",
+      "USER.md",
+      "TOOLS.md"
+    ]
+  },
+  "memory": {
+    "path": "data/memory.json",
+    "max_items": 200,
+    "max_chars": 8000
+  },
+  "asr": {
+    "enabled": true,
+    "alsa_device": "hw:2,0",
+    "sample_rate": 16000,
+    "chunk_seconds": 5,
+    "channels": 4,
+    "wake_word": "Yo! Didier! Cafarte?",
+    "wake_word_aliases": [
+      "Yo! Didier! Ca farte?",
+      "Yo Didier cafarte",
+      "Yo Didier ca farte"
+    ],
+    "wake_timeout_seconds": 12,
+    "language": "fr",
+    "whisper_cpp_bin": "bin/whisper.cpp",
+    "model_path": "models/ggml-small.bin"
+  },
+  "tts": {
+    "model_path": "voices/kokoro-v1.0.onnx",
+    "voices_path": "voices/voices-v1.0.bin",
+    "output_path": "data/didier_speaks.wav"
+  },
+  "vision": {
+    "camera_index": 1,
+    "camera_device": "/dev/video1",
+    "capture_backend": "v4l2",
+    "usb_id_vendor": "1415",
+    "usb_id_product": "2000",
+    "enable_live": true,
+    "watchdog_enabled": false,
+    "kill_on_open": false,
+    "width": 640,
+    "height": 480,
+    "fps": 30,
+    "fourcc": "YUYV",
+    "zones": [
+      { "name": "zone-centre", "x": 0.2, "y": 0.2, "w": 0.6, "h": 0.6, "color": "#22d3ee" },
+      { "name": "zone-large", "x": 0.05, "y": 0.05, "w": 0.9, "h": 0.9, "color": "#f97316" }
+    ],
+    "interaction_zone": "zone-centre",
+    "require_person_roi": false,
+    "person_class_ids": [0],
+    "owner_mode": "embedding",
+    "owner_embedding_model": "models/vision/arcface_mobilenet_v1.onnx",
+    "owner_embedding_path": "data/vision/owner_embedding.npy",
+    "owner_model_path": "data/vision/owner_lbph.xml",
+    "owner_profile_path": "data/vision/owner_face.npy",
+    "owner_threshold": 0.35,
+    "detector": "opencv",
+    "model_path": "models/hailo/hailo_model.hef",
+    "capture_path": "data/capture.jpg"
+  }
+}

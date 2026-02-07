@@ -1,0 +1,17 @@
+# Framework web
+fastapi
+uvicorn[standard]
+
+# Communication & Utilitaires
+requests
+psutil
+httpx
+
+# Vision par ordinateur
+opencv-contrib-python
+
+# Synthèse vocale (Text-to-Speech)
+kokoro-onnx
+onnxruntime
+soundfile
+numpy==2.2.4
