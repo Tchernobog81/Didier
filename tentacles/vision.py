@@ -83,9 +83,7 @@ class HailoDetector:
             self._output_vstreams_params = OutputVStreamParams.make_from_network_group(
                 self._network_group, quantized=False, format_type=FormatType.FLOAT32
             )
-            self._infer_pipeline = InferVStreams(
-                self._network_group, self._input_vstreams_params, self._output_vstreams_params
-            )
+            self._infer_pipeline = None
             self._ready = True
             self._logger.info(
                 "Hailo detector initialized (input=%s, shape=%s).",
@@ -98,15 +96,22 @@ class HailoDetector:
     def detect(self, frame: Any) -> List[dict]:
         if not self._ready:
             return []
-        if self._infer_pipeline is None or self._network_group is None:
+        if (
+            self._network_group is None
+            or self._input_vstreams_params is None
+            or self._output_vstreams_params is None
+        ):
             return []
         try:
             input_tensor = self._preprocess(frame)
             if input_tensor is None:
                 return []
             inputs = {self._input_name: input_tensor} if self._input_name else input_tensor
-            with self._network_group.activate(self._network_group_params):
-                outputs = self._infer_pipeline.infer(inputs)
+            infer_pipeline = InferVStreams(
+                self._network_group, self._input_vstreams_params, self._output_vstreams_params
+            )
+            with infer_pipeline as infer:
+                outputs = infer.infer(inputs)
             if not self._output_shapes_logged:
                 self._log_output_shapes(outputs)
                 self._output_shapes_logged = True
@@ -364,6 +369,11 @@ class OpenCVShapeDetector:
                         "label": shape,
                         "confidence": None,
                         "bbox": [int(x), int(y), int(w), int(h)],
+                        "poly": [
+                            [int(pt[0][0]), int(pt[0][1])]
+                            for pt in approx
+                            if pt is not None and len(pt) > 0
+                        ],
                         "class_id": None,
                     }
                 )
@@ -408,6 +418,18 @@ class Tentacle(BaseTentacle):
             self._person_class_ids = {int(x) for x in person_ids}
         except Exception:
             self._person_class_ids = {0}
+        self._labels_path = Path(
+            self.config.get("vision.labels_path", "models/vision/coco.names")
+        )
+        self._class_labels = self._load_class_labels()
+        self._polygon_refine = bool(self.config.get("vision.polygon_refine", False))
+        self._polygon_refine_max = int(self.config.get("vision.polygon_refine_max", 3))
+        self._polygon_refine_epsilon = float(
+            self.config.get("vision.polygon_refine_epsilon", 0.02)
+        )
+        self._polygon_refine_min_area = int(
+            self.config.get("vision.polygon_refine_min_area", 120)
+        )
         self._owner_mode = str(self.config.get("vision.owner_mode", "lbph")).lower()
         self._owner_profile_path = Path(
             self.config.get("vision.owner_profile_path", "data/vision/owner_face.npy")
@@ -450,6 +472,15 @@ class Tentacle(BaseTentacle):
         if detector.ready:
             return detector
         return OpenCVShapeDetector(self._logger)
+
+    def _load_class_labels(self) -> list[str]:
+        try:
+            if not self._labels_path.exists():
+                return []
+            lines = self._labels_path.read_text(encoding="utf-8").splitlines()
+            return [line.strip() for line in lines if line.strip()]
+        except Exception:
+            return []
 
     def _load_owner_profile(self) -> np.ndarray | None:
         try:
@@ -591,11 +622,13 @@ class Tentacle(BaseTentacle):
         device = self._camera_device or f"/dev/video{self._camera_index}"
         width = int(self._width or 640)
         height = int(self._height or 480)
+        fourcc = (self._fourcc or "YUYV").upper()
         expected = width * height * 2
         cmd = [
             "v4l2-ctl",
             "-d",
             str(device),
+            f"--set-fmt-video=width={width},height={height},pixelformat={fourcc}",
             "--stream-mmap",
             "--stream-count=1",
             "--stream-to=-",
@@ -798,6 +831,102 @@ class Tentacle(BaseTentacle):
         self._last_detections = detections
         self._last_ts = time.time()
 
+    def _tag_detections(self, detections: List[dict], frame: Any | None = None) -> List[dict]:
+        tagged: List[dict] = []
+        refined = 0
+        for det in detections:
+            try:
+                class_id = det.get("class_id")
+                label = det.get("label")
+                if class_id is not None and self._class_labels:
+                    idx = int(class_id)
+                    if 0 <= idx < len(self._class_labels):
+                        label = self._class_labels[idx]
+                if class_id is not None and class_id in self._person_class_ids:
+                    label = "personne"
+                if not label:
+                    label = "objet"
+                det["label"] = label
+            except Exception:
+                pass
+            if (
+                frame is not None
+                and self._polygon_refine
+                and refined < self._polygon_refine_max
+            ):
+                if self._refine_polygon(frame, det):
+                    refined += 1
+            self._ensure_polygon(det)
+            tagged.append(det)
+        return tagged
+
+    def _ensure_polygon(self, det: dict) -> None:
+        if det.get("poly"):
+            return
+        bbox = det.get("bbox")
+        if not bbox or len(bbox) < 4:
+            return
+        try:
+            x, y, w, h = (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))
+        except Exception:
+            return
+        det["poly"] = [
+            [x, y],
+            [x + w, y],
+            [x + w, y + h],
+            [x, y + h],
+        ]
+
+    def _refine_polygon(self, frame: Any, det: dict) -> bool:
+        bbox = det.get("bbox")
+        if not bbox or len(bbox) < 4:
+            return False
+        try:
+            x, y, w, h = (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))
+        except Exception:
+            return False
+        if w <= 0 or h <= 0:
+            return False
+        if w * h < self._polygon_refine_min_area:
+            return False
+        frame_h, frame_w = frame.shape[:2]
+        x0 = max(0, min(frame_w - 1, x))
+        y0 = max(0, min(frame_h - 1, y))
+        x1 = max(0, min(frame_w, x + w))
+        y1 = max(0, min(frame_h, y + h))
+        if x1 <= x0 or y1 <= y0:
+            return False
+        roi = frame[y0:y1, x0:x1]
+        if roi.size == 0:
+            return False
+        try:
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+            edges = cv2.Canny(blurred, 50, 150)
+            contours, _ = cv2.findContours(
+                edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            if not contours:
+                return False
+            contour = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(contour) < self._polygon_refine_min_area:
+                return False
+            epsilon = self._polygon_refine_epsilon * cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, epsilon, True)
+            if approx is None or len(approx) < 3:
+                return False
+            poly = [
+                [int(x0 + pt[0][0]), int(y0 + pt[0][1])]
+                for pt in approx
+                if pt is not None and len(pt) > 0
+            ]
+            if len(poly) < 3:
+                return False
+            det["poly"] = poly
+            return True
+        except Exception:
+            return False
+
     def _update_stream_frame(self, frame: Any) -> None:
         try:
             ok, buffer = cv2.imencode(".jpg", frame)
@@ -813,12 +942,41 @@ class Tentacle(BaseTentacle):
         with self._jpeg_lock:
             return self._last_jpeg
 
+    def _build_gstreamer_pipeline(self) -> str | None:
+        if not self._camera_device and self._camera_index is None:
+            return None
+        device = self._camera_device or f"/dev/video{self._camera_index}"
+        width = int(self._width or 640)
+        height = int(self._height or 480)
+        fps = int(self._fps or 30)
+        fourcc = (self._fourcc or "YUYV").upper()
+        if fourcc == "YUYV":
+            fourcc = "YUY2"
+        return (
+            f"v4l2src device={device} "
+            f"! video/x-raw,format={fourcc},width={width},height={height},framerate={fps}/1 "
+            "! videoconvert ! appsink"
+        )
+
     def _open_camera(self) -> cv2.VideoCapture:
         source = self._camera_device if self._camera_device else self._camera_index
-        cap = cv2.VideoCapture(source, cv2.CAP_V4L2)
+        if self._capture_backend == "gstreamer":
+            gst = self._build_gstreamer_pipeline()
+            if gst:
+                cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
+            else:
+                cap = cv2.VideoCapture(source, cv2.CAP_V4L2)
+        else:
+            cap = cv2.VideoCapture(source, cv2.CAP_V4L2)
         if not cap.isOpened() and self._camera_device:
             cap.release()
             cap = cv2.VideoCapture(self._camera_index, cv2.CAP_V4L2)
+        if not cap.isOpened():
+            cap.release()
+            gst = self._build_gstreamer_pipeline()
+            if gst:
+                self._logger.warning("OpenCV V4L2 failed; trying GStreamer pipeline.")
+                cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
         if self._fourcc:
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*self._fourcc))
         if self._width:
@@ -844,6 +1002,7 @@ class Tentacle(BaseTentacle):
             "model": model_name,
             "ready": bool(getattr(self._detector, "ready", False)),
             "last_ts": self._last_ts,
+            "last_frame_ts": self._last_frame_ts,
             "last_count": len(self._last_detections),
             "last_error": self._last_error,
             "npu_load": self._last_npu_load,
@@ -866,20 +1025,53 @@ class Tentacle(BaseTentacle):
                 use_fallback = True
 
         try:
+            failures = 0
+            fallback_failures = 0
             while not self.stop_event.is_set():
                 if use_fallback:
                     frame = await asyncio.to_thread(self._capture_frame_v4l2)
                     if frame is None:
-                        await asyncio.sleep(0.05)
+                        fallback_failures += 1
+                        if fallback_failures >= 8:
+                            self._logger.warning(
+                                "v4l2 capture failing; trying to reopen camera."
+                            )
+                            fallback_failures = 0
+                            try:
+                                cap = self._open_camera()
+                                if cap.isOpened():
+                                    use_fallback = False
+                            except Exception:
+                                cap = None
+                        await asyncio.sleep(0.08)
                         continue
+                    fallback_failures = 0
                 else:
                     ret, frame = await asyncio.to_thread(cap.read)
                     if not ret:
+                        failures += 1
+                        if failures >= 8:
+                            self._logger.warning("Camera read failed; reopening stream.")
+                            failures = 0
+                            try:
+                                cap.release()
+                            except Exception:
+                                pass
+                            cap = self._open_camera()
+                            if not cap.isOpened():
+                                self._logger.warning(
+                                    "OpenCV reopen failed; switching to v4l2."
+                                )
+                                cap.release()
+                                cap = None
+                                use_fallback = True
                         await asyncio.sleep(0.05)
                         continue
+                    failures = 0
                 self._last_frame_shape = frame.shape[:2]
                 await asyncio.to_thread(self._update_stream_frame, frame)
                 detections = await asyncio.to_thread(self._detector.detect, frame)
+                detections = self._tag_detections(detections, frame)
                 self._store_detections(detections)
                 now = time.time()
                 if (
@@ -922,6 +1114,7 @@ class Tentacle(BaseTentacle):
                     raise RuntimeError("Failed to capture frame")
             self._last_frame_shape = frame.shape[:2]
             detections = await asyncio.to_thread(self._detector.detect, frame)
+            detections = self._tag_detections(detections, frame)
             self._store_detections(detections)
             return {
                 "detections": detections,
@@ -957,6 +1150,20 @@ class Tentacle(BaseTentacle):
             if cap is not None:
                 cap.release()
         return str(image_path)
+
+    def get_latest_detections(self) -> dict[str, Any]:
+        width = None
+        height = None
+        if self._last_frame_shape:
+            height, width = self._last_frame_shape
+        elif self._width and self._height:
+            width, height = int(self._width), int(self._height)
+        return {
+            "detections": list(self._last_detections),
+            "frame": {"width": width, "height": height},
+            "ts": self._last_ts,
+            "status": self.get_status(),
+        }
 
     def person_in_roi(self) -> bool:
         if not self._last_detections:

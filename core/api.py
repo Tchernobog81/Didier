@@ -1,5 +1,5 @@
 import asyncio
-import audioop
+import base64
 import json
 import logging
 import os
@@ -14,6 +14,7 @@ import cv2
 import psutil
 import shutil
 import soundfile as sf
+import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -37,6 +38,159 @@ _AUDIO_CACHE_LOCK = threading.Lock()
 _NPU_CACHE: dict[str, Any] = {"ts": 0.0, "active": None, "util": None}
 _NPU_CACHE_LOCK = threading.Lock()
 _VIDEO_LOCK = threading.Lock()
+try:
+    import audioop  # type: ignore
+except Exception:  # pragma: no cover
+    audioop = None
+
+_VISION_TAGS_PATH = Path("data/vision/tags.json")
+_DOCKER_ROOT_CACHE: dict[str, Any] = {"path": None, "ts": 0.0}
+
+
+def _get_docker_root() -> Path:
+    cached = _DOCKER_ROOT_CACHE.get("path")
+    if cached and (time.time() - float(_DOCKER_ROOT_CACHE.get("ts", 0.0)) < 10):
+        return Path(cached)
+    default_root = Path("/host/var/lib/docker")
+    daemon_path = Path("/host/etc/docker/daemon.json")
+    docker_root = default_root
+    if daemon_path.exists():
+        try:
+            data = json.loads(daemon_path.read_text(encoding="utf-8"))
+            root = data.get("data-root") if isinstance(data, dict) else None
+            if root:
+                docker_root = Path("/host") / str(root).lstrip("/")
+        except Exception:
+            docker_root = default_root
+    _DOCKER_ROOT_CACHE["path"] = str(docker_root)
+    _DOCKER_ROOT_CACHE["ts"] = time.time()
+    return docker_root
+
+
+def _read_docker_containers() -> list[dict[str, Any]]:
+    containers: list[dict[str, Any]] = []
+    containers_dir = _get_docker_root() / "containers"
+    if not containers_dir.exists():
+        return containers
+    for cfg_path in containers_dir.glob("*/config.v2.json"):
+        try:
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        name = str(data.get("Name") or "").lstrip("/")
+        state = data.get("State") if isinstance(data.get("State"), dict) else {}
+        status = state.get("Status") if isinstance(state, dict) else None
+        if not status and isinstance(state, dict):
+            if state.get("Running") is True:
+                status = "running"
+        config = data.get("Config") if isinstance(data.get("Config"), dict) else {}
+        labels = config.get("Labels") if isinstance(config.get("Labels"), dict) else {}
+        service = labels.get("com.docker.compose.service") if labels else None
+        image = config.get("Image") or data.get("Image") or None
+        containers.append(
+            {
+                "id": data.get("ID"),
+                "name": name or service or "inconnu",
+                "service": service,
+                "status": status,
+                "image": image,
+            }
+        )
+    containers.sort(key=lambda item: str(item.get("name", "")))
+    return containers
+
+
+def _search_repo_files(query: str, limit: int = 40) -> list[dict[str, Any]]:
+    query = query.strip().lower()
+    if len(query) < 2:
+        return []
+    root = Path(".").resolve()
+    ignored = {
+        ".git",
+        ".deps",
+        "__pycache__",
+        "venv",
+        "node_modules",
+        "models",
+        "logs",
+        "data",
+        "ollama",
+        "voices",
+    }
+    results: list[dict[str, Any]] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in ignored and not d.startswith(".")]
+        for filename in filenames:
+            if filename.startswith("."):
+                continue
+            rel_path = str(Path(dirpath, filename).relative_to(root))
+            if query not in filename.lower() and query not in rel_path.lower():
+                continue
+            try:
+                size = (Path(dirpath) / filename).stat().st_size
+            except Exception:
+                size = None
+            results.append({"path": rel_path, "size": size})
+            if len(results) >= limit:
+                return results
+    return results
+
+
+def _load_vision_tags() -> dict[str, str]:
+    if not _VISION_TAGS_PATH.exists():
+        return {}
+    try:
+        data = json.loads(_VISION_TAGS_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return {str(k): str(v) for k, v in data.items() if v is not None}
+    except Exception:
+        return {}
+    return {}
+
+
+def _save_vision_tags(tags: dict[str, str]) -> None:
+    _VISION_TAGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _VISION_TAGS_PATH.write_text(
+        json.dumps(tags, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+async def _warmup_ollama() -> None:
+    try:
+        orchestrator = _require_orchestrator()
+        config = orchestrator.config
+        base_url = config.get("ollama.base_url", "http://localhost:11434")
+        model = config.get("ollama.model", "")
+        if not model:
+            return
+        payload: dict[str, Any] = {
+            "model": model,
+            "prompt": "Bonjour.",
+            "stream": False,
+            "options": {"num_predict": 1, "temperature": 0.2},
+        }
+        keep_alive = config.get("ollama.keep_alive", None)
+        if keep_alive:
+            payload["keep_alive"] = keep_alive
+        import httpx
+
+        async with httpx.AsyncClient(timeout=90) as client:
+            await client.post(f"{base_url}/api/generate", json=payload)
+    except Exception as exc:
+        logging.getLogger("API").warning("Ollama warmup failed: %s", exc)
+
+
+def _rms_pcm16(data: bytes) -> int:
+    if not data:
+        return 0
+    try:
+        samples = np.frombuffer(data, dtype=np.int16)
+        if samples.size == 0:
+            return 0
+        return int(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
+    except Exception:
+        return 0
 
 
 def _is_music_prompt(prompt: str) -> bool:
@@ -47,6 +201,33 @@ def _is_music_prompt(prompt: str) -> bool:
     return any(token in lowered for token in triggers)
 
 
+def _resolve_expert_prompt(
+    prompt: str, config: Any
+) -> tuple[str, str | None, str | None, str | None]:
+    experts = config.get("ollama.experts", {}) if config else {}
+    if not isinstance(experts, dict):
+        return prompt, None, None, None
+    raw = prompt.strip()
+    lowered = raw.lower()
+    for name, entry in experts.items():
+        if not isinstance(entry, dict):
+            continue
+        key = str(name).strip()
+        if not key:
+            continue
+        key_lower = key.lower()
+        if lowered.startswith(f"@{key_lower}"):
+            cleaned = raw[len(key) + 1 :].lstrip(" :")
+        elif lowered.startswith(f"{key_lower}:") or lowered.startswith(f"{key_lower} "):
+            cleaned = raw[len(key) :].lstrip(" :")
+        else:
+            continue
+        model = entry.get("model", None)
+        system_prompt = entry.get("system_prompt", None)
+        return cleaned if cleaned else raw, model, system_prompt, key
+    return prompt, None, None, None
+
+
 @app.on_event("startup")
 async def startup_event() -> None:
     setup_logging()
@@ -55,6 +236,7 @@ async def startup_event() -> None:
     await _orchestrator.start()
     global _camera_watchdog_task
     _camera_watchdog_task = asyncio.create_task(_camera_watchdog())
+    asyncio.create_task(_warmup_ollama())
     logging.getLogger("API").info("Didier API started.")
 
 
@@ -262,7 +444,10 @@ def _read_mic_level(
         if not data:
             level_percent = 0
         else:
-            rms = audioop.rms(data, 2)
+            if audioop:
+                rms = audioop.rms(data, 2)
+            else:
+                rms = _rms_pcm16(data)
             level_percent = int(min(100, max(0, (rms / 32768) * 100)))
         with _AUDIO_CACHE_LOCK:
             _AUDIO_CACHE["ts"] = time.time()
@@ -650,7 +835,27 @@ async def device_status() -> dict[str, Any]:
     didier_model = orchestrator.config.get("ollama.model", None)
     clawbot_model = orchestrator.config.get("clawbot.model", None)
 
-    camera = await asyncio.to_thread(_check_camera, camera_index, camera_device)
+    vision = orchestrator.get_tentacle("vision")
+    camera = None
+    if vision and hasattr(vision, "get_status"):
+        try:
+            status = vision.get_status()
+            last_frame_ts = status.get("last_frame_ts")
+            now = time.time()
+            age = now - last_frame_ts if last_frame_ts else None
+            ok = age is not None and age < 3.5
+            camera = {
+                "device": camera_device or f"index:{camera_index}",
+                "opened": bool(ok),
+                "frame": bool(ok),
+                "last_frame_ts": last_frame_ts,
+                "last_frame_age_s": round(age, 2) if age is not None else None,
+                "source": "vision",
+            }
+        except Exception:
+            camera = None
+    if camera is None:
+        camera = await asyncio.to_thread(_check_camera, camera_index, camera_device)
     camera_usb = await asyncio.to_thread(_check_camera_usb, vendor, product)
     mic = await asyncio.to_thread(_check_camera_mic)
     sound = await asyncio.to_thread(_check_soundboks_sink, sink)
@@ -671,6 +876,24 @@ async def device_status() -> dict[str, Any]:
             "clawbot": clawbot_model,
         },
     }
+
+
+@app.get("/docker/diagram")
+async def docker_diagram() -> dict[str, Any]:
+    try:
+        containers = _read_docker_containers()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Docker unavailable: {exc}")
+    return {"ts": time.time(), "containers": containers}
+
+
+@app.get("/files/search")
+async def files_search(q: str = "") -> dict[str, Any]:
+    query = str(q or "").strip()
+    if len(query) < 2:
+        return {"results": []}
+    results = await asyncio.to_thread(_search_repo_files, query)
+    return {"results": results}
 
 
 @app.get("/camera/holders")
@@ -915,6 +1138,117 @@ def _mjpeg_generator_v4l2(
             proc.kill()
 
 
+class RemoteMjpegStream:
+    def __init__(self, input_url: str, fps: int = 15) -> None:
+        self._input_url = input_url
+        self._fps = fps
+        self._proc: subprocess.Popen | None = None
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._last_jpeg: bytes | None = None
+        self._last_ts: float = 0.0
+        self._last_error: str | None = None
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        if shutil.which("ffmpeg") is None:
+            self._last_error = "ffmpeg not installed"
+            return
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-fflags",
+            "nobuffer",
+            "-flags",
+            "low_delay",
+            "-i",
+            self._input_url,
+            "-an",
+            "-vf",
+            f"fps={self._fps}",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "mjpeg",
+            "-",
+        ]
+        try:
+            self._proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+        except Exception as exc:
+            self._last_error = str(exc)
+            return
+        buffer = b""
+        try:
+            while not self._stop.is_set():
+                if not self._proc or not self._proc.stdout:
+                    break
+                chunk = self._proc.stdout.read(4096)
+                if not chunk:
+                    break
+                buffer += chunk
+                while True:
+                    start = buffer.find(b"\xff\xd8")
+                    if start == -1:
+                        break
+                    end = buffer.find(b"\xff\xd9", start + 2)
+                    if end == -1:
+                        break
+                    frame = buffer[start : end + 2]
+                    buffer = buffer[end + 2 :]
+                    with self._lock:
+                        self._last_jpeg = frame
+                        self._last_ts = time.time()
+        finally:
+            if self._proc:
+                try:
+                    self._proc.terminate()
+                except Exception:
+                    pass
+                self._proc = None
+
+    def get_last(self) -> tuple[bytes | None, float]:
+        with self._lock:
+            return self._last_jpeg, self._last_ts
+
+
+_REMOTE_STREAM: RemoteMjpegStream | None = None
+_REMOTE_STREAM_LOCK = threading.Lock()
+
+
+def _get_remote_stream(input_url: str, fps: int = 15) -> RemoteMjpegStream:
+    global _REMOTE_STREAM
+    with _REMOTE_STREAM_LOCK:
+        if _REMOTE_STREAM is None or _REMOTE_STREAM._input_url != input_url:
+            _REMOTE_STREAM = RemoteMjpegStream(input_url, fps=fps)
+        _REMOTE_STREAM.start()
+        return _REMOTE_STREAM
+
+
+def _remote_mjpeg_generator(stream: RemoteMjpegStream) -> Generator[bytes, None, None]:
+    last_sent = None
+    while True:
+        frame, _ts = stream.get_last()
+        if frame and frame is not last_sent:
+            last_sent = frame
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+            )
+        else:
+            time.sleep(0.08)
+
+
 @app.get("/video/stream")
 async def video_stream() -> StreamingResponse:
     orchestrator = _require_orchestrator()
@@ -944,6 +1278,25 @@ async def video_stream() -> StreamingResponse:
         _mjpeg_generator(
             camera_device, camera_index, width, height, fps, fourcc, kill_on_open
         ),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+@app.get("/video/stream-secondary")
+async def video_stream_secondary() -> StreamingResponse:
+    orchestrator = _require_orchestrator()
+    cfg = orchestrator.config.get("vision.remote_stream", {}) or {}
+    if not cfg.get("enabled", True):
+        raise HTTPException(status_code=404, detail="secondary stream disabled")
+    input_url = cfg.get("input_url", "udp://0.0.0.0:1234")
+    fps = int(cfg.get("fps", 15))
+    if not input_url:
+        raise HTTPException(status_code=400, detail="input_url required")
+    if shutil.which("ffmpeg") is None:
+        raise HTTPException(status_code=503, detail="ffmpeg not installed")
+    stream = _get_remote_stream(str(input_url), fps=fps)
+    return StreamingResponse(
+        _remote_mjpeg_generator(stream),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
 
@@ -1022,14 +1375,19 @@ async def ask(payload: dict[str, Any]) -> dict[str, Any]:
     brain = orchestrator.get_tentacle("brain")
     if not brain:
         raise HTTPException(status_code=503, detail="brain tentacle not loaded")
+    clean_prompt, expert_model, expert_system, _expert = _resolve_expert_prompt(
+        prompt, orchestrator.config
+    )
     try:
         update_status(
             thinking=True,
             state="THINKING",
-            last_prompt=prompt,
+            last_prompt=clean_prompt,
             last_prompt_at=time.time(),
         )
-        response = await brain.generate(prompt)
+        response = await brain.generate(
+            clean_prompt, model_override=expert_model, system_override=expert_system
+        )
         update_status(
             thinking=False,
             state="IDLE",
@@ -1067,6 +1425,9 @@ async def coding(payload: dict[str, Any]) -> dict[str, Any]:
             "temperature": temperature,
         },
     }
+    keep_alive = orchestrator.config.get("ollama.keep_alive", None)
+    if keep_alive:
+        payload_data["keep_alive"] = keep_alive
     url = f"{base_url}/api/generate"
     try:
         import httpx
@@ -1150,6 +1511,39 @@ async def clawbot(payload: dict[str, Any]) -> dict[str, Any]:
     return {"response": response_text}
 
 
+@app.get("/clawbot/report")
+async def clawbot_report(limit: int = 6) -> dict[str, Any]:
+    orchestrator = _require_orchestrator()
+    config = orchestrator.config
+    report_path = Path(config.get("clawbot.report_path", "data/clawbot_report.json"))
+    limit = max(1, min(50, int(limit)))
+    if not report_path.exists():
+        return {"available": False, "history": []}
+    try:
+        data = json.loads(report_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"available": False, "history": []}
+    history = data.get("history", [])
+    if not isinstance(history, list):
+        history = []
+    if limit:
+        history = history[-limit:]
+    return {"available": True, "history": history}
+
+
+@app.post("/clawbot/veille")
+async def clawbot_veille() -> dict[str, Any]:
+    orchestrator = _require_orchestrator()
+    claw = orchestrator.get_tentacle("clawbot")
+    if not claw or not hasattr(claw, "run_once"):
+        raise HTTPException(status_code=503, detail="clawbot tentacle not ready")
+    try:
+        report = await claw.run_once()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"clawbot veille failed: {exc}")
+    return {"status": "ok", "report": report}
+
+
 @app.get("/ollama/models")
 async def ollama_models() -> dict[str, Any]:
     orchestrator = _require_orchestrator()
@@ -1188,6 +1582,9 @@ async def ask_and_speak(payload: dict[str, Any]) -> dict[str, Any]:
     music = orchestrator.get_tentacle("music")
     if not brain:
         raise HTTPException(status_code=503, detail="brain tentacle not loaded")
+    clean_prompt, expert_model, expert_system, _expert = _resolve_expert_prompt(
+        prompt, orchestrator.config
+    )
     if music and _is_music_prompt(prompt):
         await music.play(prompt)
         response = "Musique lancée."
@@ -1198,10 +1595,12 @@ async def ask_and_speak(payload: dict[str, Any]) -> dict[str, Any]:
         update_status(
             thinking=True,
             state="THINKING",
-            last_prompt=prompt,
+            last_prompt=clean_prompt,
             last_prompt_at=time.time(),
         )
-        response = await brain.generate(prompt)
+        response = await brain.generate(
+            clean_prompt, model_override=expert_model, system_override=expert_system
+        )
         update_status(
             thinking=False,
             last_response=response,
@@ -1229,6 +1628,60 @@ async def capture() -> dict[str, Any]:
         raise HTTPException(status_code=501, detail="capture not supported")
     image_path = await vision.capture_once()
     return {"path": image_path}
+
+
+@app.post("/vision/describe")
+async def vision_describe(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    orchestrator = _require_orchestrator()
+    vision = orchestrator.get_tentacle("vision")
+    if not vision:
+        raise HTTPException(status_code=503, detail="vision tentacle not loaded")
+    config = orchestrator.config
+    prompt = (
+        (payload or {}).get("prompt")
+        or config.get("vision.describe_prompt", "Décris l'image en français.")
+    )
+    model = config.get("vision.describe_model", "moondream:1.8b")
+    num_predict = int(config.get("vision.describe_num_predict", 160))
+    base_url = config.get("ollama.base_url", "http://localhost:11434")
+    img_bytes = None
+    if hasattr(vision, "get_latest_jpeg"):
+        try:
+            img_bytes = vision.get_latest_jpeg()
+        except Exception:
+            img_bytes = None
+    if not img_bytes and hasattr(vision, "capture_once"):
+        try:
+            image_path = await vision.capture_once()
+            img_bytes = Path(image_path).read_bytes()
+        except Exception:
+            img_bytes = None
+    if not img_bytes:
+        raise HTTPException(status_code=503, detail="capture unavailable")
+    img_b64 = base64.b64encode(img_bytes).decode("ascii")
+    payload_data: dict[str, Any] = {
+        "model": model,
+        "prompt": str(prompt),
+        "stream": False,
+        "images": [img_b64],
+        "options": {"num_predict": num_predict, "temperature": 0.2},
+    }
+    keep_alive = config.get("ollama.keep_alive", None)
+    if keep_alive:
+        payload_data["keep_alive"] = keep_alive
+    try:
+        import httpx
+
+        async with httpx.AsyncClient(timeout=120) as client:
+            response = await client.post(f"{base_url}/api/generate", json=payload_data)
+            response.raise_for_status()
+            data = response.json()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Ollama unavailable: {exc}")
+    return {
+        "response": str(data.get("response", "")).strip(),
+        "model": model,
+    }
 
 
 @app.post("/vision/enroll")
@@ -1263,6 +1716,37 @@ async def vision_status() -> dict[str, Any]:
     return vision.get_status()
 
 
+@app.get("/vision/tags")
+async def vision_tags() -> dict[str, Any]:
+    return {"tags": _load_vision_tags()}
+
+
+@app.post("/vision/tags")
+async def vision_tags_update(payload: dict[str, Any]) -> dict[str, Any]:
+    if not payload:
+        raise HTTPException(status_code=400, detail="payload required")
+    tags = _load_vision_tags()
+    if "tags" in payload and isinstance(payload["tags"], dict):
+        for key, value in payload["tags"].items():
+            key = str(key)
+            label = str(value).strip() if value is not None else ""
+            if label:
+                tags[key] = label
+            elif key in tags:
+                tags.pop(key, None)
+    else:
+        key = str(payload.get("key", "")).strip()
+        label = str(payload.get("label", "")).strip()
+        if not key:
+            raise HTTPException(status_code=400, detail="key required")
+        if label:
+            tags[key] = label
+        else:
+            tags.pop(key, None)
+    _save_vision_tags(tags)
+    return {"status": "ok", "count": len(tags)}
+
+
 @app.get("/vision/zones")
 async def vision_zones() -> dict[str, Any]:
     orchestrator = _require_orchestrator()
@@ -1285,3 +1769,14 @@ async def vision_detect() -> dict[str, Any]:
     if not hasattr(vision, "detect_once"):
         raise HTTPException(status_code=501, detail="vision detect not supported")
     return await vision.detect_once()
+
+
+@app.get("/vision/detections")
+async def vision_detections() -> dict[str, Any]:
+    orchestrator = _require_orchestrator()
+    vision = orchestrator.get_tentacle("vision")
+    if not vision:
+        raise HTTPException(status_code=503, detail="vision tentacle not loaded")
+    if not hasattr(vision, "get_latest_detections"):
+        raise HTTPException(status_code=501, detail="vision detections not supported")
+    return vision.get_latest_detections()

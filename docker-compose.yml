@@ -24,6 +24,7 @@ services:
 
     environment:
       - PULSE_SERVER=unix:/run/user/1000/pulse/native
+      - PYTHONPATH=/usr/lib/python3/dist-packages
 
     volumes:
       # --- Persistance des données et du code ---
@@ -43,6 +44,19 @@ services:
       # pour que paplay dans le conteneur puisse parler à la Soundboks via l'hôte.
       - /run/user/1000/pulse:/run/user/1000/pulse
       - /var/run/dbus:/var/run/dbus
+      # --- Hailo runtime + Python (depuis l'hôte) ---
+      - /usr/lib/python3/dist-packages/hailo_platform:/usr/lib/python3/dist-packages/hailo_platform:ro
+      - /usr/lib/python3/dist-packages/hailo.cpython-313-aarch64-linux-gnu.so:/usr/lib/python3/dist-packages/hailo.cpython-313-aarch64-linux-gnu.so:ro
+      - /lib/libhailort.so:/lib/libhailort.so:ro
+      - /lib/libhailort.so.4.23.0:/lib/libhailort.so.4.23.0:ro
+      - /lib/aarch64-linux-gnu/libhailo_tracker.so:/lib/aarch64-linux-gnu/libhailo_tracker.so:ro
+      - /lib/aarch64-linux-gnu/libhailo_tracker.so.5:/lib/aarch64-linux-gnu/libhailo_tracker.so.5:ro
+      - /lib/aarch64-linux-gnu/libhailo_gst_image.so:/lib/aarch64-linux-gnu/libhailo_gst_image.so:ro
+      - /lib/aarch64-linux-gnu/libhailo_gst_image.so.5:/lib/aarch64-linux-gnu/libhailo_gst_image.so.5:ro
+      - /lib/aarch64-linux-gnu/libhailo_cv_singleton.so:/lib/aarch64-linux-gnu/libhailo_cv_singleton.so:ro
+      - /lib/aarch64-linux-gnu/libhailo_cv_singleton.so.5:/lib/aarch64-linux-gnu/libhailo_cv_singleton.so.5:ro
+      - /lib/aarch64-linux-gnu/libgsthailometa.so:/lib/aarch64-linux-gnu/libgsthailometa.so:ro
+      - /lib/aarch64-linux-gnu/libgsthailometa.so.5:/lib/aarch64-linux-gnu/libgsthailometa.so.5:ro
       
     devices:
       # --- Mapping du matériel ---
@@ -74,3 +88,22 @@ services:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./cert.pem:/etc/nginx/certs/cert.pem:ro
       - ./key.pem:/etc/nginx/certs/key.pem:ro
+
+  vscode:
+    image: codercom/code-server:latest
+    container_name: didier-vscode
+    restart: unless-stopped
+    network_mode: "host"
+    user: "1000:1000"
+    command:
+      [
+        "code-server",
+        "--bind-addr",
+        "0.0.0.0:8080",
+        "--auth",
+        "none",
+        "/home/coder/project"
+      ]
+    volumes:
+      - /mnt/didier_ssd/didier/workspace/Didier:/home/coder/project
+      - /mnt/didier_ssd/didier/vscode:/home/coder/.local/share/code-server

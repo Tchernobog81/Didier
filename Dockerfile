@@ -1,5 +1,5 @@
-# Utilisation d'une image Python 3.11 slim optimisée pour le Raspberry Pi (ARM64)
-FROM python:3.11-slim
+# Utilisation d'une image Python 3.13 slim optimisée pour le Raspberry Pi (ARM64)
+FROM python:3.13-slim
 
 # Métadonnées de l'image
 LABEL maintainer="Florian"
@@ -20,6 +20,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pipewire \
     pipewire-pulse \
     libpipewire-0.3-0 \
+    gstreamer1.0-plugins-base \
+    gstreamer1.0-plugins-good \
     libgl1 \
     libglib2.0-0 \
     libsm6 \
@@ -28,6 +30,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libusb-1.0-0 \
     libv4l-0 \
     v4l-utils \
+    ffmpeg \
+    python3-opencv \
     bluez \
     psmisc \
     wget \

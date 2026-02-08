@@ -15,6 +15,7 @@ const lastHeardEl = document.getElementById("last-heard");
 const beepBtn = document.getElementById("beep-btn");
 const audioDot = document.getElementById("audio-dot");
 const videoStream = document.getElementById("video-stream");
+const videoFrame = document.getElementById("video-frame");
 const zonesOverlay = document.getElementById("zones-overlay");
 const ollamaModels = document.getElementById("ollama-models");
 const deviceStatus = document.getElementById("device-status");
@@ -43,9 +44,36 @@ const clawbotForm = document.getElementById("clawbot-form");
 const clawbotPrompt = document.getElementById("clawbot-prompt");
 const didierTitle = document.getElementById("didier-title");
 const clawbotTitle = document.getElementById("clawbot-title");
+const detectionTags = document.getElementById("detection-tags");
+const detectionTagsEmpty = document.getElementById("detection-tags-empty");
+const detectionTagsMeta = document.getElementById("detection-tags-meta");
+const detectionTagsEditor = document.getElementById("detection-tags-editor");
+const detectionTagsEditorLabel = document.getElementById(
+  "detection-tags-editor-label"
+);
+const detectionTagsEditorInput = document.getElementById(
+  "detection-tags-editor-input"
+);
+const clawbotLog = document.getElementById("clawbot-log");
+const clawbotLogMeta = document.getElementById("clawbot-log-meta");
+const vscodeFrame = document.getElementById("vscode-frame");
+const codingOutput = document.getElementById("coding-output");
+const codingForm = document.getElementById("coding-form");
+const codingPrompt = document.getElementById("coding-prompt");
+const tabButtons = document.querySelectorAll("[data-tab]");
+const tabPanels = document.querySelectorAll("[data-tab-panel]");
+const dockerGraph = document.getElementById("docker-graph");
+const dockerMeta = document.getElementById("docker-meta");
+const didierFilesInput = document.getElementById("didier-files");
+const didierFileSearch = document.getElementById("didier-file-search");
+const didierFileResults = document.getElementById("didier-file-results");
+const didierFileMeta = document.getElementById("didier-file-meta");
 
 const DIDIER_TIMEOUT_MS = 90000;
 const CLAWBOT_TIMEOUT_MS = 90000;
+const CODING_TIMEOUT_MS = 120000;
+const MAX_FILE_SIZE = 200 * 1024;
+const MAX_INSERT_CHARS = 4000;
 
 function withTimeout(ms) {
   const controller = new AbortController();
@@ -105,6 +133,57 @@ function setDisk(entry, valueEl, barEl) {
   valueEl.textContent = formatDiskLabel(entry);
   if (entry.percent !== undefined) {
     setBar(barEl, entry.percent);
+  }
+}
+
+const DETECTION_LABELS_KEY = "didier:detectionLabels";
+let detectionLabels = {};
+
+function loadDetectionLabels() {
+  try {
+    const raw = localStorage.getItem(DETECTION_LABELS_KEY);
+    detectionLabels = raw ? JSON.parse(raw) : {};
+  } catch (err) {
+    detectionLabels = {};
+  }
+}
+
+function saveDetectionLabels() {
+  try {
+    localStorage.setItem(DETECTION_LABELS_KEY, JSON.stringify(detectionLabels));
+  } catch (err) {
+    // ignore storage errors
+  }
+}
+
+loadDetectionLabels();
+
+async function loadDetectionLabelsFromServer() {
+  try {
+    const res = await fetch("/vision/tags");
+    if (!res.ok) return;
+    const data = await res.json();
+    if (!data || typeof data.tags !== "object") return;
+    detectionLabels = { ...data.tags, ...detectionLabels };
+    saveDetectionLabels();
+  } catch (err) {
+    // ignore
+  }
+}
+
+let lastTagSyncAt = 0;
+async function saveDetectionLabelToServer(key, label) {
+  const now = Date.now();
+  if (now - lastTagSyncAt < 400) return;
+  lastTagSyncAt = now;
+  try {
+    await fetch("/vision/tags", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key, label }),
+    });
+  } catch (err) {
+    // ignore
   }
 }
 
@@ -411,6 +490,486 @@ async function fetchAsrStatus() {
 }
 
 let visionZones = [];
+let visionDetections = [];
+let visionFrame = null;
+let visionDetectionsTs = 0;
+let activeDetection = null;
+let activeDetectionKey = null;
+let dockerNodesMap = new Map();
+let dockerEdges = [];
+let localDidierFiles = [];
+let fileSearchResults = [];
+let lastFileSearch = "";
+let fileSearchTimer = null;
+
+function detectionKey(det) {
+  if (!det) return null;
+  let bbox = det.bbox;
+  if (!Array.isArray(bbox) && Array.isArray(det.poly) && det.poly.length >= 3) {
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    det.poly.forEach((pt) => {
+      if (!Array.isArray(pt) || pt.length < 2) return;
+      const px = Number(pt[0]);
+      const py = Number(pt[1]);
+      if (Number.isNaN(px) || Number.isNaN(py)) return;
+      minX = Math.min(minX, px);
+      minY = Math.min(minY, py);
+      maxX = Math.max(maxX, px);
+      maxY = Math.max(maxY, py);
+    });
+    if (Number.isFinite(minX) && Number.isFinite(minY)) {
+      bbox = [minX, minY, maxX - minX, maxY - minY];
+    }
+  }
+  if (!Array.isArray(bbox)) return null;
+  const [x, y, w, h] = bbox.map((val) =>
+    Math.round(Number(val || 0) / 10) * 10
+  );
+  const base =
+    det.class_id !== null && det.class_id !== undefined
+      ? `c${det.class_id}`
+      : String(det.label || "obj");
+  return `${base}:${x},${y},${w},${h}`;
+}
+
+function getCustomLabel(det) {
+  const key = detectionKey(det);
+  if (!key) return "";
+  return detectionLabels[key] || "";
+}
+
+function setCustomLabel(key, value) {
+  if (!key) return;
+  const label = String(value || "").trim();
+  if (!label) {
+    delete detectionLabels[key];
+  } else {
+    detectionLabels[key] = label;
+  }
+  saveDetectionLabels();
+  saveDetectionLabelToServer(key, label);
+}
+
+function formatTime(ts) {
+  if (!ts) return "--:--:--";
+  const date = new Date(Number(ts) * 1000);
+  if (Number.isNaN(date.getTime())) return "--:--:--";
+  return date.toLocaleTimeString("fr-FR", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function renderDetectionTags() {
+  if (!detectionTags || !detectionTagsEmpty) return;
+  detectionTags.innerHTML = "";
+  if (!visionDetections.length) {
+    detectionTagsEmpty.style.display = "block";
+    if (detectionTagsEditor) {
+      detectionTagsEditor.classList.remove("is-open");
+      detectionTagsEditor.setAttribute("aria-hidden", "true");
+    }
+    if (detectionTagsMeta) detectionTagsMeta.textContent = "0 objet";
+    return;
+  }
+  detectionTagsEmpty.style.display = "none";
+  if (detectionTagsMeta) {
+    const count = visionDetections.length;
+    const suffix = count > 1 ? "objets" : "objet";
+    const at = visionDetectionsTs ? formatTime(visionDetectionsTs) : "--:--:--";
+    detectionTagsMeta.textContent = `${count} ${suffix} · ${at}`;
+  }
+  visionDetections.forEach((det, idx) => {
+    const customLabel = getCustomLabel(det);
+    const baseLabel = det.label || "objet";
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "detection-chip";
+    if (!customLabel) chip.classList.add("is-unset");
+    if (activeDetectionKey && activeDetectionKey === detectionKey(det)) {
+      chip.classList.add("is-active");
+    }
+    chip.textContent = customLabel || baseLabel;
+    chip.addEventListener("click", () => {
+      openTagEditor(det, idx);
+    });
+    detectionTags.appendChild(chip);
+  });
+}
+function openTagEditor(det, idx) {
+  if (!detectionTagsEditor || !detectionTagsEditorInput) return;
+  activeDetection = det;
+  activeDetectionKey = detectionKey(det);
+  if (detectionTagsEditorLabel) {
+    const baseLabel = det.label || "objet";
+    detectionTagsEditorLabel.textContent = `Objet ${idx + 1} · ${baseLabel}`;
+  }
+  detectionTagsEditorInput.value = getCustomLabel(det) || "";
+  detectionTagsEditor.classList.add("is-open");
+  detectionTagsEditor.setAttribute("aria-hidden", "false");
+  detectionTagsEditorInput.focus();
+  detectionTagsEditorInput.select();
+  renderDetectionTags();
+}
+
+function closeTagEditor() {
+  if (!detectionTagsEditor) return;
+  activeDetection = null;
+  activeDetectionKey = null;
+  detectionTagsEditor.classList.remove("is-open");
+  detectionTagsEditor.setAttribute("aria-hidden", "true");
+  renderDetectionTags();
+}
+
+function applyTagEditor() {
+  if (!activeDetection || !activeDetectionKey || !detectionTagsEditorInput) {
+    closeTagEditor();
+    return;
+  }
+  setCustomLabel(activeDetectionKey, detectionTagsEditorInput.value);
+  renderDetectionTags();
+  drawZones();
+  closeTagEditor();
+}
+
+function formatBytes(size) {
+  if (!Number.isFinite(size)) return "";
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function insertIntoDidierPrompt(text) {
+  if (!didierPrompt) return;
+  const prefix = didierPrompt.value ? `${didierPrompt.value}\n\n` : "";
+  didierPrompt.value = `${prefix}${text}`;
+  didierPrompt.focus();
+}
+
+function renderDidierFiles() {
+  if (!didierFileResults) return;
+  didierFileResults.innerHTML = "";
+  if (didierFileMeta) {
+    const count = localDidierFiles.length;
+    didierFileMeta.textContent = `${count} fichier${count > 1 ? "s" : ""}`;
+  }
+
+  const localLabel = document.createElement("div");
+  localLabel.className = "file-section-label";
+  localLabel.textContent = "Déposés";
+  didierFileResults.appendChild(localLabel);
+
+  if (!localDidierFiles.length) {
+    const empty = document.createElement("div");
+    empty.className = "file-chip";
+    empty.textContent = "Aucun fichier déposé.";
+    didierFileResults.appendChild(empty);
+  } else {
+    localDidierFiles.forEach((file) => {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "file-chip";
+      const name = document.createElement("span");
+      name.textContent = file.name;
+      const meta = document.createElement("small");
+      meta.textContent = formatBytes(file.size);
+      chip.appendChild(name);
+      chip.appendChild(meta);
+      chip.addEventListener("click", () => {
+        if (file.content) {
+          const snippet = file.content.slice(0, MAX_INSERT_CHARS);
+          const suffix =
+            file.content.length > MAX_INSERT_CHARS ? "\n...[tronqué]" : "";
+          insertIntoDidierPrompt(
+            `[Fichier: ${file.name}]\n${snippet}${suffix}\n[/Fichier]`
+          );
+        } else {
+          insertIntoDidierPrompt(`Fichier: ${file.name}`);
+        }
+      });
+      didierFileResults.appendChild(chip);
+    });
+  }
+
+  const searchLabel = document.createElement("div");
+  searchLabel.className = "file-section-label";
+  searchLabel.textContent = "Recherche";
+  didierFileResults.appendChild(searchLabel);
+
+  if (!lastFileSearch) {
+    const hint = document.createElement("div");
+    hint.className = "file-chip";
+    hint.textContent = "Tape au moins 2 caractères pour chercher.";
+    didierFileResults.appendChild(hint);
+    return;
+  }
+
+  if (!fileSearchResults.length) {
+    const empty = document.createElement("div");
+    empty.className = "file-chip";
+    empty.textContent = "Aucun fichier trouvé.";
+    didierFileResults.appendChild(empty);
+    return;
+  }
+
+  fileSearchResults.forEach((item) => {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "file-chip";
+    const name = document.createElement("span");
+    name.textContent = item.path;
+    const meta = document.createElement("small");
+    meta.textContent = formatBytes(item.size);
+    chip.appendChild(name);
+    chip.appendChild(meta);
+    chip.addEventListener("click", () => {
+      insertIntoDidierPrompt(`Fichier: ${item.path}`);
+    });
+    didierFileResults.appendChild(chip);
+  });
+}
+
+function readFileAsText(file) {
+  return new Promise((resolve) => {
+    if (!file || !file.size || file.size > MAX_FILE_SIZE) {
+      resolve(null);
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => resolve(null);
+    reader.readAsText(file);
+  });
+}
+
+async function handleDidierFiles(files) {
+  if (!files || !files.length) return;
+  const next = [];
+  for (const file of files) {
+    const content = await readFileAsText(file);
+    next.push({
+      name: file.name,
+      size: file.size,
+      type: file.type,
+      content: content || "",
+    });
+  }
+  localDidierFiles = next;
+  renderDidierFiles();
+}
+
+async function fetchFileSearch(query) {
+  try {
+    const res = await fetch(`/files/search?q=${encodeURIComponent(query)}`);
+    if (!res.ok) throw new Error("search");
+    const data = await res.json();
+    fileSearchResults = Array.isArray(data.results) ? data.results : [];
+  } catch (err) {
+    fileSearchResults = [];
+  }
+  renderDidierFiles();
+}
+
+function statusToClass(status) {
+  if (!status) return "is-unknown";
+  const normalized = String(status).toLowerCase();
+  if (normalized.includes("run")) return "is-running";
+  if (normalized.includes("pause")) return "is-paused";
+  if (
+    normalized.includes("exit") ||
+    normalized.includes("dead") ||
+    normalized.includes("stop")
+  ) {
+    return "is-stopped";
+  }
+  return "is-unknown";
+}
+
+function buildDockerLayout(containers) {
+  const columns = [[], [], []];
+  const known = [
+    { name: "didier-proxy", label: "Reverse Proxy", column: 0 },
+    { name: "didier-brain", label: "Didier Brain", column: 1 },
+    { name: "didier-vscode", label: "VSCode", column: 1 },
+    { name: "ollama", label: "Ollama", column: 2 },
+  ];
+  const knownSet = new Set();
+  known.forEach((item) => {
+    const match = containers.find((c) => c.name === item.name);
+    if (!match) return;
+    knownSet.add(match.name);
+    columns[item.column].push({
+      id: match.name,
+      label: item.label,
+      status: match.status,
+      image: match.image,
+    });
+  });
+  containers.forEach((c) => {
+    if (knownSet.has(c.name)) return;
+    columns[2].push({
+      id: c.name,
+      label: c.name,
+      status: c.status,
+      image: c.image,
+    });
+  });
+  dockerEdges = [
+    ["didier-proxy", "didier-brain"],
+    ["didier-proxy", "didier-vscode"],
+    ["didier-brain", "ollama"],
+  ].filter(
+    ([a, b]) => containers.some((c) => c.name === a) && containers.some((c) => c.name === b)
+  );
+  return columns;
+}
+
+function drawDockerLinks(svg) {
+  if (!dockerGraph || !svg) return;
+  const rect = dockerGraph.getBoundingClientRect();
+  svg.setAttribute("viewBox", `0 0 ${rect.width} ${rect.height}`);
+  svg.setAttribute("width", rect.width);
+  svg.setAttribute("height", rect.height);
+  svg.innerHTML = "";
+  const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
+  const marker = document.createElementNS("http://www.w3.org/2000/svg", "marker");
+  marker.setAttribute("id", "arrow");
+  marker.setAttribute("markerWidth", "8");
+  marker.setAttribute("markerHeight", "8");
+  marker.setAttribute("refX", "6");
+  marker.setAttribute("refY", "3");
+  marker.setAttribute("orient", "auto");
+  const markerPath = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  markerPath.setAttribute("d", "M0,0 L6,3 L0,6 Z");
+  marker.appendChild(markerPath);
+  defs.appendChild(marker);
+  svg.appendChild(defs);
+
+  dockerEdges.forEach(([fromId, toId]) => {
+    const fromEl = dockerNodesMap.get(fromId);
+    const toEl = dockerNodesMap.get(toId);
+    if (!fromEl || !toEl) return;
+    const fromRect = fromEl.getBoundingClientRect();
+    const toRect = toEl.getBoundingClientRect();
+    const startX = fromRect.right - rect.left;
+    const startY = fromRect.top - rect.top + fromRect.height / 2;
+    const endX = toRect.left - rect.left;
+    const endY = toRect.top - rect.top + toRect.height / 2;
+    const midX = (startX + endX) / 2;
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute(
+      "d",
+      `M ${startX} ${startY} C ${midX} ${startY}, ${midX} ${endY}, ${endX} ${endY}`
+    );
+    path.setAttribute("marker-end", "url(#arrow)");
+    svg.appendChild(path);
+  });
+}
+
+function renderDockerDiagram(payload) {
+  if (!dockerGraph) return;
+  const containers = Array.isArray(payload?.containers) ? payload.containers : [];
+  dockerGraph.innerHTML = "";
+  dockerNodesMap = new Map();
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.classList.add("docker-links");
+  dockerGraph.appendChild(svg);
+  const columns = buildDockerLayout(containers);
+  columns.forEach((col) => {
+    const columnEl = document.createElement("div");
+    columnEl.className = "docker-column";
+    col.forEach((node) => {
+      const nodeEl = document.createElement("div");
+      nodeEl.className = `docker-node ${statusToClass(node.status)}`;
+      nodeEl.dataset.nodeId = node.id;
+      const title = document.createElement("span");
+      title.className = "docker-node-title";
+      title.textContent = node.label;
+      const meta = document.createElement("span");
+      meta.className = "docker-node-meta";
+      const statusLabel = node.status ? node.status : "inconnu";
+      meta.textContent = statusLabel;
+      nodeEl.appendChild(title);
+      nodeEl.appendChild(meta);
+      columnEl.appendChild(nodeEl);
+      dockerNodesMap.set(node.id, nodeEl);
+    });
+    dockerGraph.appendChild(columnEl);
+  });
+  if (dockerMeta) {
+    const count = containers.length;
+    const suffix = count > 1 ? "conteneurs" : "conteneur";
+    const at = payload?.ts ? formatTime(payload.ts) : "--:--:--";
+    dockerMeta.textContent = `${count} ${suffix} · ${at}`;
+  }
+  requestAnimationFrame(() => drawDockerLinks(svg));
+}
+
+async function fetchDockerDiagram() {
+  if (!dockerGraph) return;
+  try {
+    const res = await fetch("/docker/diagram");
+    if (!res.ok) throw new Error("docker");
+    const data = await res.json();
+    renderDockerDiagram(data);
+  } catch (err) {
+    dockerGraph.textContent = "Diagramme Docker indisponible.";
+    if (dockerMeta) dockerMeta.textContent = "--";
+  }
+}
+
+function truncateText(text, maxLen) {
+  const clean = String(text || "").replace(/\s+/g, " ").trim();
+  if (!clean) return "";
+  if (clean.length <= maxLen) return clean;
+  return `${clean.slice(0, maxLen).trimEnd()}…`;
+}
+
+function formatDateTime(ts) {
+  if (!ts) return "--:--:--";
+  const date = new Date(Number(ts) * 1000);
+  if (Number.isNaN(date.getTime())) return "--:--:--";
+  return date.toLocaleTimeString("fr-FR", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+async function fetchClawbotReport() {
+  if (!clawbotLog) return;
+  try {
+    const res = await fetch("/clawbot/report?limit=6");
+    if (!res.ok) throw new Error("clawbot report");
+    const data = await res.json();
+    const history = Array.isArray(data.history) ? data.history : [];
+    if (!history.length) {
+      clawbotLog.textContent = "Aucun rapport Clawbot.";
+      if (clawbotLogMeta) clawbotLogMeta.textContent = "0 rapport";
+      return;
+    }
+    const lines = history.map((item) => {
+      const ts = item && item.ts ? formatDateTime(item.ts) : "--:--:--";
+      const response = item && item.response ? String(item.response) : "";
+      const summary = response.split("\n").find((line) => line.trim()) || "RAS";
+      return `[${ts}] ${truncateText(summary, 180)}`;
+    });
+    clawbotLog.textContent = lines.join("\n");
+    if (clawbotLogMeta) {
+      const last = history[history.length - 1];
+      const lastTs = last && last.ts ? formatDateTime(last.ts) : "--:--:--";
+      clawbotLogMeta.textContent = `${history.length} rapports · ${lastTs}`;
+    }
+    clawbotLog.scrollTop = clawbotLog.scrollHeight;
+  } catch (err) {
+    clawbotLog.textContent = "Rapport Clawbot indisponible.";
+    if (clawbotLogMeta) clawbotLogMeta.textContent = "--";
+  }
+}
 
 async function fetchVisionZones() {
   if (!zonesOverlay) return;
@@ -441,24 +1000,238 @@ function drawZones() {
   if (!ctx) return;
   syncOverlaySize();
   ctx.clearRect(0, 0, zonesOverlay.width, zonesOverlay.height);
-  if (!visionZones.length) return;
+  if (visionZones.length) {
+    ctx.save();
+    ctx.globalAlpha = 0.35;
+    ctx.lineWidth = 2;
+    ctx.font = "12px 'IBM Plex Mono', monospace";
+    visionZones.forEach((zone) => {
+      const color = zone.color || "rgba(34, 211, 238, 0.9)";
+      const x = zone.x * zonesOverlay.width;
+      const y = zone.y * zonesOverlay.height;
+      const w = zone.w * zonesOverlay.width;
+      const h = zone.h * zonesOverlay.height;
+      ctx.strokeStyle = color;
+      ctx.fillStyle = color;
+      ctx.strokeRect(x, y, w, h);
+      if (zone.name) {
+        const labelX = Math.min(Math.max(4, x + 4), zonesOverlay.width - 4);
+        const labelY = Math.min(Math.max(14, y + 14), zonesOverlay.height - 4);
+        ctx.fillText(zone.name, labelX, labelY);
+      }
+    });
+    ctx.restore();
+  }
+  drawDetections(ctx);
+}
+
+function drawDetections(ctx) {
+  if (!visionDetections || !visionDetections.length) return;
+  const frameW =
+    visionFrame && Number.isFinite(visionFrame.width)
+      ? Number(visionFrame.width)
+      : zonesOverlay.width;
+  const frameH =
+    visionFrame && Number.isFinite(visionFrame.height)
+      ? Number(visionFrame.height)
+      : zonesOverlay.height;
+  const scaleX = frameW ? zonesOverlay.width / frameW : 1;
+  const scaleY = frameH ? zonesOverlay.height / frameH : 1;
   ctx.lineWidth = 2;
   ctx.font = "12px 'IBM Plex Mono', monospace";
-  visionZones.forEach((zone) => {
-    const color = zone.color || "rgba(34, 211, 238, 0.9)";
-    const x = zone.x * zonesOverlay.width;
-    const y = zone.y * zonesOverlay.height;
-    const w = zone.w * zonesOverlay.width;
-    const h = zone.h * zonesOverlay.height;
+  visionDetections.forEach((det) => {
+    const bbox = det.bbox;
+    const baseLabel = det.label || "objet";
+    const customLabel = getCustomLabel(det);
+    const label = customLabel || baseLabel;
+    const confidence =
+      det.confidence !== null && det.confidence !== undefined
+        ? Number(det.confidence)
+        : null;
+    const color = baseLabel === "personne" ? "#22c55e" : "#f59e0b";
     ctx.strokeStyle = color;
     ctx.fillStyle = color;
-    ctx.strokeRect(x, y, w, h);
-    if (zone.name) {
-      const labelX = Math.min(Math.max(4, x + 4), zonesOverlay.width - 4);
-      const labelY = Math.min(Math.max(14, y + 14), zonesOverlay.height - 4);
-      ctx.fillText(zone.name, labelX, labelY);
+    let labelX = 4;
+    let labelY = 14;
+    if (Array.isArray(det.poly) && det.poly.length >= 3) {
+      ctx.beginPath();
+      det.poly.forEach((pt, idx) => {
+        if (!Array.isArray(pt) || pt.length < 2) return;
+        const px = Number(pt[0]) * scaleX;
+        const py = Number(pt[1]) * scaleY;
+        if (idx === 0) {
+          ctx.moveTo(px, py);
+          labelX = px + 4;
+          labelY = py + 12;
+        } else {
+          ctx.lineTo(px, py);
+        }
+      });
+      ctx.closePath();
+      ctx.stroke();
+    } else if (Array.isArray(bbox) && bbox.length >= 4) {
+      const [x, y, w, h] = bbox;
+      const sx = x * scaleX;
+      const sy = y * scaleY;
+      const sw = w * scaleX;
+      const sh = h * scaleY;
+      ctx.strokeRect(sx, sy, sw, sh);
+      labelX = sx + 4;
+      labelY = sy + 14;
+    } else {
+      return;
+    }
+    const text =
+      confidence !== null && Number.isFinite(confidence)
+        ? `${label} ${(confidence * 100).toFixed(0)}%`
+        : label;
+    const clampedX = Math.min(Math.max(4, labelX), zonesOverlay.width - 4);
+    const clampedY = Math.min(Math.max(14, labelY), zonesOverlay.height - 4);
+    ctx.fillText(text, clampedX, clampedY);
+  });
+}
+
+function pointInPolygon(x, y, points) {
+  let inside = false;
+  for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
+    const xi = points[i].x;
+    const yi = points[i].y;
+    const xj = points[j].x;
+    const yj = points[j].y;
+    const intersect =
+      yi > y !== yj > y &&
+      x < ((xj - xi) * (y - yi)) / (yj - yi + 0.000001) + xi;
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+function findDetectionAtPoint(canvasX, canvasY) {
+  if (!visionDetections || !visionDetections.length || !zonesOverlay) {
+    return null;
+  }
+  const frameW =
+    visionFrame && Number.isFinite(visionFrame.width)
+      ? Number(visionFrame.width)
+      : zonesOverlay.width;
+  const frameH =
+    visionFrame && Number.isFinite(visionFrame.height)
+      ? Number(visionFrame.height)
+      : zonesOverlay.height;
+  const scaleX = frameW ? zonesOverlay.width / frameW : 1;
+  const scaleY = frameH ? zonesOverlay.height / frameH : 1;
+  let best = null;
+  let bestArea = Infinity;
+  visionDetections.forEach((det, idx) => {
+    let hit = false;
+    let area = Infinity;
+    if (Array.isArray(det.poly) && det.poly.length >= 3) {
+      const pts = det.poly
+        .map((pt) => {
+          if (!Array.isArray(pt) || pt.length < 2) return null;
+          return { x: Number(pt[0]) * scaleX, y: Number(pt[1]) * scaleY };
+        })
+        .filter(Boolean);
+      if (pts.length >= 3) {
+        hit = pointInPolygon(canvasX, canvasY, pts);
+        const xs = pts.map((p) => p.x);
+        const ys = pts.map((p) => p.y);
+        const minX = Math.min(...xs);
+        const minY = Math.min(...ys);
+        const maxX = Math.max(...xs);
+        const maxY = Math.max(...ys);
+        area = Math.max(1, (maxX - minX) * (maxY - minY));
+      }
+    } else if (Array.isArray(det.bbox) && det.bbox.length >= 4) {
+      const [x, y, w, h] = det.bbox;
+      const sx = x * scaleX;
+      const sy = y * scaleY;
+      const sw = w * scaleX;
+      const sh = h * scaleY;
+      hit =
+        canvasX >= sx &&
+        canvasX <= sx + sw &&
+        canvasY >= sy &&
+        canvasY <= sy + sh;
+      area = Math.max(1, sw * sh);
+    }
+    if (!hit) return;
+    if (area < bestArea) {
+      best = { det, idx };
+      bestArea = area;
     }
   });
+  return best;
+}
+
+async function fetchVisionDetections() {
+  if (!zonesOverlay) return;
+  try {
+    const res = await fetch("/vision/detections");
+    if (!res.ok) throw new Error("detections");
+    const data = await res.json();
+    visionDetections = Array.isArray(data.detections) ? data.detections : [];
+    visionFrame = data.frame || null;
+    visionDetectionsTs = data.ts || 0;
+    drawZones();
+    renderDetectionTags();
+  } catch (err) {
+    visionDetections = [];
+    visionFrame = null;
+    drawZones();
+    renderDetectionTags();
+  }
+}
+
+if (detectionTagsEditorInput) {
+  detectionTagsEditorInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      applyTagEditor();
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeTagEditor();
+    }
+  });
+  detectionTagsEditorInput.addEventListener("blur", () => {
+    if (activeDetectionKey) applyTagEditor();
+  });
+}
+
+function setActiveTab(name) {
+  tabButtons.forEach((btn) => {
+    const active = btn.dataset.tab === name;
+    btn.classList.toggle("is-active", active);
+  });
+  tabPanels.forEach((panel) => {
+    const active = panel.dataset.tabPanel === name;
+    panel.classList.toggle("is-active", active);
+    panel.toggleAttribute("hidden", !active);
+  });
+  if (name) {
+    try {
+      localStorage.setItem("didier:activeTab", name);
+    } catch (err) {
+      // ignore
+    }
+  }
+}
+
+if (tabButtons.length && tabPanels.length) {
+  tabButtons.forEach((btn) => {
+    btn.addEventListener("click", () => {
+      setActiveTab(btn.dataset.tab);
+    });
+  });
+  const saved = (() => {
+    try {
+      return localStorage.getItem("didier:activeTab");
+    } catch (err) {
+      return null;
+    }
+  })();
+  if (saved) setActiveTab(saved);
 }
 
 async function sendDidierPrompt(prompt) {
@@ -498,6 +1271,36 @@ async function sendDidierPrompt(prompt) {
       timeout
         ? "Erreur : délai dépassé. Vérifie Ollama / brain."
         : `Erreur : ${err && err.message ? err.message : "impossible de joindre Didier."}`
+    );
+  }
+}
+
+async function sendCodingPrompt(prompt) {
+  if (!codingOutput) return;
+  appendTerminal(codingOutput, `> ${prompt}`);
+  appendTerminal(codingOutput, "... réflexion ...");
+  try {
+    const { controller, clear } = withTimeout(CODING_TIMEOUT_MS);
+    const res = await fetch("/coding", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt }),
+      signal: controller.signal,
+    });
+    clear();
+    if (!res.ok) {
+      const detail = await readErrorDetail(res);
+      throw new Error(detail || "service indisponible");
+    }
+    const data = await res.json();
+    appendTerminal(codingOutput, data.response || "Pas de réponse.");
+  } catch (err) {
+    const timeout = err && err.name === "AbortError";
+    appendTerminal(
+      codingOutput,
+      timeout
+        ? "Erreur : délai dépassé. Vérifie l'agent coding."
+        : `Erreur : ${err && err.message ? err.message : "impossible de joindre l'agent."}`
     );
   }
 }
@@ -544,6 +1347,7 @@ if (micBtn) {
 }
 
 setupSpeech();
+loadDetectionLabelsFromServer();
 fetchMetrics();
 setInterval(fetchMetrics, 2000);
 fetchAsrStatus();
@@ -556,9 +1360,32 @@ fetchVersion();
 setInterval(fetchVersion, 20000);
 fetchVisionZones();
 setInterval(fetchVisionZones, 20000);
+fetchVisionDetections();
+setInterval(fetchVisionDetections, 1000);
+fetchClawbotReport();
+setInterval(fetchClawbotReport, 6000);
+loadLogo();
 if (zonesOverlay) {
   window.addEventListener("resize", () => {
     drawZones();
+  });
+  zonesOverlay.addEventListener("click", (event) => {
+    const rect = zonesOverlay.getBoundingClientRect();
+    const x = event.clientX - rect.left;
+    const y = event.clientY - rect.top;
+    const hit = findDetectionAtPoint(x, y);
+    if (hit) {
+      openTagEditor(hit.det, hit.idx);
+    } else {
+      closeTagEditor();
+    }
+  });
+}
+
+if (dockerGraph) {
+  window.addEventListener("resize", () => {
+    const svg = dockerGraph.querySelector("svg.docker-links");
+    if (svg) drawDockerLinks(svg);
   });
 }
 
@@ -635,6 +1462,51 @@ if (videoStream) {
     }
   }, 8000);
 }
+
+if (codingForm && codingPrompt) {
+  codingForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const prompt = codingPrompt.value.trim();
+    if (!prompt) return;
+    codingPrompt.value = "";
+    sendCodingPrompt(prompt);
+  });
+}
+
+if (vscodeFrame) {
+  const host = window.location.hostname;
+  const protocol = window.location.protocol === "https:" ? "https:" : "http:";
+  vscodeFrame.src = `${protocol}//${host}/vscode/`;
+}
+
+fetchDockerDiagram();
+setInterval(fetchDockerDiagram, 5000);
+
+if (didierFilesInput) {
+  didierFilesInput.addEventListener("change", (event) => {
+    const files = event.target && event.target.files ? event.target.files : [];
+    handleDidierFiles(Array.from(files));
+  });
+}
+
+if (didierFileSearch) {
+  didierFileSearch.addEventListener("input", () => {
+    const query = didierFileSearch.value.trim();
+    lastFileSearch = query;
+    if (fileSearchTimer) clearTimeout(fileSearchTimer);
+    if (!query || query.length < 2) {
+      fileSearchResults = [];
+      renderDidierFiles();
+      return;
+    }
+    fileSearchTimer = setTimeout(() => {
+      fetchFileSearch(query);
+    }, 350);
+  });
+}
+
+renderDidierFiles();
+
 
 if (cameraReconnect) {
   cameraReconnect.addEventListener("click", async () => {
@@ -790,13 +1662,3 @@ if (enrollOwner) {
     }
   });
 }
-
-fetchOllamaModels();
-setInterval(fetchOllamaModels, 10000);
-fetchDeviceStatus();
-setInterval(fetchDeviceStatus, 5000);
-fetchAsrStatus();
-setInterval(fetchAsrStatus, 2000);
-fetchVersion();
-setInterval(fetchVersion, 10000);
-loadLogo();

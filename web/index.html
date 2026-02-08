@@ -9,23 +9,26 @@
   <body>
     <div class="bg"></div>
     <header class="header">
-      <div class="title">
-        <span class="logo" id="logo">D</span>
-        <div>
-          <h1>Didier</h1>
-          <p>Raspberry Pi 5 · Orchestrateur</p>
+      <div class="header-left">
+        <div class="title">
+          <span class="logo" id="logo">D</span>
+          <div>
+            <h1>Didier</h1>
+            <p>Raspberry Pi 5 · Orchestrateur</p>
+          </div>
+        </div>
+        <div class="tabs" role="tablist">
+          <button class="tab is-active" type="button" data-tab="dashboard">
+            Console
+          </button>
+          <button class="tab" type="button" data-tab="vscode">VSCode</button>
+          <button class="tab" type="button" data-tab="docker">Docker</button>
         </div>
       </div>
       <div class="status" id="status-pill">DÉMARRAGE</div>
     </header>
-    <div class="subbar">
-      <div class="badge" id="version-badge">Version : --</div>
-      <div class="badge" id="listening-badge">Écoute : non</div>
-      <div class="badge" id="thinking-badge">Réflexion : repos</div>
-      <div class="badge" id="speaking-badge">Voix : non</div>
-    </div>
 
-    <main class="grid">
+    <main class="grid is-active" id="dashboard-panel" data-tab-panel="dashboard">
       <section class="card metrics">
         <h2>Santé</h2>
         <div class="metric-grid" id="metric-grid">
@@ -46,12 +49,12 @@
             <div class="bar"><div class="bar-fill" id="bar-mem"></div></div>
           </div>
           <div class="metric">
-            <span class="label">Disque SD <span class="label-path" id="disk-root-path"></span></span>
+            <span class="label">Disque SYS</span>
             <span class="value" id="disk-root">--</span>
             <div class="bar"><div class="bar-fill" id="bar-disk-root"></div></div>
           </div>
           <div class="metric">
-            <span class="label">Disque SSD <span class="label-path" id="disk-ssd-path"></span></span>
+            <span class="label">Disque BRAIN</span>
             <span class="value" id="disk-ssd">--</span>
             <div class="bar"><div class="bar-fill" id="bar-disk-ssd"></div></div>
           </div>
@@ -77,27 +80,60 @@
       </section>
 
       <section class="card video">
-        <h2>Contrôle périphérique</h2>
-        <div class="video-frame">
-          <img id="video-stream" src="/video/stream" alt="Flux PS3 Eye" />
-          <canvas id="zones-overlay"></canvas>
+        <h2>Vidéo</h2>
+        <div class="video-stack">
+          <div class="video-frame" id="video-frame">
+            <img id="video-stream" src="/video/stream" alt="Flux PS3 Eye" />
+            <canvas id="zones-overlay"></canvas>
+            <div
+              class="detection-tags-editor"
+              id="detection-tags-editor"
+              aria-hidden="true"
+            >
+              <span
+                class="detection-tags-editor-label"
+                id="detection-tags-editor-label"
+              ></span>
+              <input
+                type="text"
+                id="detection-tags-editor-input"
+                placeholder="Saisir un tag…"
+                autocomplete="off"
+              />
+            </div>
+          </div>
+          <div class="hint">Flux PS3 Eye</div>
+          <div class="video-frame secondary">
+            <img
+              id="video-stream-secondary"
+              src="/video/stream-secondary"
+              alt="Flux Surface"
+            />
+          </div>
+          <div class="hint">Flux Surface (UDP 1234)</div>
         </div>
-        <div class="hint">Flux MJPEG direct</div>
-        <div class="video-actions">
-          <button id="enroll-owner" type="button">Apprendre visage</button>
-        </div>
-        <div class="voice-controls">
-          <button id="beep-btn" type="button">Bip enceinte</button>
-          <span id="mic-status">Micro : off</span>
-          <span id="last-heard">Entendu : --</span>
-          <span class="audio-dot" id="audio-dot" title="Niveau micro"></span>
-        </div>
-        <pre id="camera-holders-output"></pre>
       </section>
 
       <section class="card coding">
         <h2 id="didier-title">Parler à Didier</h2>
         <div class="terminal" id="didier-output"></div>
+        <div class="file-box" id="didier-file-box">
+          <div class="file-box-header">
+            <span class="label">Fichiers</span>
+            <span class="file-box-meta" id="didier-file-meta">0 fichier</span>
+          </div>
+          <label class="file-drop" id="didier-file-drop">
+            <input type="file" id="didier-files" multiple />
+            <span>Déposer ou cliquer pour ajouter</span>
+          </label>
+          <input
+            type="text"
+            id="didier-file-search"
+            placeholder="Rechercher un fichier dans le dépôt…"
+            autocomplete="off"
+          />
+          <div class="file-results" id="didier-file-results"></div>
+        </div>
         <form id="didier-form">
           <input
             type="text"
@@ -121,6 +157,30 @@
           />
           <button type="submit">Envoyer</button>
         </form>
+        <div class="clawbot-log">
+          <div class="clawbot-log-header">
+            <span class="label">Terminal Clawbot</span>
+            <span class="clawbot-log-meta" id="clawbot-log-meta">--</span>
+          </div>
+          <div class="terminal terminal-compact" id="clawbot-log"></div>
+        </div>
+      </section>
+    </main>
+
+    <main class="vscode-panel" id="vscode-panel" data-tab-panel="vscode" hidden>
+      <section class="card vscode">
+        <h2>VSCode</h2>
+        <div class="vscode-frame">
+          <iframe id="vscode-frame" title="VSCode" src="/vscode/"></iframe>
+        </div>
+      </section>
+    </main>
+
+    <main class="docker-panel" id="docker-panel" data-tab-panel="docker" hidden>
+      <section class="card docker-diagram">
+        <h2>Pods Docker</h2>
+        <div class="docker-meta" id="docker-meta">--</div>
+        <div class="docker-graph" id="docker-graph"></div>
       </section>
     </main>
 

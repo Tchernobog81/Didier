@@ -42,11 +42,46 @@ body {
   padding: 28px 40px;
 }
 
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  flex-wrap: wrap;
+}
+
 .subbar {
   display: flex;
   gap: 12px;
   padding: 0 40px 20px;
   flex-wrap: wrap;
+}
+
+.tabs {
+  display: flex;
+  gap: 10px;
+  padding: 0;
+  flex-wrap: wrap;
+}
+
+.tab {
+  padding: 8px 16px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(15, 23, 42, 0.6);
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+  transition: border-color 0.2s ease, color 0.2s ease, background 0.2s ease;
+}
+
+.tab.is-active {
+  color: #e2e8f0;
+  border-color: rgba(34, 211, 238, 0.6);
+  background: rgba(34, 211, 238, 0.12);
+}
+
+[hidden] {
+  display: none !important;
 }
 
 .badge {
@@ -291,6 +326,15 @@ body {
   background: #0b0f15;
 }
 
+.video-stack {
+  display: grid;
+  gap: 10px;
+}
+
+.video-frame.secondary {
+  border-style: dashed;
+}
+
 .video-frame img {
   width: 100%;
   display: block;
@@ -301,7 +345,39 @@ body {
   inset: 0;
   width: 100%;
   height: 100%;
-  pointer-events: none;
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.detection-tags-editor {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  display: none;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  font-size: 11px;
+  color: var(--muted);
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: rgba(10, 15, 24, 0.85);
+  backdrop-filter: blur(8px);
+  z-index: 2;
+}
+
+.detection-tags-editor.is-open {
+  display: flex;
+}
+
+.detection-tags-editor input {
+  min-width: 160px;
+  padding: 6px 8px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: rgba(10, 15, 24, 0.7);
+  color: var(--text);
+  font-size: 12px;
 }
 
 .video-actions {
@@ -327,6 +403,271 @@ body {
   font-size: 12px;
   color: #e2e8f0;
   white-space: pre-wrap;
+}
+
+.terminal-compact {
+  height: 160px;
+}
+
+.detection-tags {
+  margin-top: 12px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.6);
+}
+
+.detection-tags-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.detection-tags-meta {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.detection-tags-bubbles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.detection-tags-empty {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.detection-chip {
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: rgba(148, 163, 184, 0.12);
+  color: var(--text);
+  border-radius: 999px;
+  font-size: 11px;
+  padding: 4px 10px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.detection-chip.is-unset {
+  color: var(--muted);
+}
+
+.detection-chip:hover {
+  border-color: rgba(34, 211, 238, 0.6);
+}
+
+.detection-chip.is-active {
+  border-color: rgba(34, 211, 238, 0.9);
+  background: rgba(34, 211, 238, 0.12);
+}
+
+.vscode-panel {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 24px;
+  padding: 0 40px 40px;
+}
+
+.file-box {
+  margin-top: 12px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 12px;
+  background: rgba(15, 23, 42, 0.6);
+  display: grid;
+  gap: 10px;
+}
+
+.file-box-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.file-box-meta {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.file-drop {
+  display: grid;
+  place-items: center;
+  text-align: center;
+  border: 1px dashed rgba(148, 163, 184, 0.4);
+  border-radius: 12px;
+  padding: 16px;
+  color: var(--muted);
+  font-size: 12px;
+  background: rgba(10, 15, 24, 0.5);
+  cursor: pointer;
+}
+
+.file-drop input {
+  display: none;
+}
+
+.file-results {
+  display: grid;
+  gap: 6px;
+  max-height: 160px;
+  overflow-y: auto;
+}
+
+.file-section-label {
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-top: 4px;
+}
+
+.file-chip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: rgba(15, 23, 42, 0.7);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.file-chip span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-chip small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.docker-panel {
+  padding: 0 40px 40px;
+}
+
+.docker-meta {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 12px;
+}
+
+.docker-graph {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(180px, 1fr));
+  gap: 24px;
+  min-height: 220px;
+  padding: 12px 6px;
+}
+
+.docker-column {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.docker-node {
+  position: relative;
+  border-radius: 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  background: rgba(15, 23, 42, 0.7);
+  box-shadow: 0 10px 20px rgba(0, 0, 0, 0.25);
+  font-size: 12px;
+}
+
+.docker-node-title {
+  display: block;
+  font-weight: 600;
+  color: #e2e8f0;
+  margin-bottom: 4px;
+}
+
+.docker-node-meta {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.docker-node.is-running {
+  border-color: rgba(34, 197, 94, 0.6);
+  background: rgba(34, 197, 94, 0.12);
+}
+
+.docker-node.is-stopped {
+  border-color: rgba(239, 68, 68, 0.6);
+  background: rgba(239, 68, 68, 0.12);
+}
+
+.docker-node.is-paused {
+  border-color: rgba(251, 191, 36, 0.6);
+  background: rgba(251, 191, 36, 0.12);
+}
+
+.docker-node.is-unknown {
+  border-color: rgba(148, 163, 184, 0.4);
+}
+
+.docker-links {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.docker-links path {
+  stroke: rgba(148, 163, 184, 0.55);
+  stroke-width: 2;
+  fill: none;
+}
+
+.docker-links marker path {
+  fill: rgba(148, 163, 184, 0.6);
+}
+
+.vscode-frame {
+  border-radius: 16px;
+  border: 1px solid var(--border);
+  overflow: hidden;
+  background: #0b0f15;
+  min-height: 420px;
+}
+
+.vscode-frame iframe {
+  width: 100%;
+  height: 600px;
+  border: none;
+  display: block;
+  background: #0b0f15;
+}
+
+.coding-edge .terminal {
+  height: 320px;
+}
+
+.clawbot-log {
+  margin-top: 14px;
+}
+
+.clawbot-log-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.clawbot-log-meta {
+  font-size: 11px;
+  color: var(--muted);
 }
 
 #camera-holders-output {
@@ -442,6 +783,19 @@ button {
   }
   .grid {
     padding: 0 20px 20px;
+  }
+  .tabs {
+    padding: 0 20px 12px;
+  }
+  .vscode-panel {
+    padding: 0 20px 20px;
+    grid-template-columns: 1fr;
+  }
+  .docker-panel {
+    padding: 0 20px 20px;
+  }
+  .docker-graph {
+    grid-template-columns: 1fr;
   }
 }
 

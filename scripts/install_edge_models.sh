@@ -48,6 +48,28 @@ else
   echo "Set INSTALL_MUSICGEN=1 to download the MusicGen-small ONNX model."
 fi
 
+echo "[VISION] Hugging Face Edge models"
+HF_VISION_DIR="$MODELS_DIR/vision/huggingface"
+mkdir -p "$HF_VISION_DIR"
+download_hf() {
+  local dest="$1"
+  local url="$2"
+  if [ -f "$dest" ]; then
+    echo "Already present: $dest"
+    return
+  fi
+  echo "Downloading $url -> $dest"
+  curl -L -o "$dest" "$url"
+}
+
+# YOLOv8n FP16 ONNX (object detection)
+download_hf "$HF_VISION_DIR/yolov8n_fp16.onnx" \
+  "https://huggingface.co/webnn/yolov8n/resolve/main/onnx/yolov8n_fp16.onnx"
+
+# YOLOv8n-seg ONNX (instance segmentation)
+download_hf "$HF_VISION_DIR/yolov8n-seg.onnx" \
+  "https://huggingface.co/Kalray/yolov8n-seg/resolve/main/yolov8n-seg.optimized.onnx"
+
 cat <<EOF
 
 [VISION] Hailo model zoo:
