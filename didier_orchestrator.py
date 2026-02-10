@@ -26,7 +26,7 @@ VOICE_CONFIG_PATH = "/app/voices/fr_FR-siwis-low.onnx.json"
 OUTPUT_WAV_PATH = "/app/data/didier_speaks.wav"
 
 # URL de l'API Ollama (accessible via le réseau de l'hôte)
-OLLAMA_API_URL = "http://localhost:11434/api/generate"
+OLLAMA_API_URL = "http://localhost:11435/api/generate"
 
 # Index de la caméra (généralement 0 pour la première caméra)
 CAMERA_INDEX = 0

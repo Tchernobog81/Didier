@@ -40,13 +40,26 @@ body {
   justify-content: space-between;
   align-items: center;
   padding: 28px 40px;
+  position: relative;
+}
+
+.header::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 1px;
+  background: rgba(148, 163, 184, 0.35);
 }
 
 .header-left {
   display: flex;
-  align-items: center;
-  gap: 24px;
-  flex-wrap: wrap;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  flex: 1;
+  min-width: 0;
 }
 
 .subbar {
@@ -57,27 +70,124 @@ body {
 }
 
 .tabs {
-  display: flex;
-  gap: 10px;
+  display: inline-flex;
+  align-items: flex-end;
+  flex-wrap: nowrap;
+  gap: 0;
   padding: 0;
-  flex-wrap: wrap;
+  border-bottom: none;
+  width: 100%;
+  position: relative;
+  z-index: 1;
 }
 
 .tab {
-  padding: 8px 16px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: rgba(15, 23, 42, 0.6);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px 9px;
+  border-radius: 14px 14px 0 0;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-bottom: none;
+  background: linear-gradient(
+    180deg,
+    rgba(51, 65, 85, 0.5) 0%,
+    rgba(30, 41, 59, 0.35) 100%
+  );
   color: var(--muted);
   font-size: 12px;
   cursor: pointer;
-  transition: border-color 0.2s ease, color 0.2s ease, background 0.2s ease;
+  transition: border-color 0.2s ease, color 0.2s ease, background 0.2s ease,
+    transform 0.2s ease, box-shadow 0.2s ease, filter 0.2s ease;
+  position: relative;
+  margin-bottom: -1px;
+  box-shadow: 0 8px 16px rgba(2, 6, 23, 0.2);
+}
+
+.tab + .tab {
+  margin-left: -1px;
 }
 
 .tab.is-active {
+  color: #f8fafc;
+  border-color: rgba(34, 211, 238, 0.7);
+  background: linear-gradient(
+    180deg,
+    rgba(34, 211, 238, 0.35) 0%,
+    rgba(14, 116, 144, 0.2) 100%
+  );
+  box-shadow: 0 0 0 1px rgba(34, 211, 238, 0.22), 0 10px 20px rgba(2, 6, 23, 0.25);
+  transform: translateY(1px);
+  z-index: 2;
+}
+
+.tab:hover {
   color: #e2e8f0;
-  border-color: rgba(34, 211, 238, 0.6);
-  background: rgba(34, 211, 238, 0.12);
+  border-color: rgba(148, 163, 184, 0.5);
+  filter: brightness(1.05);
+}
+
+.tab--wide {
+  min-width: 210px;
+  justify-content: space-between;
+}
+
+.tab-label {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.tab-meta {
+  font-size: 10px;
+  color: rgba(148, 163, 184, 0.75);
+}
+
+.device-pills {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.device-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(15, 23, 42, 0.6);
+  font-size: 11px;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.device-pill .pill-label {
+  font-weight: 600;
+}
+
+.device-pill .pill-status {
+  color: var(--muted);
+}
+
+.device-pill.is-ok {
+  border-color: rgba(34, 197, 94, 0.6);
+  background: rgba(34, 197, 94, 0.12);
+}
+
+.device-pill.is-warn {
+  border-color: rgba(251, 191, 36, 0.6);
+  background: rgba(251, 191, 36, 0.12);
+}
+
+.device-pill.is-bad {
+  border-color: rgba(239, 68, 68, 0.6);
+  background: rgba(239, 68, 68, 0.12);
+}
+
+.device-pill.is-unknown {
+  border-color: rgba(148, 163, 184, 0.4);
+  color: var(--muted);
 }
 
 [hidden] {
@@ -157,33 +267,6 @@ body {
   color: var(--text);
 }
 
-.device-status {
-  margin-top: 16px;
-  padding: 12px;
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  background: rgba(15, 23, 42, 0.6);
-}
-
-.device-status .label {
-  display: block;
-  font-size: 12px;
-  color: var(--muted);
-  margin-bottom: 8px;
-}
-
-.device-status ul {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: grid;
-  gap: 6px;
-}
-
-.device-status li {
-  font-size: 13px;
-  color: var(--text);
-}
 
 .title h1 {
   margin: 0;
@@ -193,6 +276,18 @@ body {
 .title p {
   margin: 4px 0 0;
   color: var(--muted);
+}
+
+.ui-version {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(34, 211, 238, 0.35);
+  color: rgba(226, 232, 240, 0.9);
+  background: rgba(15, 23, 42, 0.7);
+  font-size: 10px;
+  vertical-align: middle;
 }
 
 .status {
@@ -347,6 +442,14 @@ body {
   height: 100%;
   pointer-events: auto;
   cursor: pointer;
+}
+
+#zones-overlay-secondary {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
 }
 
 .detection-tags-editor {
@@ -781,11 +884,20 @@ button {
     align-items: flex-start;
     gap: 12px;
   }
+  .header-left {
+    width: 100%;
+  }
   .grid {
     padding: 0 20px 20px;
   }
   .tabs {
-    padding: 0 20px 12px;
+    width: 100%;
+    overflow-x: auto;
+    padding: 0 0 6px;
+    scrollbar-width: thin;
+  }
+  .tab {
+    flex: 0 0 auto;
   }
   .vscode-panel {
     padding: 0 20px 20px;

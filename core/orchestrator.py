@@ -18,6 +18,9 @@ class Orchestrator:
         self._logger = logging.getLogger(self.__class__.__name__)
         self._config = DidierConfig.load(config_path)
         self._tentacles_path = Path(tentacles_path)
+        self._tentacle_start_timeout = float(
+            self._config.get("system.tentacle_start_timeout_seconds", 12)
+        )
         self._tentacles: List[BaseTentacle] = []
         self._tentacle_map: dict[str, BaseTentacle] = {}
         self._stop_event = asyncio.Event()
@@ -60,8 +63,35 @@ class Orchestrator:
             tentacle_cls = self._load_tentacle_class(module)
             if not tentacle_cls:
                 continue
-            tentacle = tentacle_cls(self._config, orchestrator=self)
-            await tentacle.start()
+            try:
+                tentacle = tentacle_cls(self._config, orchestrator=self)
+            except Exception:
+                self._logger.exception(
+                    "Failed to instantiate tentacle %s", module.__name__
+                )
+                continue
+            try:
+                await asyncio.wait_for(
+                    tentacle.start(), timeout=self._tentacle_start_timeout
+                )
+            except asyncio.TimeoutError:
+                self._logger.error(
+                    "Tentacle start timeout after %.1fs: %s",
+                    self._tentacle_start_timeout,
+                    tentacle.name,
+                )
+                try:
+                    await tentacle.stop()
+                except Exception:
+                    self._logger.debug(
+                        "Tentacle stop after timeout failed: %s",
+                        tentacle.name,
+                        exc_info=True,
+                    )
+                continue
+            except Exception:
+                self._logger.exception("Tentacle start failed: %s", tentacle.name)
+                continue
             self._tentacles.append(tentacle)
             self._tentacle_map[tentacle.name] = tentacle
             self._logger.info("Tentacle loaded: %s", tentacle.name)

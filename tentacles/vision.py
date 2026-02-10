@@ -30,6 +30,7 @@ class HailoDetector:
         self._network_group = None
         self._network_group_params = None
         self._infer_pipeline = None
+        self._infer_vstreams_cls = None
         self._input_info = None
         self._output_infos = []
         self._input_shape = None
@@ -83,6 +84,7 @@ class HailoDetector:
             self._output_vstreams_params = OutputVStreamParams.make_from_network_group(
                 self._network_group, quantized=False, format_type=FormatType.FLOAT32
             )
+            self._infer_vstreams_cls = InferVStreams
             self._infer_pipeline = None
             self._ready = True
             self._logger.info(
@@ -100,6 +102,7 @@ class HailoDetector:
             self._network_group is None
             or self._input_vstreams_params is None
             or self._output_vstreams_params is None
+            or self._infer_vstreams_cls is None
         ):
             return []
         try:
@@ -107,7 +110,7 @@ class HailoDetector:
             if input_tensor is None:
                 return []
             inputs = {self._input_name: input_tensor} if self._input_name else input_tensor
-            infer_pipeline = InferVStreams(
+            infer_pipeline = self._infer_vstreams_cls(
                 self._network_group, self._input_vstreams_params, self._output_vstreams_params
             )
             with infer_pipeline as infer:
@@ -388,7 +391,7 @@ class Tentacle(BaseTentacle):
 
     def __init__(self, config, orchestrator: object) -> None:
         super().__init__(config, orchestrator)
-        self._logger = logging.getLogger(self.__class__.__name__)
+        self._logger = logging.getLogger(f"Tentacle.{self.name}")
         self._camera_index = int(self.config.get("vision.camera_index", 0))
         self._camera_device = self.config.get("vision.camera_device", None)
         self._capture_backend = str(self.config.get("vision.capture_backend", "auto")).lower()
@@ -403,7 +406,9 @@ class Tentacle(BaseTentacle):
         self._model_name = self.config.get("vision.model_name", None)
         self._detector = self._build_detector()
         self._last_detections: List[dict] = []
+        self._last_secondary_detections: List[dict] = []
         self._last_ts = 0.0
+        self._last_secondary_ts = 0.0
         self._last_error: str | None = None
         self._last_npu_load: int | None = None
         self._last_monitor_ts = 0.0
@@ -411,6 +416,7 @@ class Tentacle(BaseTentacle):
         self._last_jpeg: bytes | None = None
         self._last_frame_ts = 0.0
         self._last_frame_shape: tuple[int, int] | None = None
+        self._last_secondary_frame_shape: tuple[int, int] | None = None
         self._interaction_zone = self.config.get("vision.interaction_zone", "zone-centre")
         self._require_person_roi = bool(self.config.get("vision.require_person_roi", False))
         person_ids = self.config.get("vision.person_class_ids", [0])
@@ -459,6 +465,7 @@ class Tentacle(BaseTentacle):
         self._owner_last_score: float | None = None
         self._face_cascade = None
         self._v4l2_lock = threading.Lock()
+        self._detect_lock = threading.Lock()
 
     def _build_detector(self):
         mode = str(self._detector_mode or "auto").lower()
@@ -831,6 +838,10 @@ class Tentacle(BaseTentacle):
         self._last_detections = detections
         self._last_ts = time.time()
 
+    def _store_secondary_detections(self, detections: List[dict]) -> None:
+        self._last_secondary_detections = detections
+        self._last_secondary_ts = time.time()
+
     def _tag_detections(self, detections: List[dict], frame: Any | None = None) -> List[dict]:
         tagged: List[dict] = []
         refined = 0
@@ -859,6 +870,10 @@ class Tentacle(BaseTentacle):
             self._ensure_polygon(det)
             tagged.append(det)
         return tagged
+
+    def _detect_with_lock(self, frame: Any) -> List[dict]:
+        with self._detect_lock:
+            return self._detector.detect(frame)
 
     def _ensure_polygon(self, det: dict) -> None:
         if det.get("poly"):
@@ -1070,7 +1085,7 @@ class Tentacle(BaseTentacle):
                     failures = 0
                 self._last_frame_shape = frame.shape[:2]
                 await asyncio.to_thread(self._update_stream_frame, frame)
-                detections = await asyncio.to_thread(self._detector.detect, frame)
+                detections = await asyncio.to_thread(self._detect_with_lock, frame)
                 detections = self._tag_detections(detections, frame)
                 self._store_detections(detections)
                 now = time.time()
@@ -1113,7 +1128,7 @@ class Tentacle(BaseTentacle):
                 if not ret:
                     raise RuntimeError("Failed to capture frame")
             self._last_frame_shape = frame.shape[:2]
-            detections = await asyncio.to_thread(self._detector.detect, frame)
+            detections = await asyncio.to_thread(self._detect_with_lock, frame)
             detections = self._tag_detections(detections, frame)
             self._store_detections(detections)
             return {
@@ -1162,6 +1177,33 @@ class Tentacle(BaseTentacle):
             "detections": list(self._last_detections),
             "frame": {"width": width, "height": height},
             "ts": self._last_ts,
+            "status": self.get_status(),
+        }
+
+    def detect_secondary_frame(self, frame: Any) -> dict[str, Any]:
+        if frame is None or not hasattr(frame, "shape"):
+            raise RuntimeError("Invalid frame")
+        self._last_secondary_frame_shape = frame.shape[:2]
+        detections = self._detect_with_lock(frame)
+        detections = self._tag_detections(detections, frame)
+        self._store_secondary_detections(detections)
+        height, width = self._last_secondary_frame_shape
+        return {
+            "detections": detections,
+            "frame": {"width": width, "height": height},
+            "ts": self._last_secondary_ts,
+            "status": self.get_status(),
+        }
+
+    def get_latest_secondary_detections(self) -> dict[str, Any]:
+        width = None
+        height = None
+        if self._last_secondary_frame_shape:
+            height, width = self._last_secondary_frame_shape
+        return {
+            "detections": list(self._last_secondary_detections),
+            "frame": {"width": width, "height": height},
+            "ts": self._last_secondary_ts,
             "status": self.get_status(),
         }
 

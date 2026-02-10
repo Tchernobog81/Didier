@@ -5,7 +5,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG_PATH="${CONFIG_PATH:-$ROOT_DIR/config/config.json}"
 LOG_DIR="${LOG_DIR:-$ROOT_DIR/logs}"
 LOG_FILE="${LOG_FILE:-$LOG_DIR/ensure_devices.log}"
-FORCE_MODE="${FORCE_MODE:-1}"
+FORCE_MODE="${FORCE_MODE:-0}"
+BT_CONNECT_TIMEOUT="${BT_CONNECT_TIMEOUT:-10s}"
 
 mkdir -p "$LOG_DIR"
 exec > >(tee -a "$LOG_FILE") 2>&1
@@ -57,15 +58,17 @@ check_camera() {
 }
 
 force_camera_up() {
+  if [ "${FORCE_MODE}" -ne 1 ]; then
+    echo "[CAM] force mode disabled; skipping camera reset"
+    return 1
+  fi
   echo "[CAM] trying to reset uvcvideo"
-  if [ "${FORCE_MODE}" -eq 1 ]; then
-    if command -v lsof >/dev/null 2>&1; then
-      echo "[CAM] killing processes using ${CAM_DEV}"
-      sudo lsof -t "${CAM_DEV}" | xargs -r sudo kill -9 || true
-    elif command -v fuser >/dev/null 2>&1; then
-      echo "[CAM] killing processes using ${CAM_DEV}"
-      sudo fuser -k "${CAM_DEV}" || true
-    fi
+  if command -v lsof >/dev/null 2>&1; then
+    echo "[CAM] killing processes using ${CAM_DEV}"
+    sudo lsof -t "${CAM_DEV}" | xargs -r sudo kill -9 || true
+  elif command -v fuser >/dev/null 2>&1; then
+    echo "[CAM] killing processes using ${CAM_DEV}"
+    sudo fuser -k "${CAM_DEV}" || true
   fi
   sudo modprobe -r uvcvideo || true
   sudo modprobe uvcvideo || true
@@ -86,6 +89,10 @@ check_soundboks_sink() {
 }
 
 force_bluetooth_up() {
+  if [ "${FORCE_MODE}" -ne 1 ]; then
+    echo "[BT] force mode disabled; skipping bluetooth reconnect"
+    return 1
+  fi
   if ! command -v bluetoothctl >/dev/null 2>&1; then
     echo "[BT] bluetoothctl not found"
     return 1
@@ -95,13 +102,22 @@ force_bluetooth_up() {
     return 1
   fi
   echo "[BT] powering on + connecting ${BT_MAC}"
-  bluetoothctl <<EOF
+  local -a bt_cmd=("bluetoothctl")
+  if command -v timeout >/dev/null 2>&1; then
+    bt_cmd=("timeout" "${BT_CONNECT_TIMEOUT}" "bluetoothctl")
+  fi
+  if ! "${bt_cmd[@]}" <<EOF
 power on
 agent on
 default-agent
 connect ${BT_MAC}
 trust ${BT_MAC}
 EOF
+  then
+    echo "[BT] bluetoothctl connect failed or timed out"
+    return 1
+  fi
+  return 0
 }
 
 audio_test() {

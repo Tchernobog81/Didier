@@ -6,6 +6,7 @@ DIDIER_ROOT="${SSD_MOUNT}/didier"
 DOCKER_ROOT="${SSD_MOUNT}/docker_root"
 SWAPFILE="${SSD_MOUNT}/swapfile"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 log() {
   echo "[setup_final] $*"
@@ -202,6 +203,12 @@ EOS
 main() {
   require_root
   require_mount
+
+  if [ -x "${ROOT_DIR}/scripts/stabilize_ssd_migration.sh" ]; then
+    log "Délégation vers scripts/stabilize_ssd_migration.sh --fix"
+    "${ROOT_DIR}/scripts/stabilize_ssd_migration.sh" --fix
+    return 0
+  fi
 
   log "Prune Docker"
   if command -v docker >/dev/null 2>&1; then

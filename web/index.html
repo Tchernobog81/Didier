@@ -4,25 +4,47 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Didier — Console</title>
-    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260210-5" />
   </head>
   <body>
     <div class="bg"></div>
     <header class="header">
       <div class="header-left">
+        <div class="tabs" role="tablist">
+          <button class="tab tab--wide is-active" type="button" data-tab="dashboard">
+            <span class="tab-label">Didier</span>
+            <span class="tab-meta" id="didier-tab-time">--</span>
+          </button>
+          <button class="tab" type="button" data-tab="vscode">VScode</button>
+          <button class="tab" type="button" data-tab="docker">Docker</button>
+        </div>
         <div class="title">
           <span class="logo" id="logo">D</span>
           <div>
             <h1>Didier</h1>
-            <p>Raspberry Pi 5 · Orchestrateur</p>
+            <p>
+              Raspberry Pi 5 · Orchestrateur
+              <span class="ui-version">index.html v2026.02.10-5</span>
+            </p>
           </div>
         </div>
-        <div class="tabs" role="tablist">
-          <button class="tab is-active" type="button" data-tab="dashboard">
-            Console
-          </button>
-          <button class="tab" type="button" data-tab="vscode">VSCode</button>
-          <button class="tab" type="button" data-tab="docker">Docker</button>
+        <div class="device-pills" id="device-pills">
+          <span class="device-pill is-unknown" id="pill-ps3-video">
+            <span class="pill-label">PS3 Vidéo</span>
+            <span class="pill-status">--</span>
+          </span>
+          <span class="device-pill is-unknown" id="pill-surface-video">
+            <span class="pill-label">Surface Vidéo</span>
+            <span class="pill-status">--</span>
+          </span>
+          <span class="device-pill is-unknown" id="pill-sound">
+            <span class="pill-label">Son SB</span>
+            <span class="pill-status">--</span>
+          </span>
+          <span class="device-pill is-unknown" id="pill-mic">
+            <span class="pill-label">Micro PS3</span>
+            <span class="pill-status">--</span>
+          </span>
         </div>
       </div>
       <div class="status" id="status-pill">DÉMARRAGE</div>
@@ -73,10 +95,6 @@
           <span class="label">Modèles Ollama</span>
           <ul id="ollama-models"></ul>
         </div>
-        <div class="device-status">
-          <span class="label">État des périphériques</span>
-          <ul id="device-status"></ul>
-        </div>
       </section>
 
       <section class="card video">
@@ -109,6 +127,7 @@
               src="/video/stream-secondary"
               alt="Flux Surface"
             />
+            <canvas id="zones-overlay-secondary"></canvas>
           </div>
           <div class="hint">Flux Surface (UDP 1234)</div>
         </div>
@@ -184,6 +203,6 @@
       </section>
     </main>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=20260210-5"></script>
   </body>
 </html>

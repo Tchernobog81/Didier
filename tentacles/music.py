@@ -16,7 +16,7 @@ class Tentacle(BaseTentacle):
 
     def __init__(self, config, orchestrator: object) -> None:
         super().__init__(config, orchestrator)
-        self._logger = logging.getLogger(self.__class__.__name__)
+        self._logger = logging.getLogger(f"Tentacle.{self.name}")
         self._sink = self.config.get(
             "bluetooth.sink_name", "bluez_output.00_07_80_E0_3F_F0.1"
         )

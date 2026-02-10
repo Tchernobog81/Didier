@@ -24,7 +24,7 @@ class Tentacle(BaseTentacle):
 
     def __init__(self, config, orchestrator: object) -> None:
         super().__init__(config, orchestrator)
-        self._logger = logging.getLogger(self.__class__.__name__)
+        self._logger = logging.getLogger(f"Tentacle.{self.name}")
         self._enabled = bool(self.config.get("asr.enabled", False))
         self._alsa_device = self.config.get("asr.alsa_device", "default")
         self._sample_rate = int(self.config.get("asr.sample_rate", 16000))
@@ -103,6 +103,18 @@ class Tentacle(BaseTentacle):
         self._audio_queue: asyncio.Queue[Path] = asyncio.Queue(maxsize=2)
         self._capture_thread: threading.Thread | None = None
         self._capture_stop = threading.Event()
+        self._capture_initial_backoff = max(
+            0.5, float(self.config.get("asr.capture_retry_initial_seconds", 1.0))
+        )
+        self._capture_max_backoff = max(
+            self._capture_initial_backoff,
+            float(self.config.get("asr.capture_retry_max_seconds", 20.0)),
+        )
+        self._capture_error_log_interval = max(
+            1.0, float(self.config.get("asr.capture_error_log_interval_seconds", 20.0))
+        )
+        self._capture_failures = 0
+        self._last_capture_error_log = 0.0
         self._autotune_thread: threading.Thread | None = None
         self._autotune_stop = threading.Event()
         self._autotune_last_run = 0.0
@@ -113,9 +125,12 @@ class Tentacle(BaseTentacle):
 
     async def start(self) -> None:
         if self._enabled:
-            self._loop = asyncio.get_running_loop()
-            self._start_capture_thread()
-            self._start_autotune_thread()
+            if self._validate_startup_prerequisites():
+                self._loop = asyncio.get_running_loop()
+                self._start_capture_thread()
+                self._start_autotune_thread()
+            else:
+                self._enabled = False
         await super().start()
 
     async def stop(self) -> None:
@@ -132,25 +147,6 @@ class Tentacle(BaseTentacle):
             self._logger.warning("Hearing tentacle disabled.")
             await self.stop_event.wait()
             return
-
-        if not self._whisper_bin or not os.path.exists(self._whisper_bin):
-            self._logger.error("whisper.cpp binary not found: %s", self._whisper_bin)
-            await self.stop_event.wait()
-            return
-
-        if not self._model_path or not Path(self._model_path).exists():
-            self._logger.error("whisper.cpp model not found: %s", self._model_path)
-            await self.stop_event.wait()
-            return
-        if not self._wake_model_path:
-            self._wake_model_path = self._model_path
-        if not Path(self._wake_model_path).exists():
-            self._logger.warning(
-                "wake model not found: %s (fallback to %s)",
-                self._wake_model_path,
-                self._model_path,
-            )
-            self._wake_model_path = self._model_path
 
         self._logger.info("Hearing tentacle started.")
         self._write_status(listening=True, state="LISTENING")
@@ -214,10 +210,32 @@ class Tentacle(BaseTentacle):
             return
         if self._autotune_thread and self._autotune_thread.is_alive():
             return
+        self._autotune_last_run = time.time()
         self._autotune_thread = threading.Thread(
             target=self._autotune_loop, daemon=True
         )
         self._autotune_thread.start()
+
+    def _validate_startup_prerequisites(self) -> bool:
+        if shutil.which("arecord") is None:
+            self._logger.error("arecord not available.")
+            return False
+        if not self._whisper_bin or not os.path.exists(self._whisper_bin):
+            self._logger.error("whisper.cpp binary not found: %s", self._whisper_bin)
+            return False
+        if not self._model_path or not Path(self._model_path).exists():
+            self._logger.error("whisper.cpp model not found: %s", self._model_path)
+            return False
+        if not self._wake_model_path:
+            self._wake_model_path = self._model_path
+        if not Path(self._wake_model_path).exists():
+            self._logger.warning(
+                "wake model not found: %s (fallback to %s)",
+                self._wake_model_path,
+                self._model_path,
+            )
+            self._wake_model_path = self._model_path
+        return True
 
     def _autotune_loop(self) -> None:
         time.sleep(2.0)
@@ -362,6 +380,7 @@ class Tentacle(BaseTentacle):
         if shutil.which("arecord") is None:
             self._logger.error("arecord not available.")
             return
+        retry_delay = self._capture_initial_backoff
         while not self._capture_stop.is_set():
             ts = int(time.time() * 1000)
             wav_path = self._tmp_dir / f"didier_mic_{ts}.wav"
@@ -385,9 +404,26 @@ class Tentacle(BaseTentacle):
             try:
                 subprocess.run(cmd, check=True, capture_output=True)
             except Exception as exc:
-                self._logger.warning("arecord failed: %s", exc)
-                time.sleep(0.5)
+                self._capture_failures += 1
+                now = time.time()
+                if (
+                    self._capture_failures <= 3
+                    or now - self._last_capture_error_log >= self._capture_error_log_interval
+                ):
+                    self._logger.warning(
+                        "arecord failed (%s, retry in %.1fs): %s",
+                        self._capture_failures,
+                        retry_delay,
+                        exc,
+                    )
+                    self._last_capture_error_log = now
+                self._cleanup_path(wav_path)
+                if self._capture_stop.wait(timeout=retry_delay):
+                    break
+                retry_delay = min(self._capture_max_backoff, retry_delay * 1.8)
                 continue
+            self._capture_failures = 0
+            retry_delay = self._capture_initial_backoff
             if not wav_path.exists():
                 continue
             if not self._loop:

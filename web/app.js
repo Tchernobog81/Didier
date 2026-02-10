@@ -17,8 +17,8 @@ const audioDot = document.getElementById("audio-dot");
 const videoStream = document.getElementById("video-stream");
 const videoFrame = document.getElementById("video-frame");
 const zonesOverlay = document.getElementById("zones-overlay");
+const zonesOverlaySecondary = document.getElementById("zones-overlay-secondary");
 const ollamaModels = document.getElementById("ollama-models");
-const deviceStatus = document.getElementById("device-status");
 const versionBadge = document.getElementById("version-badge");
 const listeningBadge = document.getElementById("listening-badge");
 const thinkingBadge = document.getElementById("thinking-badge");
@@ -68,12 +68,27 @@ const didierFilesInput = document.getElementById("didier-files");
 const didierFileSearch = document.getElementById("didier-file-search");
 const didierFileResults = document.getElementById("didier-file-results");
 const didierFileMeta = document.getElementById("didier-file-meta");
+const devicePillPs3Video = document.getElementById("pill-ps3-video");
+const devicePillSurfaceVideo = document.getElementById("pill-surface-video");
+const devicePillSound = document.getElementById("pill-sound");
+const devicePillMic = document.getElementById("pill-mic");
+const didierTabTime = document.getElementById("didier-tab-time");
+const videoStreamSecondary = document.getElementById("video-stream-secondary");
 
 const DIDIER_TIMEOUT_MS = 90000;
 const CLAWBOT_TIMEOUT_MS = 90000;
 const CODING_TIMEOUT_MS = 120000;
 const MAX_FILE_SIZE = 200 * 1024;
 const MAX_INSERT_CHARS = 4000;
+const VIDEO_STALE_S = 3.5;
+const VIDEO_REFRESH_COOLDOWN_MS = 15000;
+const METRICS_POLL_MS = 2000;
+const CPU_GRAPH_REFRESH_MS = 5000;
+const SURFACE_STATUS_POLL_MS = 3000;
+
+let lastVideoRefreshAt = 0;
+let latestCpuMetrics = null;
+let hasRenderedCpuMetrics = false;
 
 function withTimeout(ms) {
   const controller = new AbortController();
@@ -98,6 +113,87 @@ function clampPercent(value) {
 function setBar(el, percent) {
   if (!el) return;
   el.style.width = `${clampPercent(percent)}%`;
+}
+
+const PILL_CLASSES = ["is-ok", "is-warn", "is-bad", "is-unknown"];
+let surfaceLastFrameAt = null;
+let surfaceLastErrorAt = null;
+let hasSurfaceBackendStatus = false;
+
+function setPillState(pill, state, text) {
+  if (!pill) return;
+  PILL_CLASSES.forEach((cls) => pill.classList.remove(cls));
+  pill.classList.add(`is-${state}`);
+  const statusEl = pill.querySelector(".pill-status");
+  if (statusEl) statusEl.textContent = text || "--";
+}
+
+function updateSurfacePill() {
+  if (!devicePillSurfaceVideo) return;
+  if (hasSurfaceBackendStatus) return;
+  const now = Date.now();
+  if (
+    surfaceLastErrorAt &&
+    (!surfaceLastFrameAt || surfaceLastErrorAt > surfaceLastFrameAt)
+  ) {
+    setPillState(devicePillSurfaceVideo, "bad", "flux KO");
+    return;
+  }
+  if (surfaceLastFrameAt) {
+    const ageS = (now - surfaceLastFrameAt) / 1000;
+    if (ageS < 6) {
+      setPillState(devicePillSurfaceVideo, "ok", "flux ok");
+    } else if (ageS < 18) {
+      setPillState(devicePillSurfaceVideo, "warn", "flux lent");
+    } else {
+      setPillState(devicePillSurfaceVideo, "bad", "flux figé");
+    }
+    return;
+  }
+  setPillState(devicePillSurfaceVideo, "unknown", "en attente");
+}
+
+function updateSurfacePillFromBackend(secondary) {
+  if (!devicePillSurfaceVideo || !secondary) {
+    hasSurfaceBackendStatus = false;
+    return false;
+  }
+  hasSurfaceBackendStatus = true;
+  if (secondary.enabled === false) {
+    setPillState(devicePillSurfaceVideo, "unknown", "désactivé");
+    return true;
+  }
+  const ageRaw = secondary.last_frame_age_s;
+  const ageS = Number.isFinite(Number(ageRaw)) ? Number(ageRaw) : null;
+  const opened = secondary.opened === true;
+  const hasFrame = secondary.frame === true;
+  if (opened && hasFrame) {
+    if (ageS === null || ageS < 6) {
+      setPillState(devicePillSurfaceVideo, "ok", "flux ok");
+    } else if (ageS < 18) {
+      setPillState(devicePillSurfaceVideo, "warn", "flux lent");
+    } else {
+      setPillState(devicePillSurfaceVideo, "bad", "flux figé");
+    }
+    return true;
+  }
+  if (opened) {
+    setPillState(devicePillSurfaceVideo, "warn", "en attente");
+    return true;
+  }
+  setPillState(devicePillSurfaceVideo, "unknown", "en attente");
+  return true;
+}
+
+function updateDidierTabTime() {
+  if (!didierTabTime) return;
+  const formatter = new Intl.DateTimeFormat("fr-FR", {
+    day: "2-digit",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  didierTabTime.textContent = formatter.format(new Date());
 }
 
 function formatDiskPath(path) {
@@ -157,6 +253,23 @@ function saveDetectionLabels() {
 }
 
 loadDetectionLabels();
+
+if (didierTabTime) {
+  updateDidierTabTime();
+  setInterval(updateDidierTabTime, 30000);
+}
+
+if (videoStreamSecondary) {
+  videoStreamSecondary.addEventListener("load", () => {
+    surfaceLastFrameAt = Date.now();
+    if (!hasSurfaceBackendStatus) updateSurfacePill();
+  });
+  videoStreamSecondary.addEventListener("error", () => {
+    surfaceLastErrorAt = Date.now();
+    if (!hasSurfaceBackendStatus) updateSurfacePill();
+  });
+  updateSurfacePill();
+}
 
 async function loadDetectionLabelsFromServer() {
   try {
@@ -240,6 +353,19 @@ function tempToPercent(tempC) {
   return clampPercent(((tempC - min) / (max - min)) * 100);
 }
 
+function renderCpuMetrics(cpuData) {
+  if (!cpuData) return;
+  cpuEl.textContent = `${cpuData.percent.toFixed(1)}%`;
+  setBar(barCpu, cpuData.percent);
+  renderCpuCores(cpuData.per_core);
+  hasRenderedCpuMetrics = true;
+}
+
+function refreshCpuMetrics() {
+  if (!latestCpuMetrics) return;
+  renderCpuMetrics(latestCpuMetrics);
+}
+
 async function fetchMetrics() {
   try {
     const res = await fetch("/metrics");
@@ -250,9 +376,8 @@ async function fetchMetrics() {
     tempEl.textContent =
       data.cpu.temp_c !== null ? `${data.cpu.temp_c.toFixed(1)}°C` : "N/D";
     setBar(barTemp, tempToPercent(data.cpu.temp_c));
-    cpuEl.textContent = `${data.cpu.percent.toFixed(1)}%`;
-    setBar(barCpu, data.cpu.percent);
-    renderCpuCores(data.cpu.per_core);
+    latestCpuMetrics = data.cpu || null;
+    if (!hasRenderedCpuMetrics) refreshCpuMetrics();
     memEl.textContent = `${data.memory.percent.toFixed(1)}%`;
     setBar(barMem, data.memory.percent);
     const rootDisk = data.disk && (data.disk.root || data.disk);
@@ -309,6 +434,21 @@ async function fetchMetrics() {
   }
 }
 
+async function fetchVisionStatusSecondary() {
+  try {
+    const res = await fetch("/vision/status-secondary");
+    if (!res.ok) throw new Error("status-secondary");
+    const data = await res.json();
+    const secondary = data && data.camera_secondary ? data.camera_secondary : data;
+    if (!updateSurfacePillFromBackend(secondary)) {
+      updateSurfacePill();
+    }
+  } catch (err) {
+    hasSurfaceBackendStatus = false;
+    updateSurfacePill();
+  }
+}
+
 async function fetchOllamaModels() {
   if (!ollamaModels) return;
   try {
@@ -336,16 +476,6 @@ async function fetchOllamaModels() {
   }
 }
 
-function setDeviceStatus(lines) {
-  if (!deviceStatus) return;
-  deviceStatus.innerHTML = "";
-  lines.forEach((line) => {
-    const li = document.createElement("li");
-    li.textContent = line;
-    deviceStatus.appendChild(li);
-  });
-}
-
 function updateModelTitles(models) {
   if (!models) return;
   if (didierTitle && models.didier) {
@@ -357,58 +487,67 @@ function updateModelTitles(models) {
 }
 
 async function fetchDeviceStatus() {
-  if (!deviceStatus) return;
   try {
     const res = await fetch("/device-status");
     if (!res.ok) throw new Error("status");
     const data = await res.json();
-    const lines = [];
     if (data.version) {
       const version = data.version.version || "inconnue";
       const git = data.version.git ? ` (${data.version.git})` : "";
-      lines.push(`Version : ${version}${git}`);
       if (versionBadge) versionBadge.textContent = `Version : ${version}${git}`;
     }
     if (data.camera) {
-      lines.push(
-        `Caméra : ${data.camera.opened ? "ouverte" : "fermée"} ${
-          data.camera.frame ? "image ok" : "pas d'image"
-        }`
-      );
-    }
-    if (data.camera_usb) {
-      lines.push(
-        `Cam USB : ${data.camera_usb.present ? "présente" : "absente"}`
-      );
+      const age = data.camera.last_frame_age_s;
+      const stale =
+        age !== null && age !== undefined && Number(age) > VIDEO_STALE_S;
+      const missing = data.camera.frame === false || data.camera.opened === false;
+      if (videoStream && (stale || missing)) {
+        const now = Date.now();
+        if (now - lastVideoRefreshAt > VIDEO_REFRESH_COOLDOWN_MS) {
+          lastVideoRefreshAt = now;
+          if (cameraHoldersOutput) {
+            cameraHoldersOutput.textContent = "Relance auto du flux vidéo...";
+          }
+          videoStream.src = `/video/stream?ts=${Date.now()}`;
+        }
+      }
+      if (data.camera.opened && data.camera.frame) {
+        if (stale) {
+          setPillState(devicePillPs3Video, "warn", "flux lent");
+        } else {
+          setPillState(devicePillPs3Video, "ok", "flux ok");
+        }
+      } else {
+        setPillState(devicePillPs3Video, "bad", "flux KO");
+      }
+    } else {
+      setPillState(devicePillPs3Video, "unknown", "N/D");
     }
     if (data.mic) {
-      lines.push(`Micro : ${data.mic.available ? "ok" : "introuvable"}`);
+      setPillState(
+        devicePillMic,
+        data.mic.available ? "ok" : "bad",
+        data.mic.available ? "ok" : "absent"
+      );
+    } else {
+      setPillState(devicePillMic, "unknown", "N/D");
     }
     if (data.sound) {
-      lines.push(
-        `Soundboks : ${data.sound.available ? "ok" : "absente"}`
+      setPillState(
+        devicePillSound,
+        data.sound.available ? "ok" : "bad",
+        data.sound.available ? "ok" : "absent"
       );
-    }
-    if (data.tts) {
-      lines.push(
-        `TTS : modèle ${data.tts.model ? "ok" : "absent"}, config ${
-          data.tts.config ? "ok" : "absente"
-        }, paplay ${data.tts.paplay ? "ok" : "absent"}`
-      );
-    }
-    if (data.npu) {
-      lines.push(
-        `NPU : périphérique ${data.npu.device ? "ok" : "absent"}, PCIe ${
-          data.npu.pcie ? "ok" : "absent"
-        }`
-      );
+    } else {
+      setPillState(devicePillSound, "unknown", "N/D");
     }
     if (data.models) {
       updateModelTitles(data.models);
     }
-    setDeviceStatus(lines);
   } catch (err) {
-    setDeviceStatus(["État des périphériques indisponible"]);
+    setPillState(devicePillPs3Video, "unknown", "N/D");
+    setPillState(devicePillSound, "unknown", "N/D");
+    setPillState(devicePillMic, "unknown", "N/D");
   }
 }
 
@@ -493,6 +632,9 @@ let visionZones = [];
 let visionDetections = [];
 let visionFrame = null;
 let visionDetectionsTs = 0;
+let visionDetectionsSecondary = [];
+let visionFrameSecondary = null;
+let visionDetectionsSecondaryTs = 0;
 let activeDetection = null;
 let activeDetectionKey = null;
 let dockerNodesMap = new Map();
@@ -994,6 +1136,15 @@ function syncOverlaySize() {
   if (zonesOverlay.height !== height) zonesOverlay.height = height;
 }
 
+function syncSecondaryOverlaySize() {
+  if (!zonesOverlaySecondary || !videoStreamSecondary) return;
+  const rect = videoStreamSecondary.getBoundingClientRect();
+  const width = Math.max(1, Math.floor(rect.width));
+  const height = Math.max(1, Math.floor(rect.height));
+  if (zonesOverlaySecondary.width !== width) zonesOverlaySecondary.width = width;
+  if (zonesOverlaySecondary.height !== height) zonesOverlaySecondary.height = height;
+}
+
 function drawZones() {
   if (!zonesOverlay) return;
   const ctx = zonesOverlay.getContext("2d");
@@ -1091,6 +1242,82 @@ function drawDetections(ctx) {
   });
 }
 
+function drawSecondaryOverlay() {
+  if (!zonesOverlaySecondary) return;
+  const ctx = zonesOverlaySecondary.getContext("2d");
+  if (!ctx) return;
+  syncSecondaryOverlaySize();
+  ctx.clearRect(0, 0, zonesOverlaySecondary.width, zonesOverlaySecondary.height);
+  drawDetectionsSecondary(ctx);
+}
+
+function drawDetectionsSecondary(ctx) {
+  if (!visionDetectionsSecondary || !visionDetectionsSecondary.length) return;
+  const frameW =
+    visionFrameSecondary && Number.isFinite(visionFrameSecondary.width)
+      ? Number(visionFrameSecondary.width)
+      : zonesOverlaySecondary.width;
+  const frameH =
+    visionFrameSecondary && Number.isFinite(visionFrameSecondary.height)
+      ? Number(visionFrameSecondary.height)
+      : zonesOverlaySecondary.height;
+  const scaleX = frameW ? zonesOverlaySecondary.width / frameW : 1;
+  const scaleY = frameH ? zonesOverlaySecondary.height / frameH : 1;
+  ctx.lineWidth = 2;
+  ctx.font = "12px 'IBM Plex Mono', monospace";
+  visionDetectionsSecondary.forEach((det) => {
+    const bbox = det.bbox;
+    const label = det.label || "objet";
+    const confidence =
+      det.confidence !== null && det.confidence !== undefined
+        ? Number(det.confidence)
+        : null;
+    const color = label === "personne" ? "#22c55e" : "#f59e0b";
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    let labelX = 4;
+    let labelY = 14;
+    if (Array.isArray(det.poly) && det.poly.length >= 3) {
+      ctx.beginPath();
+      det.poly.forEach((pt, idx) => {
+        if (!Array.isArray(pt) || pt.length < 2) return;
+        const px = Number(pt[0]) * scaleX;
+        const py = Number(pt[1]) * scaleY;
+        if (idx === 0) {
+          ctx.moveTo(px, py);
+          labelX = px + 4;
+          labelY = py + 12;
+        } else {
+          ctx.lineTo(px, py);
+        }
+      });
+      ctx.closePath();
+      ctx.stroke();
+    } else if (Array.isArray(bbox) && bbox.length >= 4) {
+      const [x, y, w, h] = bbox;
+      const sx = x * scaleX;
+      const sy = y * scaleY;
+      const sw = w * scaleX;
+      const sh = h * scaleY;
+      ctx.strokeRect(sx, sy, sw, sh);
+      labelX = sx + 4;
+      labelY = sy + 14;
+    } else {
+      return;
+    }
+    const text =
+      confidence !== null && Number.isFinite(confidence)
+        ? `${label} ${(confidence * 100).toFixed(0)}%`
+        : label;
+    const clampedX = Math.min(Math.max(4, labelX), zonesOverlaySecondary.width - 4);
+    const clampedY = Math.min(
+      Math.max(14, labelY),
+      zonesOverlaySecondary.height - 4
+    );
+    ctx.fillText(text, clampedX, clampedY);
+  });
+}
+
 function pointInPolygon(x, y, points) {
   let inside = false;
   for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
@@ -1180,6 +1407,25 @@ async function fetchVisionDetections() {
     visionFrame = null;
     drawZones();
     renderDetectionTags();
+  }
+}
+
+async function fetchVisionDetectionsSecondary() {
+  if (!zonesOverlaySecondary) return;
+  try {
+    const res = await fetch("/vision/detections-secondary");
+    if (!res.ok) throw new Error("detections-secondary");
+    const data = await res.json();
+    visionDetectionsSecondary = Array.isArray(data.detections)
+      ? data.detections
+      : [];
+    visionFrameSecondary = data.frame || null;
+    visionDetectionsSecondaryTs = data.ts || 0;
+    drawSecondaryOverlay();
+  } catch (err) {
+    visionDetectionsSecondary = [];
+    visionFrameSecondary = null;
+    drawSecondaryOverlay();
   }
 }
 
@@ -1349,11 +1595,14 @@ if (micBtn) {
 setupSpeech();
 loadDetectionLabelsFromServer();
 fetchMetrics();
-setInterval(fetchMetrics, 2000);
+setInterval(fetchMetrics, METRICS_POLL_MS);
+setInterval(refreshCpuMetrics, CPU_GRAPH_REFRESH_MS);
 fetchAsrStatus();
 setInterval(fetchAsrStatus, 1500);
 fetchDeviceStatus();
 setInterval(fetchDeviceStatus, 8000);
+fetchVisionStatusSecondary();
+setInterval(fetchVisionStatusSecondary, SURFACE_STATUS_POLL_MS);
 fetchOllamaModels();
 setInterval(fetchOllamaModels, 15000);
 fetchVersion();
@@ -1362,12 +1611,15 @@ fetchVisionZones();
 setInterval(fetchVisionZones, 20000);
 fetchVisionDetections();
 setInterval(fetchVisionDetections, 1000);
+fetchVisionDetectionsSecondary();
+setInterval(fetchVisionDetectionsSecondary, 1500);
 fetchClawbotReport();
 setInterval(fetchClawbotReport, 6000);
 loadLogo();
 if (zonesOverlay) {
   window.addEventListener("resize", () => {
     drawZones();
+    drawSecondaryOverlay();
   });
   zonesOverlay.addEventListener("click", (event) => {
     const rect = zonesOverlay.getBoundingClientRect();
@@ -1442,7 +1694,7 @@ if (videoStream) {
     if (!lastVideoErrorAt || now - lastVideoErrorAt > 15000) {
       if (cameraHoldersOutput) {
         cameraHoldersOutput.textContent =
-          "Flux vidéo indisponible. Vérifie /dev/video1.";
+          "Flux vidéo indisponible. Vérifie /dev/video0.";
       }
       lastVideoErrorAt = now;
     }

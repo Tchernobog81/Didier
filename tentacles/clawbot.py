@@ -18,7 +18,7 @@ class Tentacle(BaseTentacle):
 
     def __init__(self, config, orchestrator: object) -> None:
         super().__init__(config, orchestrator)
-        self._logger = logging.getLogger(self.__class__.__name__)
+        self._logger = logging.getLogger(f"Tentacle.{self.name}")
         self._enabled = bool(self.config.get("clawbot.enabled", False))
         self._interval = int(self.config.get("clawbot.interval_seconds", 300))
         self._report_path = Path(

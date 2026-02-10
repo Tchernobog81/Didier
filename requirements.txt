@@ -6,6 +6,7 @@ uvicorn[standard]
 requests
 psutil
 httpx
+huggingface_hub
 
 # Synthèse vocale (Text-to-Speech)
 kokoro-onnx

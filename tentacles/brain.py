@@ -21,7 +21,7 @@ class Tentacle(BaseTentacle):
 
     def __init__(self, config, orchestrator: object) -> None:
         super().__init__(config, orchestrator)
-        self._logger = logging.getLogger(self.__class__.__name__)
+        self._logger = logging.getLogger(f"Tentacle.{self.name}")
         self._base_url = self.config.get("ollama.base_url", "http://localhost:11434")
         self._model = self.config.get("ollama.model", "llama3.2:latest")
         self._timeout = self.config.get("ollama.timeout_seconds", 120)
@@ -186,6 +186,7 @@ class Tentacle(BaseTentacle):
     def _start_autotune_thread(self) -> None:
         if self._autotune_thread and self._autotune_thread.is_alive():
             return
+        self._autotune_last_run = time.time()
         self._autotune_thread = threading.Thread(
             target=self._autotune_loop, daemon=True
         )

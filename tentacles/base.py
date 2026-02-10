@@ -11,7 +11,7 @@ class BaseTentacle(ABC):
     def __init__(self, config: DidierConfig, orchestrator: object) -> None:
         self._config = config
         self._orchestrator = orchestrator
-        self._logger = logging.getLogger(self.__class__.__name__)
+        self._logger = logging.getLogger(f"Tentacle.{self.name}")
         self._stop_event = asyncio.Event()
         self._task: asyncio.Task | None = None
 

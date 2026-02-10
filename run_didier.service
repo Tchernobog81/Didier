@@ -4,9 +4,13 @@ After=network.target
 
 [Service]
 User=tchernobog
-WorkingDirectory=/home/tchernobog/Didier
-Environment=PATH=/home/tchernobog/Didier/venv/bin
-ExecStart=/home/tchernobog/Didier/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
+WorkingDirectory=/home/tchernobog/workspace/Didier
+Environment=PATH=/home/tchernobog/workspace/Didier/venv/bin
+Environment=DIDIER_LOG_DIR=/home/tchernobog/workspace/Didier/logs
+Environment=DIDIER_LOG_LEVEL=INFO
+Environment=DIDIER_LOG_ROTATE_MB=25
+Environment=DIDIER_LOG_BACKUPS=14
+ExecStart=/home/tchernobog/workspace/Didier/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
 Restart=on-failure
 RestartSec=5s
 

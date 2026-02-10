@@ -62,6 +62,12 @@ Quickstart (sur le Pi)
    - POST /chat  { "prompt": "Salut Didier, raconte une blague" }
    - GET  /models/search?q=<query>
 
+Stabilisation migration SSD (recommandé)
+1. Vérifier l'état sans modifier
+   bash scripts/stabilize_ssd_migration.sh --check
+2. Réparer les dérives (symlinks/paths Docker/workspace)
+   sudo bash scripts/stabilize_ssd_migration.sh --fix
+
 Voir run_didier.service pour service systemd et docker-compose.yml pour exécution en conteneur.
 
 Licence: MIT

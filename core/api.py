@@ -472,9 +472,6 @@ async def metrics() -> dict[str, Any]:
         cpu_percent = psutil.cpu_percent(interval=0.1)
     mem = psutil.virtual_memory()
     orchestrator = _require_orchestrator()
-    alsa_device = orchestrator.config.get("asr.alsa_device", "default")
-    sample_rate = int(orchestrator.config.get("asr.sample_rate", 16000))
-    channels = int(orchestrator.config.get("asr.channels", 1))
     npu_device = orchestrator.config.get("npu.device", "/dev/hailo0")
     npu_pcie = orchestrator.config.get("npu.pcie_address", "0001:01:00.0")
     didier_model = orchestrator.config.get("ollama.model", None)
@@ -498,7 +495,8 @@ async def metrics() -> dict[str, Any]:
         if ssd_path
         else {"available": False, "path": ssd_mount}
     )
-    audio = await asyncio.to_thread(_read_mic_level, alsa_device, sample_rate, channels)
+    # Bypass micro capture by default to avoid costly arecord subprocess calls.
+    audio = {"available": True, "level_percent": 0, "listening": False}
     return {
         "timestamp": time.time(),
         "cpu": {
@@ -834,6 +832,8 @@ async def device_status() -> dict[str, Any]:
     npu_pcie = orchestrator.config.get("npu.pcie_address", "0001:01:00.0")
     didier_model = orchestrator.config.get("ollama.model", None)
     clawbot_model = orchestrator.config.get("clawbot.model", None)
+    secondary_cfg = orchestrator.config.get("vision.remote_stream", {}) or {}
+    secondary_enabled = bool(secondary_cfg.get("enabled", True))
 
     vision = orchestrator.get_tentacle("vision")
     camera = None
@@ -856,6 +856,32 @@ async def device_status() -> dict[str, Any]:
             camera = None
     if camera is None:
         camera = await asyncio.to_thread(_check_camera, camera_index, camera_device)
+    camera_secondary: dict[str, Any] = {
+        "enabled": secondary_enabled,
+        "opened": False,
+        "frame": False,
+        "last_frame_ts": None,
+        "last_frame_age_s": None,
+        "source": "remote_stream",
+    }
+    if secondary_enabled:
+        stream = None
+        with _REMOTE_STREAM_LOCK:
+            stream = _REMOTE_STREAM
+        if stream is not None:
+            try:
+                frame, last_frame_ts = stream.get_last()
+                age = time.time() - last_frame_ts if last_frame_ts else None
+                camera_secondary.update(
+                    {
+                        "opened": True,
+                        "frame": bool(frame),
+                        "last_frame_ts": last_frame_ts,
+                        "last_frame_age_s": round(age, 2) if age is not None else None,
+                    }
+                )
+            except Exception:
+                pass
     camera_usb = await asyncio.to_thread(_check_camera_usb, vendor, product)
     mic = await asyncio.to_thread(_check_camera_mic)
     sound = await asyncio.to_thread(_check_soundboks_sink, sink)
@@ -865,6 +891,7 @@ async def device_status() -> dict[str, Any]:
 
     return {
         "camera": camera,
+        "camera_secondary": camera_secondary,
         "camera_usb": camera_usb,
         "mic": mic,
         "sound": sound,
@@ -1237,6 +1264,8 @@ def _get_remote_stream(input_url: str, fps: int = 15) -> RemoteMjpegStream:
 
 def _remote_mjpeg_generator(stream: RemoteMjpegStream) -> Generator[bytes, None, None]:
     last_sent = None
+    target_fps = max(int(getattr(stream, "_fps", 15) or 15), 1)
+    interval_s = max(1.0 / float(target_fps), 0.03)
     while True:
         frame, _ts = stream.get_last()
         if frame and frame is not last_sent:
@@ -1245,8 +1274,7 @@ def _remote_mjpeg_generator(stream: RemoteMjpegStream) -> Generator[bytes, None,
                 b"--frame\r\n"
                 b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
             )
-        else:
-            time.sleep(0.08)
+        time.sleep(interval_s)
 
 
 @app.get("/video/stream")
@@ -1780,3 +1808,55 @@ async def vision_detections() -> dict[str, Any]:
     if not hasattr(vision, "get_latest_detections"):
         raise HTTPException(status_code=501, detail="vision detections not supported")
     return vision.get_latest_detections()
+
+
+@app.get("/vision/detections-secondary")
+async def vision_detections_secondary() -> dict[str, Any]:
+    orchestrator = _require_orchestrator()
+    vision = orchestrator.get_tentacle("vision")
+    if not vision:
+        raise HTTPException(status_code=503, detail="vision tentacle not loaded")
+    if not hasattr(vision, "detect_secondary_frame"):
+        raise HTTPException(status_code=501, detail="secondary detections not supported")
+    cfg = orchestrator.config.get("vision.remote_stream", {}) or {}
+    if not cfg.get("enabled", True):
+        raise HTTPException(status_code=404, detail="secondary stream disabled")
+    input_url = cfg.get("input_url", "udp://0.0.0.0:1234")
+    fps = int(cfg.get("fps", 15))
+    if not input_url:
+        raise HTTPException(status_code=400, detail="input_url required")
+    stream = _get_remote_stream(str(input_url), fps=fps)
+    frame_bytes, ts = stream.get_last()
+    if not frame_bytes:
+        raise HTTPException(status_code=503, detail="secondary stream not ready")
+    frame = cv2.imdecode(np.frombuffer(frame_bytes, np.uint8), cv2.IMREAD_COLOR)
+    if frame is None:
+        raise HTTPException(status_code=503, detail="secondary frame decode failed")
+    data = await asyncio.to_thread(vision.detect_secondary_frame, frame)
+    data["stream_ts"] = ts
+    return data
+    # --- AJOUTER CE BLOC À LA TOUTE FIN DU FICHIER ---
+
+@app.get("/vision/status-secondary")
+async def vision_status_secondary() -> dict[str, Any]:
+    """
+    Route ultra-légère pour la pastille d'état (CPU < 1%).
+    Vérifie juste si des paquets UDP arrivent sans décoder d'image.
+    """
+    orchestrator = _require_orchestrator()
+    cfg = orchestrator.config.get("vision.remote_stream", {}) or {}
+    input_url = cfg.get("input_url", "udp://0.0.0.0:1234")
+    
+    # On récupère le flux (déjà géré par le thread ffmpeg en arrière-plan)
+    stream = _get_remote_stream(str(input_url))
+    _frame, ts = stream.get_last()
+    
+    # On calcule si le flux est récent (moins de 3 secondes)
+    now = time.time()
+    is_online = (ts > 0) and (now - ts < 3.0)
+    
+    return {
+        "status": "online" if is_online else "offline",
+        "age_s": round(now - ts, 1) if ts > 0 else None,
+        "ts": ts
+    }

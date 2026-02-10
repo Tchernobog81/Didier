@@ -93,14 +93,14 @@ else
     docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | while read line; do log "$line"; done
     
     log ""
-    log "${YELLOW}--- Test API Ollama (Port 11434) ---${NC}"
-    if curl -s --max-time 2 http://localhost:11434 > /dev/null; then
+    log "${YELLOW}--- Test API Ollama (Port 11435) ---${NC}"
+    if curl -s --max-time 2 http://localhost:11435 > /dev/null; then
         log "${GREEN}SUCCÈS : Ollama répond.${NC}"
         # Essai de lister le modèle
-        MODELS=$(curl -s http://localhost:11434/api/tags | grep -o '"name":"[^"]*"' | cut -d'"' -f4)
+        MODELS=$(curl -s http://localhost:11435/api/tags | grep -o '"name":"[^"]*"' | cut -d'"' -f4)
         log "Modèles chargés : $MODELS"
     else
-        log "${RED}ECHEC : Ollama ne répond pas sur le port 11434.${NC}"
+        log "${RED}ECHEC : Ollama ne répond pas sur le port 11435.${NC}"
         log "Astuce : Vérifie 'docker logs loom_brain'"
     fi
 fi
