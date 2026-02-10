@@ -258,11 +258,6 @@ def _require_orchestrator() -> Orchestrator:
     return _orchestrator
 
 
-@app.get("/health")
-async def health() -> dict[str, Any]:
-    return {"status": "ok", "name": "Didier"}
-
-
 @app.get("/", response_class=HTMLResponse)
 async def index() -> str:
     if INDEX_PATH.exists():

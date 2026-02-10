@@ -8,6 +8,11 @@ from fastapi import APIRouter
 router = APIRouter()
 
 
+@router.get("/health")
+async def health() -> dict[str, Any]:
+    return {"status": "ok", "name": "Didier"}
+
+
 @router.get("/metrics")
 async def metrics() -> dict[str, Any]:
     from core import api as api_module
