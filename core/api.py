@@ -22,6 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from core.logging import setup_logging
 from core.memory import MemoryStore
 from core.orchestrator import Orchestrator
+from core.routers import system_router
 from core.status import read_status, update_status
 
 
@@ -31,6 +32,7 @@ INDEX_PATH = WEB_DIR / "index.html"
 VERSION_PATH = Path("VERSION")
 if WEB_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
+app.include_router(system_router)
 _orchestrator: Orchestrator | None = None
 _camera_watchdog_task: asyncio.Task | None = None
 _AUDIO_CACHE: dict[str, Any] = {"ts": 0.0, "level": None, "available": False}
@@ -461,62 +463,6 @@ def _read_mic_level(
             "listening": False,
             "error": str(exc),
         }
-
-
-@app.get("/metrics")
-async def metrics() -> dict[str, Any]:
-    cpu_per_core = psutil.cpu_percent(interval=0.1, percpu=True)
-    if cpu_per_core:
-        cpu_percent = round(sum(cpu_per_core) / len(cpu_per_core), 1)
-    else:
-        cpu_percent = psutil.cpu_percent(interval=0.1)
-    mem = psutil.virtual_memory()
-    orchestrator = _require_orchestrator()
-    npu_device = orchestrator.config.get("npu.device", "/dev/hailo0")
-    npu_pcie = orchestrator.config.get("npu.pcie_address", "0001:01:00.0")
-    didier_model = orchestrator.config.get("ollama.model", None)
-    clawbot_model = orchestrator.config.get("clawbot.model", None)
-    ssd_mount = orchestrator.config.get("storage.ssd_mount", "/mnt/didier_ssd")
-    host_root = "/host" if Path("/host").exists() else "/"
-    host_ssd = f"{host_root}{ssd_mount}" if ssd_mount.startswith("/") else None
-    ssd_path = _resolve_disk_path(
-        ssd_mount,
-        [
-            host_ssd,
-            f"{ssd_mount}/didier",
-            "/app",
-            "/app/logs",
-            "/root/.ollama",
-        ],
-    )
-    disk_root = _disk_usage(host_root, "/")
-    disk_ssd = (
-        _disk_usage(ssd_path, ssd_mount)
-        if ssd_path
-        else {"available": False, "path": ssd_mount}
-    )
-    # Bypass micro capture by default to avoid costly arecord subprocess calls.
-    audio = {"available": True, "level_percent": 0, "listening": False}
-    return {
-        "timestamp": time.time(),
-        "cpu": {
-            "percent": cpu_percent,
-            "temp_c": _read_cpu_temp_c(),
-            "per_core": cpu_per_core,
-        },
-        "memory": {
-            "total": mem.total,
-            "used": mem.used,
-            "percent": mem.percent,
-        },
-        "disk": {
-            "root": disk_root,
-            "ssd": disk_ssd,
-            "percent": disk_root.get("percent", 0),
-        },
-        "npu": _read_npu_usage(npu_device, npu_pcie),
-        "audio": audio,
-    }
 
 
 def _read_version() -> dict[str, Any]:
