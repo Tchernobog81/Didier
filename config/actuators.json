@@ -1,0 +1,52 @@
+{
+  "devices": {
+    "yl_192_168_1_19": {
+      "type": "yeelight",
+      "ip": "192.168.1.19",
+      "name": "Lampe Salon",
+      "validated": true,
+      "capabilities": ["on", "off"],
+      "tags": ["light", "wifi"]
+    },
+    "yl_192_168_1_12": {
+      "type": "yeelight",
+      "ip": "192.168.1.12",
+      "name": "",
+      "validated": false,
+      "capabilities": ["on", "off"],
+      "tags": ["light", "wifi"]
+    },
+    "yl_192_168_1_18": {
+      "type": "yeelight",
+      "ip": "192.168.1.18",
+      "name": "",
+      "validated": false,
+      "capabilities": ["on", "off"],
+      "tags": ["light", "wifi"]
+    },
+    "yl_192_168_1_24": {
+      "type": "yeelight",
+      "ip": "192.168.1.24",
+      "name": "",
+      "validated": false,
+      "capabilities": ["on", "off"],
+      "tags": ["light", "wifi"]
+    },
+    "yl_192_168_1_23": {
+      "type": "yeelight",
+      "ip": "192.168.1.23",
+      "name": "",
+      "validated": false,
+      "capabilities": ["on", "off"],
+      "tags": ["light", "wifi"]
+    },
+    "yl_192_168_1_22": {
+      "type": "yeelight",
+      "ip": "192.168.1.22",
+      "name": "",
+      "validated": false,
+      "capabilities": ["on", "off"],
+      "tags": ["light", "wifi"]
+    }
+  }
+}

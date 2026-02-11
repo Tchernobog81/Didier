@@ -24,11 +24,12 @@ from core.memory import MemoryStore
 from core.orchestrator import Orchestrator
 from core.routers import ai_router, system_router, vision_router
 from core.status import read_status, update_status
+from core.routers.actuators import router as actuators_router
 
 
 app = FastAPI(title="Didier Orchestrator", version="2.0")
 WEB_DIR = Path("web")
-app.mount("/static", StaticFiles(directory="web"), name="static")
+#app.mount("/static", StaticFiles(directory="web"), name="static")
 INDEX_PATH = WEB_DIR / "index.html"
 VERSION_PATH = Path("VERSION")
 if WEB_DIR.exists():
@@ -36,6 +37,7 @@ if WEB_DIR.exists():
 app.include_router(system_router)
 app.include_router(vision_router)
 app.include_router(ai_router)
+app.include_router(actuators_router)
 _orchestrator: Orchestrator | None = None
 _camera_watchdog_task: asyncio.Task | None = None
 _AUDIO_CACHE: dict[str, Any] = {"ts": 0.0, "level": None, "available": False}

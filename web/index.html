@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Didier — Console</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260210-5" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260211-1" />
   </head>
   <body>
     <div class="bg"></div>
@@ -17,6 +17,7 @@
           </button>
           <button class="tab" type="button" data-tab="vscode">VScode</button>
           <button class="tab" type="button" data-tab="docker">Docker</button>
+          <button class="tab" type="button" data-tab="actuators">Actionneurs</button>
         </div>
         <div class="title">
           <span class="logo" id="logo">D</span>
@@ -24,7 +25,7 @@
             <h1>Didier</h1>
             <p>
               Raspberry Pi 5 · Orchestrateur
-              <span class="ui-version">index.html v2026.02.10-5</span>
+              <span class="ui-version">index.html v2026.02.11-1</span>
             </p>
           </div>
         </div>
@@ -203,6 +204,24 @@
       </section>
     </main>
 
-    <script src="/static/app.js?v=20260210-5"></script>
+    <main
+      class="actuators-panel"
+      id="actuators-panel"
+      data-tab-panel="actuators"
+      hidden
+    >
+      <section class="card actuators-card">
+        <div class="actuators-toolbar">
+          <h2>Actionneurs</h2>
+          <div class="actuators-toolbar-right">
+            <button type="button" id="actuators-refresh">Rafraîchir</button>
+            <span class="actuators-message" id="actuators-message">--</span>
+          </div>
+        </div>
+        <div class="actuators-list" id="actuators-list"></div>
+      </section>
+    </main>
+
+    <script src="/static/app.js?v=20260211-1"></script>
   </body>
 </html>

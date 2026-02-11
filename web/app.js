@@ -64,6 +64,9 @@ const tabButtons = document.querySelectorAll("[data-tab]");
 const tabPanels = document.querySelectorAll("[data-tab-panel]");
 const dockerGraph = document.getElementById("docker-graph");
 const dockerMeta = document.getElementById("docker-meta");
+const actuatorsList = document.getElementById("actuators-list");
+const actuatorsRefresh = document.getElementById("actuators-refresh");
+const actuatorsMessage = document.getElementById("actuators-message");
 const didierFilesInput = document.getElementById("didier-files");
 const didierFileSearch = document.getElementById("didier-file-search");
 const didierFileResults = document.getElementById("didier-file-results");
@@ -85,10 +88,15 @@ const VIDEO_REFRESH_COOLDOWN_MS = 15000;
 const METRICS_POLL_MS = 2000;
 const CPU_GRAPH_REFRESH_MS = 5000;
 const SURFACE_STATUS_POLL_MS = 3000;
+const SERVICE_503_BACKOFF_MS = 30000;
 
 let lastVideoRefreshAt = 0;
 let latestCpuMetrics = null;
 let hasRenderedCpuMetrics = false;
+let actuatorsDevices = [];
+let actuatorsStatusById = new Map();
+let ollamaBackoffUntil = 0;
+let visionSecondaryBackoffUntil = 0;
 
 function withTimeout(ms) {
   const controller = new AbortController();
@@ -451,9 +459,16 @@ async function fetchVisionStatusSecondary() {
 
 async function fetchOllamaModels() {
   if (!ollamaModels) return;
+  if (Date.now() < ollamaBackoffUntil) return;
   try {
     const res = await fetch("/ollama/models");
-    if (!res.ok) throw new Error("models");
+    if (!res.ok) {
+      if (res.status === 503) {
+        ollamaBackoffUntil = Date.now() + SERVICE_503_BACKOFF_MS;
+      }
+      throw new Error("models");
+    }
+    ollamaBackoffUntil = 0;
     const data = await res.json();
     const models = (data.models || []).map((m) => m.name || m.model).filter(Boolean);
     ollamaModels.innerHTML = "";
@@ -1064,6 +1079,181 @@ async function fetchDockerDiagram() {
   }
 }
 
+function setActuatorsMessage(text, isError = false) {
+  if (!actuatorsMessage) return;
+  actuatorsMessage.textContent = text || "--";
+  actuatorsMessage.classList.toggle("is-error", !!isError);
+}
+
+function normalizeActuatorDevices(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (payload && Array.isArray(payload.devices)) return payload.devices;
+  return [];
+}
+
+function formatActuatorLastCommand(command) {
+  if (!command || typeof command !== "object") return "--";
+  const action = command.action ? String(command.action) : "?";
+  const ts = Number(command.ts);
+  const at = Number.isFinite(ts)
+    ? formatTime(ts)
+    : "--:--:--";
+  return `${action} @ ${at}`;
+}
+
+function actuatorViewModel(device) {
+  const id = device && device.id ? String(device.id) : "";
+  const status = actuatorsStatusById.get(id) || {};
+  const merged = { ...(device || {}), ...status };
+  return {
+    id,
+    ip: merged.ip ? String(merged.ip) : "--",
+    name: String(merged.name || "").trim(),
+    validated: !!merged.validated,
+    lastCommand: merged.last_command || null,
+  };
+}
+
+function renderActuators() {
+  if (!actuatorsList) return;
+  actuatorsList.innerHTML = "";
+  if (!actuatorsDevices.length) {
+    const empty = document.createElement("div");
+    empty.className = "actuator-empty";
+    empty.textContent = "Aucun actionneur.";
+    actuatorsList.appendChild(empty);
+    return;
+  }
+  actuatorsDevices.forEach((device) => {
+    const model = actuatorViewModel(device);
+    const card = document.createElement("article");
+    card.className = "actuator-card";
+    card.dataset.actuatorId = model.id;
+
+    const head = document.createElement("div");
+    head.className = "actuator-head";
+    const title = document.createElement("h3");
+    title.textContent = model.id;
+    const validated = document.createElement("span");
+    validated.className = `actuator-validated ${model.validated ? "is-yes" : "is-no"}`;
+    validated.textContent = model.validated ? "validé : oui" : "validé : non";
+    head.appendChild(title);
+    head.appendChild(validated);
+
+    const details = document.createElement("div");
+    details.className = "actuator-details";
+    const ip = document.createElement("div");
+    ip.textContent = `IP: ${model.ip}`;
+    const name = document.createElement("div");
+    name.textContent = `Nom: ${model.name || "non validé"}`;
+    const command = document.createElement("div");
+    command.textContent = `Dernière commande: ${formatActuatorLastCommand(
+      model.lastCommand
+    )}`;
+    details.appendChild(ip);
+    details.appendChild(name);
+    details.appendChild(command);
+
+    const actions = document.createElement("div");
+    actions.className = "actuator-actions";
+    const onBtn = document.createElement("button");
+    onBtn.type = "button";
+    onBtn.dataset.actuatorAction = "on";
+    onBtn.textContent = "On";
+    const offBtn = document.createElement("button");
+    offBtn.type = "button";
+    offBtn.dataset.actuatorAction = "off";
+    offBtn.textContent = "Off";
+    actions.appendChild(onBtn);
+    actions.appendChild(offBtn);
+
+    const renameRow = document.createElement("div");
+    renameRow.className = "actuator-rename";
+    const nameInput = document.createElement("input");
+    nameInput.type = "text";
+    nameInput.className = "actuator-name-input";
+    nameInput.placeholder = "Nom";
+    nameInput.value = model.name || "";
+    const validateBtn = document.createElement("button");
+    validateBtn.type = "button";
+    validateBtn.dataset.actuatorAction = "validate";
+    validateBtn.textContent = "Valider / Renommer";
+    renameRow.appendChild(nameInput);
+    renameRow.appendChild(validateBtn);
+
+    card.appendChild(head);
+    card.appendChild(details);
+    card.appendChild(actions);
+    card.appendChild(renameRow);
+    actuatorsList.appendChild(card);
+  });
+}
+
+async function fetchActuatorStatus(id, silent = false) {
+  try {
+    const res = await fetch(`/actuators/${encodeURIComponent(id)}/status`);
+    if (!res.ok) {
+      const detail = await readErrorDetail(res);
+      throw new Error(detail || "status indisponible");
+    }
+    const status = await res.json();
+    actuatorsStatusById.set(id, status || {});
+    return status;
+  } catch (err) {
+    if (!silent) {
+      setActuatorsMessage(
+        `Erreur status ${id}: ${err && err.message ? err.message : "indisponible"}`,
+        true
+      );
+    }
+    return null;
+  }
+}
+
+async function fetchActuators() {
+  if (!actuatorsList) return;
+  setActuatorsMessage("Chargement...");
+  try {
+    const res = await fetch("/actuators");
+    if (!res.ok) {
+      const detail = await readErrorDetail(res);
+      throw new Error(detail || "actuators indisponible");
+    }
+    const data = await res.json();
+    const devices = normalizeActuatorDevices(data)
+      .filter((item) => item && item.id)
+      .sort((a, b) => String(a.id).localeCompare(String(b.id), "fr"));
+    actuatorsDevices = devices;
+    await Promise.all(
+      devices.map((device) => fetchActuatorStatus(String(device.id), true))
+    );
+    renderActuators();
+    const count = devices.length;
+    setActuatorsMessage(`${count} device${count > 1 ? "s" : ""}`);
+  } catch (err) {
+    actuatorsDevices = [];
+    actuatorsStatusById.clear();
+    renderActuators();
+    setActuatorsMessage(
+      `Erreur: ${err && err.message ? err.message : "actuators indisponible"}`,
+      true
+    );
+  }
+}
+
+async function sendActuatorCommand(id, action, params) {
+  const res = await fetch(`/actuators/${encodeURIComponent(id)}/command`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action, params }),
+  });
+  if (!res.ok) {
+    const detail = await readErrorDetail(res);
+    throw new Error(detail || "commande refusée");
+  }
+  return res.json();
+}
+
 function truncateText(text, maxLen) {
   const clean = String(text || "").replace(/\s+/g, " ").trim();
   if (!clean) return "";
@@ -1412,9 +1602,16 @@ async function fetchVisionDetections() {
 
 async function fetchVisionDetectionsSecondary() {
   if (!zonesOverlaySecondary) return;
+  if (Date.now() < visionSecondaryBackoffUntil) return;
   try {
     const res = await fetch("/vision/detections-secondary");
-    if (!res.ok) throw new Error("detections-secondary");
+    if (!res.ok) {
+      if (res.status === 503) {
+        visionSecondaryBackoffUntil = Date.now() + SERVICE_503_BACKOFF_MS;
+      }
+      throw new Error("detections-secondary");
+    }
+    visionSecondaryBackoffUntil = 0;
     const data = await res.json();
     visionDetectionsSecondary = Array.isArray(data.detections)
       ? data.detections
@@ -1461,6 +1658,9 @@ function setActiveTab(name) {
     } catch (err) {
       // ignore
     }
+  }
+  if (name === "actuators") {
+    fetchActuators();
   }
 }
 
@@ -1758,6 +1958,44 @@ if (didierFileSearch) {
 }
 
 renderDidierFiles();
+
+if (actuatorsRefresh) {
+  actuatorsRefresh.addEventListener("click", () => {
+    fetchActuators();
+  });
+}
+
+if (actuatorsList) {
+  actuatorsList.addEventListener("click", async (event) => {
+    const button = event.target.closest("button[data-actuator-action]");
+    if (!button) return;
+    const card = button.closest(".actuator-card");
+    if (!card) return;
+    const id = card.dataset.actuatorId;
+    const action = button.dataset.actuatorAction;
+    if (!id || !action) return;
+    const nameInput = card.querySelector(".actuator-name-input");
+    const params =
+      action === "validate"
+        ? { name: nameInput ? String(nameInput.value || "").trim() : "" }
+        : {};
+    setActuatorsMessage(`Envoi ${action}...`);
+    button.disabled = true;
+    try {
+      await sendActuatorCommand(id, action, params);
+      await fetchActuatorStatus(id, true);
+      renderActuators();
+      setActuatorsMessage(`Commande ${action} envoyée`);
+    } catch (err) {
+      setActuatorsMessage(
+        `Erreur ${action}: ${err && err.message ? err.message : "échec"}`,
+        true
+      );
+    } finally {
+      button.disabled = false;
+    }
+  });
+}
 
 
 if (cameraReconnect) {
