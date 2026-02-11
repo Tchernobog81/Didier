@@ -28,6 +28,7 @@ from core.status import read_status, update_status
 
 app = FastAPI(title="Didier Orchestrator", version="2.0")
 WEB_DIR = Path("web")
+app.mount("/static", StaticFiles(directory="web"), name="static")
 INDEX_PATH = WEB_DIR / "index.html"
 VERSION_PATH = Path("VERSION")
 if WEB_DIR.exists():
