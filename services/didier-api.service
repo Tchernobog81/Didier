@@ -1,0 +1,25 @@
+[Unit]
+Description=Didier MVP API Worker
+After=network-online.target didier-vision.service didier-brain.service didier-audio.service
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/mnt/didier_ssd/didier/workspace/Didier
+User=tchernobog
+Environment=PATH=/mnt/didier_ssd/didier/workspace/Didier/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=DIDIER_API_HOST=127.0.0.1
+Environment=DIDIER_API_PORT=5010
+Environment=DIDIER_VISION_URL=http://127.0.0.1:5011
+Environment=DIDIER_BRAIN_URL=http://127.0.0.1:5012
+Environment=DIDIER_AUDIO_URL=http://127.0.0.1:5013
+ExecStart=/mnt/didier_ssd/didier/workspace/Didier/venv/bin/python /mnt/didier_ssd/didier/workspace/Didier/scripts/run_api.py
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=20s
+TimeoutStopSec=10s
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

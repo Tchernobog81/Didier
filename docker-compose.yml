@@ -13,6 +13,10 @@ services:
     # le conteneur et l'hôte, donnant à Didier un accès direct aux services
     # de l'hôte (comme PulseAudio/PipeWire) et simplifiant la découverte Bluetooth.
     network_mode: "host"
+    entrypoint: ["/app/scripts/entrypoint_didier.sh"]
+    
+    # COMMANDE EXPLICITE : Lancement orchestrateur sur le port 5003
+    command: python3 /app/didier_orchestrator.py --port 5003
     
     # Privileged est souvent nécessaire pour un accès bas niveau au matériel
     # depuis un conteneur, notamment pour certains périphériques /dev.
@@ -24,18 +28,21 @@ services:
 
     environment:
       - PULSE_SERVER=unix:/run/user/1000/pulse/native
-      - PYTHONPATH=/usr/lib/python3/dist-packages
+      # Ajout de /app au PYTHONPATH pour trouver les modules locaux (router_*, audio_service)
+      - PYTHONPATH=/app:/usr/lib/python3/dist-packages
       - DIDIER_LOG_DIR=/app/logs
       - DIDIER_LOG_LEVEL=INFO
       - DIDIER_LOG_ROTATE_MB=25
       - DIDIER_LOG_BACKUPS=14
+      - OLLAMA_HOST=127.0.0.1:11435
 
     volumes:
       # --- Persistance des données et du code ---
       # Le mapping du répertoire courant permet de voir les modifications du code en direct.
-      - /mnt/didier_ssd/didier/code:/app
+      # CORRECTION : Le chemin pointait vers le mauvais dossier, empêchant de voir les modifications.
+      - /mnt/didier_ssd/didier/workspace/Didier:/app
       # Mapping des dossiers de configuration, de voix, et de logs.
-      - /mnt/didier_ssd/didier/code/config:/app/config
+      - /mnt/didier_ssd/didier/workspace/Didier/config:/app/config
       - /mnt/didier_ssd/didier/models/tts:/app/voices
       - /mnt/didier_ssd/didier/models/hailo:/app/models/hailo
       - /mnt/didier_ssd/didier/models/vision:/app/models/vision
@@ -122,6 +129,10 @@ services:
         "none",
         "/home/coder/project"
       ]
+    environment:
+      - OLLAMA_HOST=127.0.0.1:11435
+      - DIDIER_OLLAMA_URL=http://127.0.0.1:11435
+      - DIDIER_API_BASE=http://127.0.0.1:8000
     volumes:
       - /mnt/didier_ssd/didier/workspace/Didier:/home/coder/project
       - /mnt/didier_ssd/didier/vscode:/home/coder/.local/share/code-server

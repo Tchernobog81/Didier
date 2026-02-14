@@ -1,0 +1,22 @@
+[Unit]
+Description=Didier Legacy Orchestrator (Flask)
+After=network-online.target
+Wants=network-online.target
+Conflicts=run_didier.service
+
+[Service]
+WorkingDirectory=/mnt/didier_ssd/didier/workspace/Didier
+User=tchernobog
+Environment=PATH=/mnt/didier_ssd/didier/workspace/Didier/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PORT=5003
+ExecStart=python3 /mnt/didier_ssd/didier/workspace/Didier/didier_orchestrator.py
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=20s
+TimeoutStopSec=10s
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
