@@ -270,6 +270,11 @@ async def index() -> str:
     return "<h1>Didier</h1><p>UI not found.</p>"
 
 
+@app.get("/ping")
+async def ping() -> dict[str, Any]:
+    return {"status": "ok", "name": "Didier"}
+
+
 def _read_cpu_temp_c() -> float | None:
     temp_path = Path("/sys/class/thermal/thermal_zone0/temp")
     if not temp_path.exists():
@@ -402,16 +407,6 @@ def _read_mic_level(
         return {"available": False, "level_percent": None, "listening": False}
     if shutil.which("arecord") is None:
         return {"available": False, "level_percent": None, "listening": False}
-    now = time.time()
-    with _AUDIO_CACHE_LOCK:
-        if now - _AUDIO_CACHE["ts"] < cooldown and _AUDIO_CACHE["level"] is not None:
-            return {
-                "available": bool(_AUDIO_CACHE["available"]),
-                "level_percent": _AUDIO_CACHE["level"],
-                "cached": True,
-                "listening": False,
-            }
-
     status = _read_asr_status()
     if status.get("listening"):
         with _AUDIO_CACHE_LOCK:
@@ -421,6 +416,15 @@ def _read_mic_level(
             "level_percent": cached_level,
             "listening": True,
         }
+    now = time.time()
+    with _AUDIO_CACHE_LOCK:
+        if now - _AUDIO_CACHE["ts"] < cooldown and _AUDIO_CACHE["level"] is not None:
+            return {
+                "available": bool(_AUDIO_CACHE["available"]),
+                "level_percent": _AUDIO_CACHE["level"],
+                "cached": True,
+                "listening": False,
+            }
 
     cmd = [
         "arecord",
@@ -594,10 +598,12 @@ def _camera_reconnect(device: str | None) -> dict[str, Any]:
     if device and shutil.which("fuser"):
         result = subprocess.run(["fuser", device], capture_output=True, text=True, check=False)
         tokens = (result.stdout or "").replace(":", " ").split()
+        own_pids = {os.getpid(), os.getppid()}
         for token in tokens:
             if token.isdigit():
-                pids.append(int(token))
-        subprocess.run(["fuser", "-k", device], check=False)
+                pid = int(token)
+                if pid not in own_pids:
+                    pids.append(pid)
     # Kill known camera processes as a fallback
     for name in ["libcamera-vid", "libcamera-still", "libcamera-hello", "rpicam-vid", "rpicam-still", "mjpg_streamer", "ffmpeg", "gst-launch-1.0"]:
         subprocess.run(["pkill", "-9", "-f", name], check=False)
@@ -688,11 +694,18 @@ def _check_npu(device_path: str | None, pcie_address: str | None) -> dict[str, A
     return {"device": device_ok, "pcie": pcie_ok}
 
 
-def _check_tts(model_path: str | None, config_path: str | None) -> dict[str, Any]:
+def _check_tts(
+    model_path: str | None, config_path: str | None, voices_path: str | None = None
+) -> dict[str, Any]:
     model_ok = Path(model_path).exists() if model_path else False
     config_ok = Path(config_path).exists() if config_path else False
+    voices_ok = Path(voices_path).exists() if voices_path else False
     paplay_ok = shutil.which("paplay") is not None
-    return {"model": model_ok, "config": config_ok, "paplay": paplay_ok}
+    return {
+        "model": model_ok,
+        "config": config_ok or voices_ok,
+        "paplay": paplay_ok,
+    }
 
 
 def _normalize_zones(
@@ -788,7 +801,21 @@ def _open_camera(
 ) -> cv2.VideoCapture:
     if kill_on_open and device and shutil.which("fuser"):
         try:
-            subprocess.run(["fuser", "-k", device], check=False)
+            result = subprocess.run(
+                ["fuser", device], capture_output=True, text=True, check=False
+            )
+            own_pids = {os.getpid(), os.getppid()}
+            tokens = (result.stdout or "").replace(":", " ").split()
+            for token in tokens:
+                if not token.isdigit():
+                    continue
+                pid = int(token)
+                if pid in own_pids:
+                    continue
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except Exception:
+                    pass
         except Exception:
             pass
     if device:
@@ -932,9 +959,24 @@ def _mjpeg_generator_v4l2(
         "--stream-count=100000",
         "--stream-to=-",
     ]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    loop = asyncio.new_event_loop()
+    try:
+        proc = loop.run_until_complete(
+            asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        )
+    except Exception:
+        loop.close()
+        raise
     if not proc.stdout:
-        proc.terminate()
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        loop.close()
         raise RuntimeError("v4l2-ctl stdout unavailable")
     bytes_per_pixel = 2
     if fourcc in {"GRBG", "RGGB", "GBRG", "BGGR"}:
@@ -944,7 +986,7 @@ def _mjpeg_generator_v4l2(
     def read_exact(size: int) -> bytes | None:
         data = b""
         while len(data) < size:
-            chunk = proc.stdout.read(size - len(data))
+            chunk = loop.run_until_complete(proc.stdout.read(size - len(data)))
             if not chunk:
                 return None
             data += chunk
@@ -975,18 +1017,29 @@ def _mjpeg_generator_v4l2(
             )
             time.sleep(0.03)
     finally:
-        proc.terminate()
         try:
-            proc.wait(timeout=2)
+            proc.terminate()
         except Exception:
-            proc.kill()
+            pass
+        try:
+            loop.run_until_complete(asyncio.wait_for(proc.wait(), timeout=2))
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                loop.run_until_complete(proc.wait())
+            except Exception:
+                pass
+        loop.close()
 
 
 class RemoteMjpegStream:
     def __init__(self, input_url: str, fps: int = 15) -> None:
         self._input_url = input_url
         self._fps = fps
-        self._proc: subprocess.Popen | None = None
+        self._proc: asyncio.subprocess.Process | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -1025,19 +1078,30 @@ class RemoteMjpegStream:
             "mjpeg",
             "-",
         ]
+        loop: asyncio.AbstractEventLoop | None = None
         try:
-            self._proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            loop = asyncio.new_event_loop()
+            self._proc = loop.run_until_complete(
+                asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
             )
         except Exception as exc:
             self._last_error = str(exc)
+            try:
+                if loop is not None:
+                    loop.close()
+            except Exception:
+                pass
             return
         buffer = b""
         try:
             while not self._stop.is_set():
                 if not self._proc or not self._proc.stdout:
                     break
-                chunk = self._proc.stdout.read(4096)
+                chunk = loop.run_until_complete(self._proc.stdout.read(4096))
                 if not chunk:
                     break
                 buffer += chunk
@@ -1059,7 +1123,22 @@ class RemoteMjpegStream:
                     self._proc.terminate()
                 except Exception:
                     pass
+                try:
+                    loop.run_until_complete(asyncio.wait_for(self._proc.wait(), timeout=2))
+                except Exception:
+                    try:
+                        self._proc.kill()
+                    except Exception:
+                        pass
+                    try:
+                        loop.run_until_complete(self._proc.wait())
+                    except Exception:
+                        pass
                 self._proc = None
+            try:
+                loop.close()
+            except Exception:
+                pass
 
     def get_last(self) -> tuple[bytes | None, float]:
         with self._lock:
@@ -1195,4 +1274,3 @@ async def clawbot_veille() -> dict[str, Any]:
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"clawbot veille failed: {exc}")
     return {"status": "ok", "report": report}
-
