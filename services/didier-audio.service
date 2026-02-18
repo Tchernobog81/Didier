@@ -9,6 +9,7 @@ User=tchernobog
 Environment=PATH=/mnt/didier_ssd/didier/workspace/Didier/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=DIDIER_AUDIO_HOST=127.0.0.1
 Environment=DIDIER_AUDIO_PORT=5013
+Environment=DIDIER_AUDIO_SOCK=/tmp/didier_audio.sock
 Environment=DIDIER_TTS_MODEL_PATH=/mnt/didier_ssd/didier/models/tts/kokoro-v1.0.onnx
 Environment=DIDIER_TTS_CONFIG_PATH=/mnt/didier_ssd/didier/models/tts/kokoro-v0.19.json
 Environment=DIDIER_TTS_VOICES_PATH=/mnt/didier_ssd/didier/models/tts/voices-v1.0.bin
@@ -18,6 +19,7 @@ Environment=DIDIER_TTS_LANG=fr-fr
 Environment=DIDIER_AUDIO_SINK=bluez_output.00_07_80_E0_3F_F0.1
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=PULSE_SERVER=unix:/run/user/1000/pulse/native
+ExecStartPre=-/usr/bin/rm -f /tmp/didier_audio.sock
 ExecStart=/mnt/didier_ssd/didier/workspace/Didier/venv/bin/python /mnt/didier_ssd/didier/workspace/Didier/scripts/run_audio.py
 Restart=on-failure
 RestartSec=2s

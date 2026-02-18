@@ -7,6 +7,7 @@ import asyncio
 import os
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,12 @@ import soundfile as sf
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from kokoro_onnx import Kokoro
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from core.shared_state import update_worker_metrics
 
 AUDIO_HOST = os.getenv("DIDIER_AUDIO_HOST", "127.0.0.1")
 AUDIO_PORT = int(os.getenv("DIDIER_AUDIO_PORT", "5013"))
@@ -49,6 +56,7 @@ app = FastAPI(title="Didier MVP Audio", version="0.1.0")
 
 _queue: asyncio.Queue[str] = asyncio.Queue()
 _worker_task: asyncio.Task[None] | None = None
+_shared_state_task: asyncio.Task[None] | None = None
 _kokoro: Kokoro | None = None
 
 audio_state: dict[str, Any] = {
@@ -126,6 +134,22 @@ async def _worker_loop() -> None:
             audio_state["queue_size"] = _queue.qsize()
 
 
+async def _publish_shared_state_loop() -> None:
+    while True:
+        healthy = bool(audio_state["model_loaded"] and audio_state["paplay_ok"])
+        payload = {
+            "status": "ok" if healthy else "degraded",
+            "service": "didier-audio",
+            "uptime_s": round(time.time() - APP_STARTED_AT, 3),
+            "detail": "ready" if healthy else (audio_state["last_error"] or "audio_not_ready"),
+            "queue_size": int(audio_state["queue_size"]),
+            "speaking": bool(audio_state["speaking"]),
+            "mode": str(audio_state["mode"]),
+        }
+        await asyncio.to_thread(update_worker_metrics, "audio", payload)
+        await asyncio.sleep(0.5)
+
+
 def _generate_beep(path: Path) -> None:
     sample_rate = 22050
     duration = 0.18
@@ -138,7 +162,7 @@ def _generate_beep(path: Path) -> None:
 
 @app.on_event("startup")
 async def _startup() -> None:
-    global _kokoro, _worker_task
+    global _kokoro, _worker_task, _shared_state_task
     audio_state["paplay_ok"] = bool(shutil.which("paplay"))
     try:
         _kokoro = await asyncio.to_thread(_load_model)
@@ -149,14 +173,22 @@ async def _startup() -> None:
         audio_state["mode"] = "degraded"
         audio_state["last_error"] = str(exc)
     _worker_task = asyncio.create_task(_worker_loop())
+    _shared_state_task = asyncio.create_task(_publish_shared_state_loop())
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
+    global _shared_state_task
     if _worker_task:
         _worker_task.cancel()
         try:
             await _worker_task
+        except asyncio.CancelledError:
+            pass
+    if _shared_state_task:
+        _shared_state_task.cancel()
+        try:
+            await _shared_state_task
         except asyncio.CancelledError:
             pass
 
@@ -226,7 +258,15 @@ async def beep() -> dict[str, Any]:
 
 
 def main() -> int:
-    uvicorn.run(app, host=AUDIO_HOST, port=AUDIO_PORT, log_level="info")
+    socket_path = os.getenv("DIDIER_AUDIO_SOCK", "/tmp/didier_audio.sock").strip()
+    if socket_path:
+        try:
+            Path(socket_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+        uvicorn.run(app, uds=socket_path, log_level="info")
+    else:
+        uvicorn.run(app, host=AUDIO_HOST, port=AUDIO_PORT, log_level="info")
     return 0
 
 

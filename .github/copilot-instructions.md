@@ -11,12 +11,12 @@ Short, actionable guidance for AI agents to be immediately productive in this re
 - Two runtime entrypoints:
   - API: `main.py` (FastAPI) exposes `/health`, `POST /chat` and `GET /models/search`.
   - Hardware UI / quick ops: `didier_orchestrator.py` (Flask) — small web UI, monitors hardware and calls Ollama.
-- Local model hosting: `ollama` container (see `docker-compose.yml` and `ollama/` directory that contains model manifests/blobs).
+- Local model hosting (dev only): `ollama` stack (see `docker-compose.dev.yml` and `ollama/` directory that contains model manifests/blobs).
 
 ## How to run / developer workflows ▶️
 - Local dev (Python): create venv, install `requirements.txt` and run:
   - `uvicorn main:app --host 0.0.0.0 --port 8000 --reload`
-- Docker (recommended for full stack): `docker compose up -d` (uses `docker-compose.yml` to start `ollama` + `didier-brain`).
+- Docker (dev only): `docker compose -f docker-compose.dev.yml up -d`.
 - The docker `didier-brain` container runs `didier_orchestrator.py` (Flask UI on port 5000) and maps devices (`/dev/hailo0`, camera, sound).
 - System service: `run_didier.service` included — update `User` and paths before enabling.
 - Useful checks: `scripts/init_repo.sh` initializes repo; `check_didier.sh` contains health tips (e.g., query Ollama tags on `http://localhost:11434/api/tags`).
@@ -31,7 +31,7 @@ Short, actionable guidance for AI agents to be immediately productive in this re
 - Persistence & memory:
   - `orchestrator/memory.py` manages SQLite schema (`conversations` table). Use `get_recent()` and `save_message()` to build context for prompts.
   - Note: `didier_orchestrator.py` also uses a separate `memory.json` for UI audit — this is a repo-specific divergence to be aware of.
-- Hardware and device mapping: `docker-compose.yml` mounts `/dev/hailo0` and other devices into `didier-brain`; code checks `/dev/hailo0` to detect NPU.
+- Hardware and device mapping (dev compose): `docker-compose.dev.yml` mounts `/dev/hailo0` and other devices into `didier-brain`; code checks `/dev/hailo0` to detect NPU.
 
 ## Integration points & externals ⚙️
 - Ollama: local model serving via `ollama/` + `ollama` container. The Flask UI calls Ollama at `ollama:11434` in Docker; in local dev use `localhost:11434`.

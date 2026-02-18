@@ -1,18 +1,11 @@
 [Unit]
-Description=Didier Orchestrator
+Description=Didier Legacy API 5003 (ARCHIVED - DO NOT USE)
 After=network.target
+RefuseManualStart=yes
 
 [Service]
-User=tchernobog
-WorkingDirectory=/home/tchernobog/workspace/Didier
-Environment=PATH=/home/tchernobog/workspace/Didier/venv/bin
-Environment=DIDIER_LOG_DIR=/home/tchernobog/workspace/Didier/logs
-Environment=DIDIER_LOG_LEVEL=INFO
-Environment=DIDIER_LOG_ROTATE_MB=25
-Environment=DIDIER_LOG_BACKUPS=14
-ExecStart=/home/tchernobog/workspace/Didier/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
-Restart=on-failure
-RestartSec=5s
+Type=oneshot
+ExecStart=/bin/false
 
 [Install]
 WantedBy=multi-user.target

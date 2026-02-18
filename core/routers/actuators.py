@@ -6,7 +6,7 @@ router = APIRouter(prefix="/actuators", tags=["actuators"])
 
 
 def _get_actuators_tentacle() -> Any:
-    from core import api as api_module
+    from core import runtime_bridge as api_module
 
     orchestrator = api_module._require_orchestrator()
     tentacle = orchestrator.get_tentacle("actuators")
@@ -45,3 +45,5 @@ async def actuator_command(
         return tentacle.command(id, action, params)
     except KeyError:
         raise HTTPException(status_code=404, detail="device not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))

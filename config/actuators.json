@@ -3,50 +3,140 @@
     "yl_192_168_1_19": {
       "type": "yeelight",
       "ip": "192.168.1.19",
-      "name": "Lampe Salon",
+      "name": "Cuisine",
       "validated": true,
-      "capabilities": ["on", "off"],
-      "tags": ["light", "wifi"]
+      "capabilities": [
+        "on",
+        "off"
+      ],
+      "tags": [
+        "light",
+        "wifi"
+      ],
+      "last_command": {
+        "ts": 1771088379.7785437,
+        "action": "off",
+        "params": {}
+      },
+      "last_validation": {
+        "ts": 1771087803.4231157,
+        "result": "ok"
+      }
     },
     "yl_192_168_1_12": {
       "type": "yeelight",
       "ip": "192.168.1.12",
-      "name": "",
-      "validated": false,
-      "capabilities": ["on", "off"],
-      "tags": ["light", "wifi"]
+      "name": "Entrée",
+      "validated": true,
+      "capabilities": [
+        "on",
+        "off"
+      ],
+      "tags": [
+        "light",
+        "wifi"
+      ],
+      "last_command": {
+        "ts": 1771405981.6323671,
+        "action": "off",
+        "params": {}
+      },
+      "last_validation": {
+        "ts": 1771087596.6139562,
+        "result": "ok"
+      }
     },
     "yl_192_168_1_18": {
       "type": "yeelight",
       "ip": "192.168.1.18",
-      "name": "",
-      "validated": false,
-      "capabilities": ["on", "off"],
-      "tags": ["light", "wifi"]
+      "name": "Chiottes",
+      "validated": true,
+      "capabilities": [
+        "on",
+        "off"
+      ],
+      "tags": [
+        "light",
+        "wifi"
+      ],
+      "last_command": {
+        "ts": 1771424464.6932633,
+        "action": "off",
+        "params": {}
+      },
+      "last_validation": {
+        "ts": 1771087780.375744,
+        "result": "ok"
+      }
     },
     "yl_192_168_1_24": {
       "type": "yeelight",
       "ip": "192.168.1.24",
-      "name": "",
-      "validated": false,
-      "capabilities": ["on", "off"],
-      "tags": ["light", "wifi"]
+      "name": "Canapé",
+      "validated": true,
+      "capabilities": [
+        "on",
+        "off"
+      ],
+      "tags": [
+        "light",
+        "wifi"
+      ],
+      "last_command": {
+        "ts": 1771432894.6101081,
+        "action": "off",
+        "params": {}
+      },
+      "last_validation": {
+        "ts": 1771087835.1426013,
+        "result": "ok"
+      }
     },
     "yl_192_168_1_23": {
       "type": "yeelight",
       "ip": "192.168.1.23",
-      "name": "",
-      "validated": false,
-      "capabilities": ["on", "off"],
-      "tags": ["light", "wifi"]
+      "name": "Salle à manger",
+      "validated": true,
+      "capabilities": [
+        "on",
+        "off"
+      ],
+      "tags": [
+        "light",
+        "wifi"
+      ],
+      "last_command": {
+        "ts": 1771088876.7720592,
+        "action": "off",
+        "params": {}
+      },
+      "last_validation": {
+        "ts": 1771087574.271642,
+        "result": "ok"
+      }
     },
     "yl_192_168_1_22": {
       "type": "yeelight",
       "ip": "192.168.1.22",
-      "name": "",
-      "validated": false,
-      "capabilities": ["on", "off"],
-      "tags": ["light", "wifi"]
+      "name": "Dancefloor",
+      "validated": true,
+      "capabilities": [
+        "on",
+        "off"
+      ],
+      "tags": [
+        "light",
+        "wifi"
+      ],
+      "last_command": {
+        "ts": 1771088381.3436036,
+        "action": "off",
+        "params": {}
+      },
+      "last_validation": {
+        "ts": 1771087819.8513432,
+        "result": "ok"
+      }
     }
   }
 }

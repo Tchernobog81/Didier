@@ -14,16 +14,9 @@ fi
 echo "--- CONNEXION SOUNDBOKS ---"
 echo "1. Assurez-vous que la Soundboks est allumée et en mode APPAIRAGE (LED bleue clignotante)."
 
-# Vérification du module PulseAudio (souvent manquant après reboot)
-if command -v pulseaudio &> /dev/null && ! pulseaudio --check; then
-    echo "⚠️  PulseAudio n'est pas lancé. Démarrage..."
-    pulseaudio --start
-    sleep 2
-fi
-
-if command -v pactl &> /dev/null && ! pactl list modules short 2>/dev/null | grep -q "module-bluetooth-discover"; then
-    echo "⚠️  Module Bluetooth PulseAudio non chargé. Tentative de chargement..."
-    pactl load-module module-bluetooth-discover 2>/dev/null || echo "⚠️  Impossible de charger le module (vérifiez 'pulseaudio-module-bluetooth')."
+if ! command -v pactl &> /dev/null; then
+    echo "❌ pactl indisponible. PipeWire/PulseAudio requis."
+    exit 1
 fi
 
 bluetoothctl power on
@@ -63,22 +56,36 @@ bluetoothctl connect $MAC
 if bluetoothctl info $MAC | grep -q "Connected: yes"; then
     echo "✅ Connecté !"
     
-    # Tentative de bascule audio (PulseAudio)
+    # Tentative de bascule audio (PipeWire/PulseAudio)
     if command -v pactl &> /dev/null; then
-        # On attend que le sink apparaisse
-        sleep 2
+        # On attend que la carte/sink bluetooth apparaisse
+        sleep 1
         MAC_STR=$(echo $MAC | tr ':' '_')
-        SINK=$(pactl list short sinks | grep "bluez_sink.$MAC_STR" | awk '{print $2}' | head -n 1)
+        CARD="bluez_card.$MAC_STR"
+        for _ in $(seq 1 20); do
+            if pactl list cards short 2>/dev/null | awk '{print $2}' | grep -q "^$CARD$"; then
+                break
+            fi
+            sleep 0.5
+        done
+        # Force profil A2DP pour créer un sink de lecture
+        pactl set-card-profile "$CARD" a2dp-sink 2>/dev/null || true
+        sleep 0.5
+        SINK=$(pactl list short sinks | awk '{print $2}' | grep "bluez_output.$MAC_STR" | head -n 1)
         
         if [ -n "$SINK" ]; then
             pactl set-default-sink "$SINK"
             echo "🔊 Sortie audio définie sur $SINK"
+            # Déplace les flux déjà ouverts vers la SB
+            while read -r input_id _; do
+                [ -n "$input_id" ] && pactl move-sink-input "$input_id" "$SINK" 2>/dev/null || true
+            done < <(pactl list short sink-inputs 2>/dev/null)
             # Notification vocale via Piper pour confirmer la connexion
             PIPER="/home/tchernobog/workspace/Didier/voices/piper/piper"
             MODEL="/home/tchernobog/workspace/Didier/voices/fr_FR-siwis-low.onnx"
             if [ -f "$PIPER" ]; then echo "Connexion établie." | "$PIPER" --model "$MODEL" --output_file /tmp/didier_ready.wav && paplay /tmp/didier_ready.wav; fi
         else
-            echo "⚠️ Pas de sink audio détecté (PulseAudio). Vérifiez 'pactl list sinks'."
+            echo "⚠️ Pas de sink audio détecté. Vérifiez 'pactl list cards' et 'pactl list sinks'."
         fi
     fi
 else

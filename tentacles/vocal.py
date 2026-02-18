@@ -30,6 +30,11 @@ class Tentacle(BaseTentacle):
         self._config_path = Path(
             self.config.get("tts.config_path", "voices/kokoro-v1.0.json")
         )
+        self._voices_path = Path(
+            self.config.get("tts.voices_path", "voices/voices-v1.0.bin")
+        )
+        self._voice = self.config.get("tts.voice", "af_bella")
+        self._lang = self.config.get("tts.lang", "fr-fr")
         self._output_path = Path(
             self.config.get("tts.output_path", "data/didier_speaks.wav")
         )
@@ -67,19 +72,37 @@ class Tentacle(BaseTentacle):
         await asyncio.to_thread(self._play_beep)
 
     async def _load_model(self) -> None:
-        if not self._model_path.exists() or not self._config_path.exists():
+        if not self._model_path.exists():
             self._logger.error(
-                "Missing Kokoro model/config: %s %s",
+                "Missing Kokoro model: %s",
                 self._model_path,
-                self._config_path,
             )
             self._enabled = False
             return
 
         try:
-            self._kokoro = await asyncio.to_thread(
-                Kokoro, model=str(self._model_path), config_path=str(self._config_path)
-            )
+            if self._voices_path.exists():
+                # kokoro-onnx >= 0.5 API
+                self._kokoro = await asyncio.to_thread(
+                    Kokoro,
+                    model_path=str(self._model_path),
+                    voices_path=str(self._voices_path),
+                )
+            elif self._config_path.exists():
+                # Compatibility path for older kokoro-onnx API
+                self._kokoro = await asyncio.to_thread(
+                    Kokoro,
+                    model=str(self._model_path),
+                    config_path=str(self._config_path),
+                )
+            else:
+                self._logger.error(
+                    "Missing Kokoro voices/config: %s %s",
+                    self._voices_path,
+                    self._config_path,
+                )
+                self._enabled = False
+                return
         except Exception:
             self._logger.exception("Failed to initialize Kokoro.")
             self._enabled = False
@@ -91,9 +114,14 @@ class Tentacle(BaseTentacle):
 
         try:
             update_status(speaking=True, state="SPEAKING", last_speak_at=time.time())
-            wav_data, sample_rate = await asyncio.to_thread(
-                self._kokoro.get_speech_ary, text
-            )
+            if hasattr(self._kokoro, "create"):
+                wav_data, sample_rate = await asyncio.to_thread(
+                    self._kokoro.create, text, self._voice, 1.0, self._lang
+                )
+            else:
+                wav_data, sample_rate = await asyncio.to_thread(
+                    self._kokoro.get_speech_ary, text
+                )
             self._output_path.parent.mkdir(parents=True, exist_ok=True)
             await asyncio.to_thread(
                 sf.write, str(self._output_path), wav_data, sample_rate

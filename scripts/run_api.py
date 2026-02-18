@@ -7,6 +7,7 @@ import asyncio
 import os
 import time
 from pathlib import Path
+import sys
 from typing import Any
 
 import httpx
@@ -23,6 +24,13 @@ VISION_BASE_URL = os.getenv("DIDIER_VISION_URL", "http://127.0.0.1:5011")
 BRAIN_BASE_URL = os.getenv("DIDIER_BRAIN_URL", "http://127.0.0.1:5012")
 AUDIO_BASE_URL = os.getenv("DIDIER_AUDIO_URL", "http://127.0.0.1:5013")
 AUDIO_PROXY_TIMEOUT_S = float(os.getenv("DIDIER_AUDIO_PROXY_TIMEOUT_S", "1.5"))
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from shared.ipc import health as ipc_health
+from shared.ipc import request as ipc_request
 
 WEB_DIR = Path("web")
 INDEX_PATH = WEB_DIR / "index.html"
@@ -45,26 +53,16 @@ if WEB_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
 
 
-async def _fetch_health(base_url: str) -> dict[str, Any]:
-    try:
-        async with httpx.AsyncClient(timeout=1.5) as client:
-            res = await client.get(f"{base_url}/health")
-            if not res.is_success:
-                return {"ok": False, "detail": f"http {res.status_code}"}
-            payload = res.json()
-            status = str(payload.get("status", "ok")).lower()
-            detail = payload.get("detail") or payload.get("service") or payload.get("name") or status
-            return {"ok": status == "ok", "detail": str(detail), "status": status}
-    except Exception as exc:  # pragma: no cover
-        return {"ok": False, "detail": str(exc)}
+async def _fetch_health(service: str, base_url: str) -> dict[str, Any]:
+    return await ipc_health(service, base_url=base_url, timeout=1.5)
 
 
 async def _poll_backends() -> None:
     while True:
         vision, brain, audio = await asyncio.gather(
-            _fetch_health(VISION_BASE_URL),
-            _fetch_health(BRAIN_BASE_URL),
-            _fetch_health(AUDIO_BASE_URL),
+            _fetch_health("vision", VISION_BASE_URL),
+            _fetch_health("brain", BRAIN_BASE_URL),
+            _fetch_health("audio", AUDIO_BASE_URL),
         )
         runtime_state["vision"] = vision
         runtime_state["brain"] = brain
@@ -74,12 +72,18 @@ async def _poll_backends() -> None:
 
 async def _post_backend(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     try:
-        async with httpx.AsyncClient(timeout=AUDIO_PROXY_TIMEOUT_S) as client:
-            res = await client.post(f"{AUDIO_BASE_URL}{path}", json=payload)
-            if not res.is_success:
-                detail = await read_backend_detail(res)
-                raise HTTPException(status_code=res.status_code, detail=detail)
-            return res.json()
+        res = await ipc_request(
+            "POST",
+            path,
+            service="audio",
+            base_url=AUDIO_BASE_URL,
+            payload=payload,
+            timeout=AUDIO_PROXY_TIMEOUT_S,
+        )
+        if not res.is_success:
+            detail = await read_backend_detail(res)
+            raise HTTPException(status_code=res.status_code, detail=detail)
+        return res.json()
     except HTTPException:
         raise
     except Exception as exc:  # pragma: no cover

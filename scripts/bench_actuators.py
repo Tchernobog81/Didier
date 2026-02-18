@@ -125,7 +125,7 @@ def write_html_report(path: Path, blocks: list[StatBlock], base_url: str, device
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Simple actuators endpoint benchmark")
-    parser.add_argument("--base-url", default="http://127.0.0.1:5003")
+    parser.add_argument("--base-url", default="http://127.0.0.1:5010")
     parser.add_argument("--device-id", default="yl_192_168_1_19")
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--html-out", default="actuators_bench_report.html")

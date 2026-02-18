@@ -1,7 +1,6 @@
 import json
 import threading
 import time
-from pathlib import Path
 from typing import Any, Iterable
 
 
@@ -82,10 +81,3 @@ class MemoryStore:
             lines.append(line)
             total += len(line) + 1
         return "\n".join(lines).strip()
-
-    def write_openclaw_memory(self, path: Path, max_chars: int = 4000) -> None:
-        content = self.render(max_chars=max_chars)
-        if not content:
-            content = "Aucune mémoire enregistrée pour le moment."
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")

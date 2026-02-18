@@ -20,7 +20,6 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from core.logging import setup_logging
-from core.memory import MemoryStore
 from core.orchestrator import Orchestrator
 from core.routers import ai_router, system_router, vision_router
 from core.status import read_status, update_status
@@ -372,27 +371,6 @@ def _read_asr_status() -> dict[str, Any]:
     status.setdefault("speaking", False)
     status.setdefault("state", "IDLE")
     return status
-
-
-def _load_openclaw_prompt(config: Any) -> str:
-    workspace = config.get("openclaw.workspace", "")
-    files = config.get(
-        "openclaw.bootstrap_files", ["AGENTS.md", "MEMORY.md", "SOUL.md", "USER.md", "TOOLS.md"]
-    )
-    if not workspace:
-        return ""
-    root = Path(workspace)
-    if not root.exists():
-        return ""
-    sections = []
-    for name in files:
-        path = root / name
-        if not path.exists():
-            continue
-        content = path.read_text(encoding="utf-8").strip()
-        if content:
-            sections.append(f"### {name}\n{content}")
-    return "\n\n".join(sections).strip()
 
 
 def _read_mic_level(
@@ -1114,106 +1092,3 @@ def _remote_mjpeg_generator(stream: RemoteMjpegStream) -> Generator[bytes, None,
                 b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
             )
         time.sleep(interval_s)
-
-
-@app.post("/clawbot")
-async def clawbot(payload: dict[str, Any]) -> dict[str, Any]:
-    prompt = str(payload.get("prompt", "")).strip()
-    if not prompt:
-        raise HTTPException(status_code=400, detail="prompt required")
-    orchestrator = _require_orchestrator()
-    config = orchestrator.config
-    base_url = config.get("ollama.base_url", "http://localhost:11434")
-    model = config.get(
-        "clawbot.model",
-        config.get("coding.model", config.get("ollama.model")),
-    )
-    num_predict = config.get(
-        "clawbot.num_predict",
-        config.get("coding.num_predict", config.get("ollama.num_predict", 200)),
-    )
-    temperature = config.get(
-        "clawbot.temperature",
-        config.get("coding.temperature", config.get("ollama.temperature", 0.4)),
-    )
-    system_prompt = config.get(
-        "clawbot.system_prompt",
-        "Tu es Clawbot, un agent OpenClaw. Tu réponds en français, brièvement, et tu suis AGENTS/TOOLS/SOUL/USER.",
-    ).strip()
-    model = await _resolve_ollama_model(base_url, model, config.get("ollama.model"))
-    memory_path = config.get("memory.path", "data/memory.json")
-    max_items = int(config.get("memory.max_items", 200))
-    max_chars = int(config.get("memory.max_chars", 8000))
-    memory = MemoryStore(memory_path, max_items=max_items, max_chars=max_chars)
-    memory_context = memory.render()
-    openclaw_prompt = _load_openclaw_prompt(config)
-
-    parts = []
-    if openclaw_prompt:
-        parts.append(openclaw_prompt)
-    if memory_context:
-        parts.append(f"### MÉMOIRE PERSISTANTE\n{memory_context}")
-    if system_prompt:
-        parts.append(system_prompt)
-    parts.append(f"User: {prompt}\nClawbot:")
-    full_prompt = "\n\n".join(parts)
-
-    payload_data = {
-        "model": model,
-        "prompt": full_prompt,
-        "stream": False,
-        "options": {
-            "num_predict": num_predict,
-            "temperature": temperature,
-        },
-    }
-    url = f"{base_url}/api/generate"
-    try:
-        import httpx
-
-        async with httpx.AsyncClient(timeout=120) as client:
-            response = await client.post(url, json=payload_data)
-            response.raise_for_status()
-            data = response.json()
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Ollama unavailable: {exc}")
-    response_text = str(data.get("response", "")).strip()
-    memory.add("user", prompt)
-    memory.add("assistant", response_text)
-    workspace = config.get("openclaw.workspace", "")
-    if workspace:
-        memory.write_openclaw_memory(Path(workspace) / "MEMORY.md")
-    return {"response": response_text}
-
-
-@app.get("/clawbot/report")
-async def clawbot_report(limit: int = 6) -> dict[str, Any]:
-    orchestrator = _require_orchestrator()
-    config = orchestrator.config
-    report_path = Path(config.get("clawbot.report_path", "data/clawbot_report.json"))
-    limit = max(1, min(50, int(limit)))
-    if not report_path.exists():
-        return {"available": False, "history": []}
-    try:
-        data = json.loads(report_path.read_text(encoding="utf-8"))
-    except Exception:
-        return {"available": False, "history": []}
-    history = data.get("history", [])
-    if not isinstance(history, list):
-        history = []
-    if limit:
-        history = history[-limit:]
-    return {"available": True, "history": history}
-
-
-@app.post("/clawbot/veille")
-async def clawbot_veille() -> dict[str, Any]:
-    orchestrator = _require_orchestrator()
-    claw = orchestrator.get_tentacle("clawbot")
-    if not claw or not hasattr(claw, "run_once"):
-        raise HTTPException(status_code=503, detail="clawbot tentacle not ready")
-    try:
-        report = await claw.run_once()
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"clawbot veille failed: {exc}")
-    return {"status": "ok", "report": report}

@@ -22,7 +22,6 @@ from fastapi.staticfiles import StaticFiles
 from jinja2 import Template
 
 from core.logging import setup_logging
-from core.memory import MemoryStore
 from core.orchestrator import Orchestrator
 from core.status import read_status, update_status
 
@@ -160,56 +159,13 @@ async def _run_cmd_async_text(cmd: list[str], timeout: float = 2.0) -> str:
     return (stdout + stderr).decode("utf-8", errors="ignore").strip()
 
 def _get_docker_root() -> Path:
-    cached = _DOCKER_ROOT_CACHE.get("path")
-    if cached and (time.time() - float(_DOCKER_ROOT_CACHE.get("ts", 0.0)) < 10):
-        return Path(cached)
-    default_root = Path("/host/var/lib/docker")
-    daemon_path = Path("/host/etc/docker/daemon.json")
-    docker_root = default_root
-    if daemon_path.exists():
-        try:
-            data = json.loads(daemon_path.read_text(encoding="utf-8"))
-            root = data.get("data-root") if isinstance(data, dict) else None
-            if root:
-                docker_root = Path("/host") / str(root).lstrip("/")
-        except Exception:
-            docker_root = default_root
-    _DOCKER_ROOT_CACHE["path"] = str(docker_root)
-    _DOCKER_ROOT_CACHE["ts"] = time.time()
-    return docker_root
+    # Compatibility shim: production runtime is now native systemd (no Docker root scan).
+    return Path("/nonexistent")
 
 
 def _read_docker_containers() -> list[dict[str, Any]]:
-    containers: list[dict[str, Any]] = []
-    containers_dir = _get_docker_root() / "containers"
-    if not containers_dir.exists():
-        return containers
-    for cfg_path in containers_dir.glob("*/config.v2.json"):
-        try:
-            data = json.loads(cfg_path.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        name = str(data.get("Name") or "").lstrip("/")
-        state = data.get("State") if isinstance(data.get("State"), dict) else {}
-        status = state.get("Status") if isinstance(state, dict) else None
-        if not status and isinstance(state, dict):
-            if state.get("Running") is True:
-                status = "running"
-        config = data.get("Config") if isinstance(data.get("Config"), dict) else {}
-        labels = config.get("Labels") if isinstance(config.get("Labels"), dict) else {}
-        service = labels.get("com.docker.compose.service") if labels else None
-        image = config.get("Image") or data.get("Image") or None
-        containers.append(
-            {
-                "id": data.get("ID"),
-                "name": name or service or "inconnu",
-                "service": service,
-                "status": status,
-                "image": image,
-            }
-        )
-    containers.sort(key=lambda item: str(item.get("name", "")))
-    return containers
+    # Compatibility shim for /docker/diagram legacy endpoint.
+    return []
 
 
 def _search_repo_files(query: str, limit: int = 40) -> list[dict[str, Any]]:
@@ -508,27 +464,6 @@ def _read_asr_status() -> dict[str, Any]:
     return status
 
 
-def _load_openclaw_prompt(config: Any) -> str:
-    workspace = config.get("openclaw.workspace", "")
-    files = config.get(
-        "openclaw.bootstrap_files", ["AGENTS.md", "MEMORY.md", "SOUL.md", "USER.md", "TOOLS.md"]
-    )
-    if not workspace:
-        return ""
-    root = Path(workspace)
-    if not root.exists():
-        return ""
-    sections = []
-    for name in files:
-        path = root / name
-        if not path.exists():
-            continue
-        content = path.read_text(encoding="utf-8").strip()
-        if content:
-            sections.append(f"### {name}\n{content}")
-    return "\n\n".join(sections).strip()
-
-
 async def _read_mic_level(
     alsa_device: str, sample_rate: int, channels: int = 1, cooldown: float = 1.5
 ) -> dict[str, Any]:
@@ -641,7 +576,6 @@ async def _monitor_system():
 async def metrics() -> dict[str, Any]:
     orchestrator = _require_orchestrator()
     didier_model = orchestrator.config.get("ollama.model", None)
-    clawbot_model = orchestrator.config.get("clawbot.model", None)
     ssd_mount = orchestrator.config.get("storage.ssd_mount", "/mnt/didier_ssd")
     host_root = "/host" if Path("/host").exists() else "/"
     host_ssd = f"{host_root}{ssd_mount}" if ssd_mount.startswith("/") else None
@@ -726,14 +660,96 @@ async def _resolve_ollama_model(
 
 def _check_soundboks_sink(sink_name: str) -> dict[str, Any]:
     try:
+        def _parse_sink_names(raw_output: str) -> list[str]:
+            names: list[str] = []
+            for raw in raw_output.splitlines():
+                line = raw.strip()
+                if not line:
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 2:
+                    names.append(parts[1].strip())
+                    continue
+                fallback = line.split()
+                if len(fallback) >= 2:
+                    names.append(fallback[1].strip())
+            return names
+
         result = subprocess.run(
             ["pactl", "list", "short", "sinks"],
             capture_output=True,
             text=True,
             check=True,
         )
-        available = sink_name in result.stdout
-        return {"available": available, "sink": sink_name}
+        sink_names = _parse_sink_names(result.stdout or "")
+
+        mac_token = ""
+        if sink_name.startswith("bluez_output."):
+            mac_token = sink_name[len("bluez_output.") :].split(".", 1)[0]
+        exact_match = bool(sink_name) and sink_name in sink_names
+        fuzzy_match = None
+        if mac_token:
+            for name in sink_names:
+                if name.startswith("bluez_output.") and mac_token in name:
+                    fuzzy_match = name
+                    break
+
+        default_sink = None
+        info = subprocess.run(
+            ["pactl", "info"], capture_output=True, text=True, check=False
+        )
+        for line in (info.stdout or "").splitlines():
+            if line.startswith("Default Sink:"):
+                default_sink = line.split(":", 1)[1].strip() or None
+                break
+
+        available = exact_match or bool(fuzzy_match)
+        matched_sink = sink_name if exact_match else fuzzy_match
+
+        self_healed = False
+        if not available and mac_token:
+            card_name = f"bluez_card.{mac_token}"
+            subprocess.run(
+                ["pactl", "set-card-profile", card_name, "a2dp-sink"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            retry = subprocess.run(
+                ["pactl", "list", "short", "sinks"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            retry_names = _parse_sink_names(retry.stdout or "")
+            for name in retry_names:
+                if name == sink_name or (mac_token and mac_token in name):
+                    available = True
+                    matched_sink = name
+                    self_healed = True
+                    break
+
+        if not available and default_sink:
+            if sink_name and default_sink == sink_name:
+                available = True
+                matched_sink = default_sink
+            elif mac_token and mac_token in default_sink:
+                available = True
+                matched_sink = default_sink
+        if available and matched_sink and default_sink != matched_sink:
+            subprocess.run(
+                ["pactl", "set-default-sink", matched_sink],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        return {
+            "available": available,
+            "sink": sink_name,
+            "matched_sink": matched_sink,
+            "default_sink": default_sink,
+            "self_healed": self_healed,
+        }
     except Exception as exc:
         return {"available": False, "sink": sink_name, "error": str(exc)}
 
@@ -990,7 +1006,6 @@ async def device_status() -> dict[str, Any]:
     npu_device = orchestrator.config.get("npu.device", "/dev/hailo0")
     npu_pcie = orchestrator.config.get("npu.pcie_address", "0001:01:00.0")
     didier_model = orchestrator.config.get("ollama.model", None)
-    clawbot_model = orchestrator.config.get("clawbot.model", None)
     secondary_cfg = orchestrator.config.get("vision.remote_stream", {}) or {}
     secondary_enabled = bool(secondary_cfg.get("enabled", True))
 
@@ -1059,7 +1074,6 @@ async def device_status() -> dict[str, Any]:
         "version": version,
         "models": {
             "didier": didier_model,
-            "clawbot": clawbot_model,
         },
     }
 
@@ -1631,109 +1645,6 @@ async def coding(payload: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Ollama unavailable: {exc}")
     return {"response": str(data.get("response", "")).strip()}
-
-
-@app.post("/clawbot")
-async def clawbot(payload: dict[str, Any]) -> dict[str, Any]:
-    prompt = str(payload.get("prompt", "")).strip()
-    if not prompt:
-        raise HTTPException(status_code=400, detail="prompt required")
-    orchestrator = _require_orchestrator()
-    config = orchestrator.config
-    base_url = config.get("ollama.base_url", "http://localhost:11434")
-    model = config.get(
-        "clawbot.model",
-        config.get("coding.model", config.get("ollama.model")),
-    )
-    num_predict = config.get(
-        "clawbot.num_predict",
-        config.get("coding.num_predict", config.get("ollama.num_predict", 200)),
-    )
-    temperature = config.get(
-        "clawbot.temperature",
-        config.get("coding.temperature", config.get("ollama.temperature", 0.4)),
-    )
-    system_prompt = config.get(
-        "clawbot.system_prompt",
-        "Tu es Clawbot, un agent OpenClaw. Tu réponds en français, brièvement, et tu suis AGENTS/TOOLS/SOUL/USER.",
-    ).strip()
-    model = await _resolve_ollama_model(base_url, model, config.get("ollama.model"))
-    memory_path = config.get("memory.path", "data/memory.json")
-    max_items = int(config.get("memory.max_items", 200))
-    max_chars = int(config.get("memory.max_chars", 8000))
-    memory = MemoryStore(memory_path, max_items=max_items, max_chars=max_chars)
-    memory_context = memory.render()
-    openclaw_prompt = _load_openclaw_prompt(config)
-
-    parts = []
-    if openclaw_prompt:
-        parts.append(openclaw_prompt)
-    if memory_context:
-        parts.append(f"### MÉMOIRE PERSISTANTE\n{memory_context}")
-    if system_prompt:
-        parts.append(system_prompt)
-    parts.append(f"User: {prompt}\nClawbot:")
-    full_prompt = "\n\n".join(parts)
-
-    payload_data = {
-        "model": model,
-        "prompt": full_prompt,
-        "stream": False,
-        "options": {
-            "num_predict": num_predict,
-            "temperature": temperature,
-        },
-    }
-    url = f"{base_url}/api/generate"
-    try:
-        import httpx
-
-        async with httpx.AsyncClient(timeout=120) as client:
-            response = await client.post(url, json=payload_data)
-            response.raise_for_status()
-            data = response.json()
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Ollama unavailable: {exc}")
-    response_text = str(data.get("response", "")).strip()
-    memory.add("user", prompt)
-    memory.add("assistant", response_text)
-    workspace = config.get("openclaw.workspace", "")
-    if workspace:
-        memory.write_openclaw_memory(Path(workspace) / "MEMORY.md")
-    return {"response": response_text}
-
-
-@app.get("/clawbot/report")
-async def clawbot_report(limit: int = 6) -> dict[str, Any]:
-    orchestrator = _require_orchestrator()
-    config = orchestrator.config
-    report_path = Path(config.get("clawbot.report_path", "data/clawbot_report.json"))
-    limit = max(1, min(50, int(limit)))
-    if not report_path.exists():
-        return {"available": False, "history": []}
-    try:
-        data = json.loads(report_path.read_text(encoding="utf-8"))
-    except Exception:
-        return {"available": False, "history": []}
-    history = data.get("history", [])
-    if not isinstance(history, list):
-        history = []
-    if limit:
-        history = history[-limit:]
-    return {"available": True, "history": history}
-
-
-@app.post("/clawbot/veille")
-async def clawbot_veille() -> dict[str, Any]:
-    orchestrator = _require_orchestrator()
-    claw = orchestrator.get_tentacle("clawbot")
-    if not claw or not hasattr(claw, "run_once"):
-        raise HTTPException(status_code=503, detail="clawbot tentacle not ready")
-    try:
-        report = await claw.run_once()
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"clawbot veille failed: {exc}")
-    return {"status": "ok", "report": report}
 
 
 @app.get("/ollama/models")

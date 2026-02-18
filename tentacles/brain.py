@@ -64,12 +64,6 @@ class Tentacle(BaseTentacle):
         )
         self._system_prompt = self.config.get("personality.system_prompt", "").strip()
         self._catchphrases = self.config.get("personality.catchphrases", [])
-        self._openclaw_workspace = self.config.get("openclaw.workspace", "")
-        self._openclaw_files = self.config.get(
-            "openclaw.bootstrap_files",
-            ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"],
-        )
-        self._openclaw_prompt = self._load_openclaw_prompt()
         memory_path = self.config.get("memory.path", "data/memory.json")
         max_items = int(self.config.get("memory.max_items", 200))
         max_chars = int(self.config.get("memory.max_chars", 8000))
@@ -81,22 +75,6 @@ class Tentacle(BaseTentacle):
         self._autotune_last_run = 0.0
         self._autotune_last_switch = 0.0
         self._busy = False
-
-    def _load_openclaw_prompt(self) -> str:
-        if not self._openclaw_workspace:
-            return ""
-        workspace = Path(self._openclaw_workspace).expanduser()
-        if not workspace.exists():
-            return ""
-        sections = []
-        for name in self._openclaw_files:
-            path = workspace / name
-            if not path.exists():
-                continue
-            content = path.read_text(encoding="utf-8").strip()
-            if content:
-                sections.append(f"### {name}\n{content}")
-        return "\n\n".join(sections).strip()
 
     async def run(self) -> None:
         self._logger.info("Brain tentacle ready (model=%s).", self._model)
@@ -119,8 +97,6 @@ class Tentacle(BaseTentacle):
         async with self._memory_lock:
             memory_context = self._memory.render()
         parts = []
-        if self._openclaw_prompt:
-            parts.append(self._openclaw_prompt)
         if memory_context:
             parts.append(f"### MÉMOIRE PERSISTANTE\n{memory_context}")
         if self._system_prompt:
@@ -159,9 +135,6 @@ class Tentacle(BaseTentacle):
         async with self._memory_lock:
             self._memory.add("user", prompt)
             self._memory.add("assistant", response_text)
-            if self._openclaw_workspace:
-                path = Path(self._openclaw_workspace) / "MEMORY.md"
-                self._memory.write_openclaw_memory(path)
         update_status(
             thinking=False,
             state="IDLE",

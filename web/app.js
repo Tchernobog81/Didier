@@ -1,4 +1,6 @@
 const statusPill = document.getElementById("status-pill");
+const wakeLoopTestBtn = document.getElementById("wake-loop-test-btn");
+const wakeLoopTestResult = document.getElementById("wake-loop-test-result");
 const tempEl = document.getElementById("temp");
 const cpuEl = document.getElementById("cpu");
 const cpuCoresEl = document.getElementById("cpu-cores");
@@ -39,11 +41,7 @@ const enrollOwner = document.getElementById("enroll-owner");
 const didierOutput = document.getElementById("didier-output");
 const didierForm = document.getElementById("didier-form");
 const didierPrompt = document.getElementById("didier-prompt");
-const clawbotOutput = document.getElementById("clawbot-output");
-const clawbotForm = document.getElementById("clawbot-form");
-const clawbotPrompt = document.getElementById("clawbot-prompt");
 const didierTitle = document.getElementById("didier-title");
-const clawbotTitle = document.getElementById("clawbot-title");
 const detectionTags = document.getElementById("detection-tags");
 const detectionTagsEmpty = document.getElementById("detection-tags-empty");
 const detectionTagsMeta = document.getElementById("detection-tags-meta");
@@ -54,9 +52,12 @@ const detectionTagsEditorLabel = document.getElementById(
 const detectionTagsEditorInput = document.getElementById(
   "detection-tags-editor-input"
 );
-const clawbotLog = document.getElementById("clawbot-log");
-const clawbotLogMeta = document.getElementById("clawbot-log-meta");
 const vscodeFrame = document.getElementById("vscode-frame");
+const vscodeFallback = document.getElementById("vscode-fallback");
+const vscodeDirectLink = document.getElementById("vscode-direct-link");
+const edgeTerminalOutput = document.getElementById("edge-terminal-output");
+const edgeTerminalForm = document.getElementById("edge-terminal-form");
+const edgeTerminalInput = document.getElementById("edge-terminal-input");
 const codingOutput = document.getElementById("coding-output");
 const codingForm = document.getElementById("coding-form");
 const codingPrompt = document.getElementById("coding-prompt");
@@ -77,10 +78,24 @@ const devicePillSound = document.getElementById("pill-sound");
 const devicePillMic = document.getElementById("pill-mic");
 const didierTabTime = document.getElementById("didier-tab-time");
 const videoStreamSecondary = document.getElementById("video-stream-secondary");
+const primaryStreamFallback = document.getElementById("primary-stream-fallback");
+const primaryStreamFallbackText = document.getElementById(
+  "primary-stream-fallback-text"
+);
+const primaryStreamFallbackLogo = document.getElementById(
+  "primary-stream-fallback-logo"
+);
+const surfaceStreamFallback = document.getElementById("surface-stream-fallback");
+const surfaceStreamFallbackText = document.getElementById(
+  "surface-stream-fallback-text"
+);
+const surfaceStreamFallbackLogo = document.getElementById(
+  "surface-stream-fallback-logo"
+);
 
 const DIDIER_TIMEOUT_MS = 90000;
-const CLAWBOT_TIMEOUT_MS = 90000;
 const CODING_TIMEOUT_MS = 120000;
+const TERMINAL_TIMEOUT_MS = 10000;
 const MAX_FILE_SIZE = 200 * 1024;
 const MAX_INSERT_CHARS = 4000;
 const VIDEO_STALE_S = 3.5;
@@ -91,12 +106,30 @@ const SURFACE_STATUS_POLL_MS = 3000;
 const SERVICE_503_BACKOFF_MS = 30000;
 
 let lastVideoRefreshAt = 0;
+let lastSecondaryRefreshAt = 0;
 let latestCpuMetrics = null;
 let hasRenderedCpuMetrics = false;
 let actuatorsDevices = [];
 let actuatorsStatusById = new Map();
 let ollamaBackoffUntil = 0;
 let visionSecondaryBackoffUntil = 0;
+let latestDeviceStatus = null;
+let currentActiveTab = null;
+let vscodeInitInFlight = false;
+let asrChatSyncInitialized = false;
+let asrSeenPromptAt = 0;
+let asrSeenResponseAt = 0;
+const actuatorRealtimeTimers = new Map();
+const ACTUATOR_COLOR_PRESETS = [
+  "#ffffff",
+  "#ff4d4f",
+  "#ff8a00",
+  "#ffd400",
+  "#52c41a",
+  "#00d4ff",
+  "#1677ff",
+  "#722ed1",
+];
 
 function withTimeout(ms) {
   const controller = new AbortController();
@@ -121,6 +154,23 @@ function clampPercent(value) {
 function setBar(el, percent) {
   if (!el) return;
   el.style.width = `${clampPercent(percent)}%`;
+}
+
+function terminalLines(target) {
+  if (!target) return [];
+  return String(target.textContent || "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+function terminalHasRecentLine(target, line, maxLines = 8) {
+  const needle = String(line || "").trim();
+  if (!needle) return false;
+  const lines = terminalLines(target);
+  if (!lines.length) return false;
+  const recent = lines.slice(-Math.max(1, maxLines));
+  return recent.includes(needle);
 }
 
 const PILL_CLASSES = ["is-ok", "is-warn", "is-bad", "is-unknown"];
@@ -171,6 +221,23 @@ function updateSurfacePillFromBackend(secondary) {
     setPillState(devicePillSurfaceVideo, "unknown", "désactivé");
     return true;
   }
+  const status = String(secondary.status || "").toLowerCase();
+  if (status === "online") {
+    const ageRaw = secondary.age_s;
+    const ageS = Number.isFinite(Number(ageRaw)) ? Number(ageRaw) : 0;
+    if (ageS < 6) {
+      setPillState(devicePillSurfaceVideo, "ok", "flux ok");
+    } else if (ageS < 18) {
+      setPillState(devicePillSurfaceVideo, "warn", "flux lent");
+    } else {
+      setPillState(devicePillSurfaceVideo, "bad", "flux figé");
+    }
+    return true;
+  }
+  if (status === "offline") {
+    setPillState(devicePillSurfaceVideo, "bad", "flux KO");
+    return true;
+  }
   const ageRaw = secondary.last_frame_age_s;
   const ageS = Number.isFinite(Number(ageRaw)) ? Number(ageRaw) : null;
   const opened = secondary.opened === true;
@@ -191,6 +258,54 @@ function updateSurfacePillFromBackend(secondary) {
   }
   setPillState(devicePillSurfaceVideo, "unknown", "en attente");
   return true;
+}
+
+function setStreamFallback(container, textEl, visible, message) {
+  if (!container) return;
+  container.hidden = !visible;
+  if (textEl && message) {
+    textEl.textContent = message;
+  }
+}
+
+function setSurfaceFallback(visible, message) {
+  setStreamFallback(
+    surfaceStreamFallback,
+    surfaceStreamFallbackText,
+    visible,
+    message
+  );
+}
+
+function setPrimaryFallback(visible, message) {
+  setStreamFallback(
+    primaryStreamFallback,
+    primaryStreamFallbackText,
+    visible,
+    message
+  );
+}
+
+function loadFallbackLogo(targetEl) {
+  if (!targetEl) return;
+  const candidates = ["/static/Didier.jpg", "/static/didier.jpg"];
+  const img = new Image();
+  let index = 0;
+
+  const tryNext = () => {
+    if (index >= candidates.length) return;
+    img.src = candidates[index];
+    index += 1;
+  };
+
+  img.onload = () => {
+    targetEl.style.backgroundImage = `url('${img.src}')`;
+    targetEl.textContent = "";
+  };
+  img.onerror = () => {
+    tryNext();
+  };
+  tryNext();
 }
 
 function updateDidierTabTime() {
@@ -270,12 +385,15 @@ if (didierTabTime) {
 if (videoStreamSecondary) {
   videoStreamSecondary.addEventListener("load", () => {
     surfaceLastFrameAt = Date.now();
+    setSurfaceFallback(false);
     if (!hasSurfaceBackendStatus) updateSurfacePill();
   });
   videoStreamSecondary.addEventListener("error", () => {
     surfaceLastErrorAt = Date.now();
+    setSurfaceFallback(true, "Flux indisponible. Verifie l'emetteur UDP.");
     if (!hasSurfaceBackendStatus) updateSurfacePill();
   });
+  setSurfaceFallback(true, "En attente du flux UDP 1234...");
   updateSurfacePill();
 }
 
@@ -448,11 +566,21 @@ async function fetchVisionStatusSecondary() {
     if (!res.ok) throw new Error("status-secondary");
     const data = await res.json();
     const secondary = data && data.camera_secondary ? data.camera_secondary : data;
+    if (secondary && secondary.enabled === false) {
+      setSurfaceFallback(true, "Flux secondaire desactive.");
+    } else if (secondary && secondary.status === "online") {
+      setSurfaceFallback(false);
+    } else if (secondary && secondary.opened && secondary.frame === false) {
+      setSurfaceFallback(true, "Flux detecte, attente d'image...");
+    } else {
+      setSurfaceFallback(true, "Aucun paquet recu sur UDP 1234.");
+    }
     if (!updateSurfacePillFromBackend(secondary)) {
       updateSurfacePill();
     }
   } catch (err) {
     hasSurfaceBackendStatus = false;
+    setSurfaceFallback(true, "Etat du flux secondaire indisponible.");
     updateSurfacePill();
   }
 }
@@ -496,9 +624,6 @@ function updateModelTitles(models) {
   if (didierTitle && models.didier) {
     didierTitle.textContent = `Parler à Didier (${models.didier})`;
   }
-  if (clawbotTitle && models.clawbot) {
-    clawbotTitle.textContent = `Parler à Clawbot (${models.clawbot})`;
-  }
 }
 
 async function fetchDeviceStatus() {
@@ -506,6 +631,7 @@ async function fetchDeviceStatus() {
     const res = await fetch("/device-status");
     if (!res.ok) throw new Error("status");
     const data = await res.json();
+    latestDeviceStatus = data;
     if (data.version) {
       const version = data.version.version || "inconnue";
       const git = data.version.git ? ` (${data.version.git})` : "";
@@ -527,16 +653,35 @@ async function fetchDeviceStatus() {
         }
       }
       if (data.camera.opened && data.camera.frame) {
+        setPrimaryFallback(false);
         if (stale) {
           setPillState(devicePillPs3Video, "warn", "flux lent");
         } else {
           setPillState(devicePillPs3Video, "ok", "flux ok");
         }
       } else {
+        setPrimaryFallback(true, "Flux indisponible. Verifie /dev/video0.");
         setPillState(devicePillPs3Video, "bad", "flux KO");
       }
     } else {
+      setPrimaryFallback(true, "Etat camera indisponible.");
       setPillState(devicePillPs3Video, "unknown", "N/D");
+    }
+    if (data.camera_secondary && videoStreamSecondary) {
+      const ageRaw = data.camera_secondary.last_frame_age_s;
+      const age =
+        ageRaw === null || ageRaw === undefined ? null : Number(ageRaw);
+      const stale = age !== null && Number.isFinite(age) && age > VIDEO_STALE_S;
+      const missing =
+        data.camera_secondary.frame === false ||
+        data.camera_secondary.opened === false;
+      if (stale || missing) {
+        const now = Date.now();
+        if (now - lastSecondaryRefreshAt > VIDEO_REFRESH_COOLDOWN_MS) {
+          lastSecondaryRefreshAt = now;
+          videoStreamSecondary.src = `/video/stream-secondary?ts=${Date.now()}`;
+        }
+      }
     }
     if (data.mic) {
       setPillState(
@@ -560,6 +705,8 @@ async function fetchDeviceStatus() {
       updateModelTitles(data.models);
     }
   } catch (err) {
+    latestDeviceStatus = null;
+    setPrimaryFallback(true, "Etat camera indisponible.");
     setPillState(devicePillPs3Video, "unknown", "N/D");
     setPillState(devicePillSound, "unknown", "N/D");
     setPillState(devicePillMic, "unknown", "N/D");
@@ -628,6 +775,35 @@ async function fetchAsrStatus() {
     if (lastHeardEl) {
       const heard = data.last_transcript || "";
       lastHeardEl.textContent = heard ? `Entendu : ${heard}` : "Entendu : --";
+    }
+    const promptAt = Number(data.last_prompt_at || 0);
+    const responseAt = Number(data.last_response_at || 0);
+    const promptText = String(data.last_prompt || "").trim();
+    const responseText = String(data.last_response || "").trim();
+    if (!asrChatSyncInitialized) {
+      asrSeenPromptAt = promptAt;
+      asrSeenResponseAt = responseAt;
+      asrChatSyncInitialized = true;
+    } else {
+      if (promptAt && promptAt > asrSeenPromptAt) {
+        asrSeenPromptAt = promptAt;
+        const promptLine = `> ${promptText}`;
+        if (
+          promptText &&
+          !terminalHasRecentLine(didierOutput, promptLine, 10)
+        ) {
+          appendTerminal(didierOutput, promptLine);
+        }
+      }
+      if (responseAt && responseAt > asrSeenResponseAt) {
+        asrSeenResponseAt = responseAt;
+        if (
+          responseText &&
+          !terminalHasRecentLine(didierOutput, responseText, 10)
+        ) {
+          appendTerminal(didierOutput, responseText);
+        }
+      }
     }
   } catch (err) {
     listeningBadge.textContent = "Écoute : inconnue";
@@ -934,60 +1110,235 @@ async function fetchFileSearch(query) {
 function statusToClass(status) {
   if (!status) return "is-unknown";
   const normalized = String(status).toLowerCase();
-  if (normalized.includes("run")) return "is-running";
+  if (
+    normalized.includes("run") ||
+    normalized.includes("ok") ||
+    normalized.includes("up") ||
+    normalized.includes("healthy")
+  ) {
+    return "is-running";
+  }
+  if (
+    normalized.includes("warn") ||
+    normalized.includes("degrad") ||
+    normalized.includes("partial") ||
+    normalized.includes("lent")
+  ) {
+    return "is-warn";
+  }
   if (normalized.includes("pause")) return "is-paused";
   if (
     normalized.includes("exit") ||
     normalized.includes("dead") ||
-    normalized.includes("stop")
+    normalized.includes("stop") ||
+    normalized.includes("ko") ||
+    normalized.includes("down") ||
+    normalized.includes("error") ||
+    normalized.includes("absent")
   ) {
     return "is-stopped";
   }
   return "is-unknown";
 }
 
-function buildDockerLayout(containers) {
-  const columns = [[], [], []];
-  const known = [
-    { name: "didier-proxy", label: "Reverse Proxy", column: 0 },
-    { name: "didier-brain", label: "Didier Brain", column: 1 },
-    { name: "didier-vscode", label: "VSCode", column: 1 },
-    { name: "ollama", label: "Ollama", column: 2 },
-  ];
-  const knownSet = new Set();
-  known.forEach((item) => {
-    const match = containers.find((c) => c.name === item.name);
-    if (!match) return;
-    knownSet.add(match.name);
-    columns[item.column].push({
-      id: match.name,
-      label: item.label,
-      status: match.status,
-      image: match.image,
+function statusToShortLabel(status) {
+  const cls = statusToClass(status);
+  if (cls === "is-running") return "OK";
+  if (cls === "is-warn") return "WARN";
+  if (cls === "is-paused") return "PAUSE";
+  if (cls === "is-stopped") return "KO";
+  return "UNK";
+}
+
+function shortImageName(image) {
+  if (!image) return "";
+  const value = String(image);
+  const slash = value.lastIndexOf("/");
+  return slash >= 0 ? value.slice(slash + 1) : value;
+}
+
+function buildDockerLayout(payload) {
+  const columns = [[], [], [], []];
+  const containers = Array.isArray(payload?.containers) ? payload.containers : [];
+  const workers = Array.isArray(payload?.workers) ? payload.workers : [];
+  const deviceStatus = payload?.deviceStatus || {};
+  const addNode = (column, id, label, status, meta) => {
+    columns[column].push({
+      id,
+      label,
+      status: status || "inconnu",
+      meta: meta || "",
     });
+  };
+
+  const healthOk = payload?.healthOk === true;
+  const healthName = payload?.healthName ? String(payload.healthName) : "Didier";
+  const models = deviceStatus.models && typeof deviceStatus.models === "object"
+    ? deviceStatus.models
+    : {};
+  const llmModel =
+    (models.didier && String(models.didier)) ||
+    (models.ask && String(models.ask)) ||
+    (models.brain && String(models.brain)) ||
+    (models.clawbot && String(models.clawbot)) ||
+    "";
+
+  addNode(0, "edge-dashboard", "Dashboard", healthOk ? "ok" : "inconnu", "HTTP 5003");
+  addNode(0, "edge-vscode", "VSCode", "ok", "/vscode");
+  addNode(1, "edge-api", healthName, healthOk ? "running" : "inconnu", "legacy API");
+  const workerNodeIds = [];
+  workers.forEach((worker, idx) => {
+    const rawName = worker && worker.name ? String(worker.name) : `worker-${idx + 1}`;
+    const nodeId = `edge-worker-${rawName.replace(/[^a-zA-Z0-9_-]/g, "_")}`;
+    workerNodeIds.push(nodeId);
+    addNode(
+      2,
+      nodeId,
+      worker && worker.label ? String(worker.label) : rawName,
+      worker && worker.status ? String(worker.status) : "inconnu",
+      worker && worker.meta ? String(worker.meta) : "worker"
+    );
   });
-  containers.forEach((c) => {
-    if (knownSet.has(c.name)) return;
-    columns[2].push({
-      id: c.name,
-      label: c.name,
-      status: c.status,
-      image: c.image,
-    });
-  });
-  dockerEdges = [
-    ["didier-proxy", "didier-brain"],
-    ["didier-proxy", "didier-vscode"],
-    ["didier-brain", "ollama"],
-  ].filter(
-    ([a, b]) => containers.some((c) => c.name === a) && containers.some((c) => c.name === b)
+  addNode(
+    3,
+    "edge-didier-model",
+    "LLM Didier",
+    llmModel ? "ok" : "inconnu",
+    llmModel || "modèle non défini"
   );
+
+  const camera = deviceStatus.camera || {};
+  const cameraAge = Number(camera.last_frame_age_s);
+  let cameraState = "inconnu";
+  if (camera.opened === true && camera.frame === true) {
+    cameraState = Number.isFinite(cameraAge) && cameraAge > VIDEO_STALE_S ? "warn" : "ok";
+  } else if (camera.opened === false || camera.frame === false) {
+    cameraState = "ko";
+  }
+  addNode(
+    3,
+    "edge-camera",
+    "Caméra PS3",
+    cameraState,
+    camera.device ? String(camera.device) : "source locale"
+  );
+
+  const secondary = deviceStatus.camera_secondary || {};
+  let secondaryState = "inconnu";
+  if (secondary.enabled === false) {
+    secondaryState = "inconnu";
+  } else if (secondary.opened === true && secondary.frame === true) {
+    const age = Number(secondary.last_frame_age_s);
+    secondaryState = Number.isFinite(age) && age > 10 ? "warn" : "ok";
+  } else if (secondary.opened === true && secondary.frame === false) {
+    secondaryState = "warn";
+  } else if (secondary.enabled === true) {
+    secondaryState = "ko";
+  }
+  addNode(3, "edge-camera-secondary", "Caméra Surface", secondaryState, "flux secondaire");
+
+  const micAvail = deviceStatus.mic ? deviceStatus.mic.available : null;
+  const soundAvail = deviceStatus.sound ? deviceStatus.sound.available : null;
+  let audioState = "inconnu";
+  if (micAvail === true && soundAvail === true) {
+    audioState = "ok";
+  } else if (micAvail === false && soundAvail === false) {
+    audioState = "ko";
+  } else if (micAvail === false || soundAvail === false) {
+    audioState = "warn";
+  }
+  addNode(
+    3,
+    "edge-audio",
+    "Audio",
+    audioState,
+    `mic:${micAvail === true ? "ok" : micAvail === false ? "ko" : "?"} · son:${
+      soundAvail === true ? "ok" : soundAvail === false ? "ko" : "?"
+    }`
+  );
+
+  const npu = deviceStatus.npu || {};
+  let npuState = "inconnu";
+  if (npu.device === true && npu.pcie === true) {
+    npuState = "ok";
+  } else if (npu.device === false && npu.pcie === false) {
+    npuState = "ko";
+  } else if (npu.device === false || npu.pcie === false) {
+    npuState = "warn";
+  }
+  addNode(
+    3,
+    "edge-npu",
+    "NPU Hailo",
+    npuState,
+    `dev:${npu.device === true ? "ok" : npu.device === false ? "ko" : "?"} · pcie:${
+      npu.pcie === true ? "ok" : npu.pcie === false ? "ko" : "?"
+    }`
+  );
+
+  const tts = deviceStatus.tts || {};
+  const ttsFlags = [tts.model, tts.config, tts.paplay];
+  const ttsTrueCount = ttsFlags.filter((item) => item === true).length;
+  let ttsState = "inconnu";
+  if (ttsTrueCount === ttsFlags.length && ttsFlags.length > 0) {
+    ttsState = "ok";
+  } else if (ttsTrueCount === 0 && ttsFlags.some((item) => item === false)) {
+    ttsState = "ko";
+  } else if (ttsFlags.some((item) => item === true) || ttsFlags.some((item) => item === false)) {
+    ttsState = "warn";
+  }
+  addNode(
+    3,
+    "edge-tts",
+    "TTS",
+    ttsState,
+    `modèle:${tts.model === true ? "ok" : tts.model === false ? "ko" : "?"}`
+  );
+
+  const containerNodeIds = [];
+  if (containers.length) {
+    addNode(
+      3,
+      "edge-docker-runtime",
+      "Runtime Dev",
+      "ok",
+      `${containers.length} service${containers.length > 1 ? "s" : ""} dev`
+    );
+    containers.slice(0, 8).forEach((container, idx) => {
+      const rawName = container && container.name ? String(container.name) : `container-${idx + 1}`;
+      const serviceName = container && container.service ? String(container.service) : rawName;
+      const nodeId = `edge-container-${rawName.replace(/[^a-zA-Z0-9_-]/g, "_")}`;
+      containerNodeIds.push(nodeId);
+      addNode(
+        3,
+        nodeId,
+        serviceName,
+        container && container.status ? String(container.status) : "inconnu",
+        shortImageName(container && container.image ? container.image : "")
+      );
+    });
+  }
+
+  dockerEdges = [
+    ["edge-dashboard", "edge-api"],
+    ["edge-vscode", "edge-api"],
+    ...workerNodeIds.map((nodeId) => ["edge-api", nodeId]),
+    ["edge-api", "edge-didier-model"],
+    ["edge-api", "edge-camera"],
+    ["edge-api", "edge-camera-secondary"],
+    ["edge-api", "edge-audio"],
+    ["edge-api", "edge-npu"],
+    ["edge-api", "edge-tts"],
+    ["edge-api", "edge-docker-runtime"],
+    ...containerNodeIds.map((nodeId) => ["edge-docker-runtime", nodeId]),
+  ];
   return columns;
 }
 
 function drawDockerLinks(svg) {
   if (!dockerGraph || !svg) return;
   const rect = dockerGraph.getBoundingClientRect();
+  if (rect.width < 8 || rect.height < 8) return;
   svg.setAttribute("viewBox", `0 0 ${rect.width} ${rect.height}`);
   svg.setAttribute("width", rect.width);
   svg.setAttribute("height", rect.height);
@@ -1030,15 +1381,20 @@ function drawDockerLinks(svg) {
 function renderDockerDiagram(payload) {
   if (!dockerGraph) return;
   const containers = Array.isArray(payload?.containers) ? payload.containers : [];
+  const columnTitles = ["Entrées", "Contrôle", "Workers Edge", "Infra"];
   dockerGraph.innerHTML = "";
   dockerNodesMap = new Map();
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.classList.add("docker-links");
   dockerGraph.appendChild(svg);
-  const columns = buildDockerLayout(containers);
-  columns.forEach((col) => {
+  const columns = buildDockerLayout(payload);
+  columns.forEach((col, idx) => {
     const columnEl = document.createElement("div");
     columnEl.className = "docker-column";
+    const columnTitle = document.createElement("h3");
+    columnTitle.className = "docker-column-title";
+    columnTitle.textContent = columnTitles[idx] || `Bloc ${idx + 1}`;
+    columnEl.appendChild(columnTitle);
     col.forEach((node) => {
       const nodeEl = document.createElement("div");
       nodeEl.className = `docker-node ${statusToClass(node.status)}`;
@@ -1046,35 +1402,87 @@ function renderDockerDiagram(payload) {
       const title = document.createElement("span");
       title.className = "docker-node-title";
       title.textContent = node.label;
+      const metaRow = document.createElement("div");
+      metaRow.className = "docker-node-meta-row";
+      const pill = document.createElement("span");
+      pill.className = `docker-node-pill ${statusToClass(node.status)}`;
+      pill.textContent = statusToShortLabel(node.status);
       const meta = document.createElement("span");
       meta.className = "docker-node-meta";
-      const statusLabel = node.status ? node.status : "inconnu";
-      meta.textContent = statusLabel;
+      meta.textContent = node.meta ? String(node.meta) : (node.status ? String(node.status) : "inconnu");
       nodeEl.appendChild(title);
-      nodeEl.appendChild(meta);
+      metaRow.appendChild(pill);
+      metaRow.appendChild(meta);
+      nodeEl.appendChild(metaRow);
       columnEl.appendChild(nodeEl);
       dockerNodesMap.set(node.id, nodeEl);
     });
     dockerGraph.appendChild(columnEl);
   });
   if (dockerMeta) {
-    const count = containers.length;
-    const suffix = count > 1 ? "conteneurs" : "conteneur";
+    const count = columns.reduce((total, col) => total + col.length, 0);
+    const workersCount = Array.isArray(payload?.workers) ? payload.workers.length : 0;
+    const suffix = count > 1 ? "composants" : "composant";
+    const runtime = `${containers.length} service${containers.length > 1 ? "s dev" : " dev"}`;
+    const workersLabel = `${workersCount} worker${workersCount > 1 ? "s" : ""}`;
     const at = payload?.ts ? formatTime(payload.ts) : "--:--:--";
-    dockerMeta.textContent = `${count} ${suffix} · ${at}`;
+    dockerMeta.textContent = `${count} ${suffix} · ${workersLabel} · ${runtime} · ${at}`;
   }
   requestAnimationFrame(() => drawDockerLinks(svg));
+  setTimeout(() => drawDockerLinks(svg), 120);
+}
+
+async function fetchJsonSafe(url) {
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (err) {
+    return null;
+  }
 }
 
 async function fetchDockerDiagram() {
   if (!dockerGraph) return;
+  if (currentActiveTab !== "docker") return;
   try {
-    const res = await fetch("/docker/diagram");
-    if (!res.ok) throw new Error("docker");
-    const data = await res.json();
-    renderDockerDiagram(data);
+    const [diagramData, healthData, deviceData, metricsData] = await Promise.all([
+      fetchJsonSafe("/docker/diagram"),
+      fetchJsonSafe("/health"),
+      latestDeviceStatus ? Promise.resolve(latestDeviceStatus) : fetchJsonSafe("/device-status"),
+      fetchJsonSafe("/metrics"),
+    ]);
+    if (!diagramData && !healthData && !deviceData && !metricsData) throw new Error("edge");
+    const workersFromMetricsRaw = metricsData && metricsData.workers ? metricsData.workers : null;
+    let workersFromMetrics = [];
+    if (Array.isArray(workersFromMetricsRaw)) {
+      workersFromMetrics = workersFromMetricsRaw;
+    } else if (workersFromMetricsRaw && typeof workersFromMetricsRaw === "object") {
+      workersFromMetrics = Object.entries(workersFromMetricsRaw).map(([name, info]) => ({
+        name,
+        label: `Worker ${String(name)}`,
+        status: info && info.status ? String(info.status) : "inconnu",
+        detail: info && info.detail ? String(info.detail) : "",
+        meta: info && info.service ? String(info.service) : "",
+      }));
+    }
+    const payload = {
+      ts: diagramData && diagramData.ts ? diagramData.ts : Date.now() / 1000,
+      containers:
+        diagramData && Array.isArray(diagramData.containers) ? diagramData.containers : [],
+      workers:
+        workersFromMetrics.length
+          ? workersFromMetrics
+          : diagramData && Array.isArray(diagramData.workers) ? diagramData.workers : [],
+      healthOk:
+        healthData &&
+        String(healthData.status || "").toLowerCase() === "ok",
+      healthName: healthData && healthData.name ? String(healthData.name) : "Didier",
+      deviceStatus: deviceData || latestDeviceStatus || null,
+    };
+    renderDockerDiagram(payload);
   } catch (err) {
-    dockerGraph.textContent = "Diagramme Docker indisponible.";
+    dockerGraph.textContent = "Schéma Workers Edge indisponible.";
     if (dockerMeta) dockerMeta.textContent = "--";
   }
 }
@@ -1101,16 +1509,39 @@ function formatActuatorLastCommand(command) {
   return `${action} @ ${at}`;
 }
 
+function toIntOrNull(value) {
+  const n = Number.parseInt(String(value ?? ""), 10);
+  return Number.isFinite(n) ? n : null;
+}
+
+function rgbNumberToHex(value) {
+  const n = toIntOrNull(value);
+  if (n === null || n < 0 || n > 16777215) return "#ffffff";
+  return `#${n.toString(16).padStart(6, "0")}`;
+}
+
 function actuatorViewModel(device) {
   const id = device && device.id ? String(device.id) : "";
   const status = actuatorsStatusById.get(id) || {};
   const merged = { ...(device || {}), ...status };
+  const state = merged && typeof merged.state === "object" ? merged.state : {};
+  let powerOn = null;
+  if (state && typeof state.power_on === "boolean") {
+    powerOn = state.power_on;
+  } else if (merged.last_command && typeof merged.last_command === "object") {
+    const lastAction = String(merged.last_command.action || "").toLowerCase();
+    if (lastAction === "on") powerOn = true;
+    if (lastAction === "off") powerOn = false;
+  }
+  const brightRaw = toIntOrNull(state.bright);
+  const brightness = brightRaw === null ? 100 : Math.max(1, Math.min(100, brightRaw));
+  const colorHex = rgbNumberToHex(state.rgb);
   return {
     id,
-    ip: merged.ip ? String(merged.ip) : "--",
     name: String(merged.name || "").trim(),
-    validated: !!merged.validated,
-    lastCommand: merged.last_command || null,
+    powerOn,
+    brightness,
+    colorHex,
   };
 }
 
@@ -1133,39 +1564,65 @@ function renderActuators() {
     const head = document.createElement("div");
     head.className = "actuator-head";
     const title = document.createElement("h3");
-    title.textContent = model.id;
-    const validated = document.createElement("span");
-    validated.className = `actuator-validated ${model.validated ? "is-yes" : "is-no"}`;
-    validated.textContent = model.validated ? "validé : oui" : "validé : non";
+    title.textContent = model.name || model.id;
     head.appendChild(title);
-    head.appendChild(validated);
-
-    const details = document.createElement("div");
-    details.className = "actuator-details";
-    const ip = document.createElement("div");
-    ip.textContent = `IP: ${model.ip}`;
-    const name = document.createElement("div");
-    name.textContent = `Nom: ${model.name || "non validé"}`;
-    const command = document.createElement("div");
-    command.textContent = `Dernière commande: ${formatActuatorLastCommand(
-      model.lastCommand
-    )}`;
-    details.appendChild(ip);
-    details.appendChild(name);
-    details.appendChild(command);
 
     const actions = document.createElement("div");
     actions.className = "actuator-actions";
-    const onBtn = document.createElement("button");
-    onBtn.type = "button";
-    onBtn.dataset.actuatorAction = "on";
-    onBtn.textContent = "On";
-    const offBtn = document.createElement("button");
-    offBtn.type = "button";
-    offBtn.dataset.actuatorAction = "off";
-    offBtn.textContent = "Off";
-    actions.appendChild(onBtn);
-    actions.appendChild(offBtn);
+    const toggleBtn = document.createElement("button");
+    toggleBtn.type = "button";
+    toggleBtn.className = `actuator-toggle ${
+      model.powerOn === true ? "is-on" : "is-off"
+    }`;
+    toggleBtn.dataset.actuatorAction = "toggle";
+    toggleBtn.dataset.actuatorNextAction = model.powerOn === true ? "off" : "on";
+    toggleBtn.textContent = model.powerOn === true ? "ON" : "OFF";
+    actions.appendChild(toggleBtn);
+
+    const dimmerRow = document.createElement("div");
+    dimmerRow.className = "actuator-dimmer";
+    const dimmerLabel = document.createElement("span");
+    dimmerLabel.textContent = "Intensité";
+    const dimmerInput = document.createElement("input");
+    dimmerInput.type = "range";
+    dimmerInput.min = "1";
+    dimmerInput.max = "100";
+    dimmerInput.step = "1";
+    dimmerInput.value = String(model.brightness);
+    dimmerInput.dataset.actuatorAction = "bright";
+    const dimmerValue = document.createElement("span");
+    dimmerValue.className = "actuator-dimmer-value";
+    dimmerValue.textContent = `${model.brightness}%`;
+    dimmerRow.appendChild(dimmerLabel);
+    dimmerRow.appendChild(dimmerInput);
+    dimmerRow.appendChild(dimmerValue);
+
+    const colorRow = document.createElement("div");
+    colorRow.className = "actuator-color";
+    const colorLabel = document.createElement("span");
+    colorLabel.textContent = "Couleur";
+    const colorInput = document.createElement("input");
+    colorInput.type = "color";
+    colorInput.value = model.colorHex;
+    colorInput.dataset.actuatorAction = "color";
+    const palette = document.createElement("div");
+    palette.className = "actuator-color-palette";
+    ACTUATOR_COLOR_PRESETS.forEach((hex) => {
+      const swatch = document.createElement("button");
+      swatch.type = "button";
+      swatch.className = "actuator-color-swatch";
+      if (hex.toLowerCase() === String(model.colorHex || "").toLowerCase()) {
+        swatch.classList.add("is-active");
+      }
+      swatch.style.backgroundColor = hex;
+      swatch.dataset.actuatorAction = "color-preset";
+      swatch.dataset.colorValue = hex;
+      swatch.title = hex;
+      palette.appendChild(swatch);
+    });
+    colorRow.appendChild(colorLabel);
+    colorRow.appendChild(colorInput);
+    colorRow.appendChild(palette);
 
     const renameRow = document.createElement("div");
     renameRow.className = "actuator-rename";
@@ -1177,13 +1634,14 @@ function renderActuators() {
     const validateBtn = document.createElement("button");
     validateBtn.type = "button";
     validateBtn.dataset.actuatorAction = "validate";
-    validateBtn.textContent = "Valider / Renommer";
+    validateBtn.textContent = "Valider";
     renameRow.appendChild(nameInput);
     renameRow.appendChild(validateBtn);
 
     card.appendChild(head);
-    card.appendChild(details);
     card.appendChild(actions);
+    card.appendChild(dimmerRow);
+    card.appendChild(colorRow);
     card.appendChild(renameRow);
     actuatorsList.appendChild(card);
   });
@@ -1251,56 +1709,15 @@ async function sendActuatorCommand(id, action, params) {
     const detail = await readErrorDetail(res);
     throw new Error(detail || "commande refusée");
   }
-  return res.json();
-}
-
-function truncateText(text, maxLen) {
-  const clean = String(text || "").replace(/\s+/g, " ").trim();
-  if (!clean) return "";
-  if (clean.length <= maxLen) return clean;
-  return `${clean.slice(0, maxLen).trimEnd()}…`;
-}
-
-function formatDateTime(ts) {
-  if (!ts) return "--:--:--";
-  const date = new Date(Number(ts) * 1000);
-  if (Number.isNaN(date.getTime())) return "--:--:--";
-  return date.toLocaleTimeString("fr-FR", {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
-}
-
-async function fetchClawbotReport() {
-  if (!clawbotLog) return;
-  try {
-    const res = await fetch("/clawbot/report?limit=6");
-    if (!res.ok) throw new Error("clawbot report");
-    const data = await res.json();
-    const history = Array.isArray(data.history) ? data.history : [];
-    if (!history.length) {
-      clawbotLog.textContent = "Aucun rapport Clawbot.";
-      if (clawbotLogMeta) clawbotLogMeta.textContent = "0 rapport";
-      return;
-    }
-    const lines = history.map((item) => {
-      const ts = item && item.ts ? formatDateTime(item.ts) : "--:--:--";
-      const response = item && item.response ? String(item.response) : "";
-      const summary = response.split("\n").find((line) => line.trim()) || "RAS";
-      return `[${ts}] ${truncateText(summary, 180)}`;
-    });
-    clawbotLog.textContent = lines.join("\n");
-    if (clawbotLogMeta) {
-      const last = history[history.length - 1];
-      const lastTs = last && last.ts ? formatDateTime(last.ts) : "--:--:--";
-      clawbotLogMeta.textContent = `${history.length} rapports · ${lastTs}`;
-    }
-    clawbotLog.scrollTop = clawbotLog.scrollHeight;
-  } catch (err) {
-    clawbotLog.textContent = "Rapport Clawbot indisponible.";
-    if (clawbotLogMeta) clawbotLogMeta.textContent = "--";
+  const data = await res.json();
+  if (data && data.ok === false) {
+    const detail =
+      data.error !== undefined && data.error !== null
+        ? String(data.error)
+        : "commande refusée";
+    throw new Error(detail);
   }
+  return data;
 }
 
 async function fetchVisionZones() {
@@ -1583,6 +2000,7 @@ function findDetectionAtPoint(canvasX, canvasY) {
 
 async function fetchVisionDetections() {
   if (!zonesOverlay) return;
+  if (document.hidden || currentActiveTab !== "vision") return;
   try {
     const res = await fetch("/vision/detections");
     if (!res.ok) throw new Error("detections");
@@ -1602,6 +2020,7 @@ async function fetchVisionDetections() {
 
 async function fetchVisionDetectionsSecondary() {
   if (!zonesOverlaySecondary) return;
+  if (document.hidden || currentActiveTab !== "vision") return;
   if (Date.now() < visionSecondaryBackoffUntil) return;
   try {
     const res = await fetch("/vision/detections-secondary");
@@ -1643,6 +2062,7 @@ if (detectionTagsEditorInput) {
 }
 
 function setActiveTab(name) {
+  currentActiveTab = name || null;
   tabButtons.forEach((btn) => {
     const active = btn.dataset.tab === name;
     btn.classList.toggle("is-active", active);
@@ -1661,6 +2081,15 @@ function setActiveTab(name) {
   }
   if (name === "actuators") {
     fetchActuators();
+  }
+  if (name === "docker") {
+    fetchDockerDiagram();
+  }
+  if (name === "vscode") {
+    initVscodeFrame(true);
+  }
+  if (name === "terminal" && edgeTerminalInput) {
+    edgeTerminalInput.focus();
   }
 }
 
@@ -1813,9 +2242,9 @@ fetchVisionDetections();
 setInterval(fetchVisionDetections, 1000);
 fetchVisionDetectionsSecondary();
 setInterval(fetchVisionDetectionsSecondary, 1500);
-fetchClawbotReport();
-setInterval(fetchClawbotReport, 6000);
 loadLogo();
+loadFallbackLogo(primaryStreamFallbackLogo);
+loadFallbackLogo(surfaceStreamFallbackLogo);
 if (zonesOverlay) {
   window.addEventListener("resize", () => {
     drawZones();
@@ -1881,6 +2310,7 @@ if (videoStream) {
   videoStream.onload = () => {
     videoRetries = 0;
     videoLoaded = true;
+    setPrimaryFallback(false);
     if (initialLoadTimer) {
       clearTimeout(initialLoadTimer);
       initialLoadTimer = null;
@@ -1890,6 +2320,7 @@ if (videoStream) {
 
   videoStream.onerror = () => {
     videoLoaded = false;
+    setPrimaryFallback(true, "Flux indisponible. Verifie /dev/video0.");
     const now = Date.now();
     if (!lastVideoErrorAt || now - lastVideoErrorAt > 15000) {
       if (cameraHoldersOutput) {
@@ -1913,6 +2344,7 @@ if (videoStream) {
       triggerCameraReconnect("auto");
     }
   }, 8000);
+  setPrimaryFallback(true, "En attente de /video/stream...");
 }
 
 if (codingForm && codingPrompt) {
@@ -1925,10 +2357,63 @@ if (codingForm && codingPrompt) {
   });
 }
 
-if (vscodeFrame) {
-  const host = window.location.hostname;
-  const protocol = window.location.protocol === "https:" ? "https:" : "http:";
-  vscodeFrame.src = `${protocol}//${host}/vscode/`;
+async function initVscodeFrame(force = false) {
+  if (!vscodeFrame) return;
+  if (vscodeInitInFlight && !force) return;
+  vscodeInitInFlight = true;
+  try {
+    const host = window.location.hostname;
+    const isHttps = window.location.protocol === "https:";
+    const projectFolder = "/home/coder/project";
+    const folderQuery = `?folder=${encodeURIComponent(projectFolder)}`;
+    const proxyUrl = `${window.location.origin}/vscode/${folderQuery}`;
+    const directUrl = `${isHttps ? "http:" : window.location.protocol}//${host}:8080/${folderQuery}`;
+    if (vscodeDirectLink) vscodeDirectLink.href = directUrl;
+
+    let proxyOk = false;
+    try {
+      const res = await fetch("/vscode/", { cache: "no-store" });
+      proxyOk = res.ok || (res.status >= 300 && res.status < 400);
+    } catch (_err) {
+      proxyOk = false;
+    }
+
+    if (proxyOk) {
+      if (vscodeFallback) vscodeFallback.hidden = true;
+      vscodeFrame.src = proxyUrl;
+      return;
+    }
+
+    if (vscodeFallback) vscodeFallback.hidden = false;
+    if (isHttps) {
+      // Browsers block insecure iframe content when UI runs on HTTPS.
+      vscodeFrame.src = "about:blank";
+      return;
+    }
+    let directReachable = false;
+    try {
+      await fetch(directUrl, { cache: "no-store", mode: "no-cors" });
+      directReachable = true;
+    } catch (_err) {
+      directReachable = false;
+    }
+    if (!directReachable) {
+      if (vscodeFallback) vscodeFallback.hidden = false;
+      vscodeFrame.src = "about:blank";
+      return;
+    }
+    if (vscodeFallback) vscodeFallback.hidden = true;
+    vscodeFrame.src = directUrl;
+  } finally {
+    vscodeInitInFlight = false;
+  }
+}
+
+initVscodeFrame();
+
+if (edgeTerminalOutput) {
+  appendTerminal(edgeTerminalOutput, "Didier Terminal prêt.");
+  appendTerminal(edgeTerminalOutput, "Exemples: ls -la, df -h, systemctl --failed");
 }
 
 fetchDockerDiagram();
@@ -1966,6 +2451,46 @@ if (actuatorsRefresh) {
 }
 
 if (actuatorsList) {
+  const queueRealtimeCommand = (id, action, params, delayMs = 120) => {
+    const key = `${id}:${action}`;
+    const previous = actuatorRealtimeTimers.get(key);
+    if (previous) clearTimeout(previous);
+    const timer = setTimeout(async () => {
+      actuatorRealtimeTimers.delete(key);
+      try {
+        await sendActuatorCommand(id, action, params);
+      } catch (err) {
+        setActuatorsMessage(
+          `Erreur ${action}: ${err && err.message ? err.message : "échec"}`,
+          true
+        );
+      }
+    }, delayMs);
+    actuatorRealtimeTimers.set(key, timer);
+  };
+
+  actuatorsList.addEventListener("input", (event) => {
+    const range = event.target.closest('input[type="range"][data-actuator-action="bright"]');
+    if (!range) return;
+    const row = range.closest(".actuator-dimmer");
+    const valueEl = row ? row.querySelector(".actuator-dimmer-value") : null;
+    if (valueEl) {
+      const value = Number(range.value || 100);
+      valueEl.textContent = `${Math.max(1, Math.min(100, value))}%`;
+    }
+    const card = range.closest(".actuator-card");
+    if (!card) return;
+    const id = card.dataset.actuatorId;
+    if (!id) return;
+    const value = Number.parseInt(String(range.value || "100"), 10);
+    queueRealtimeCommand(
+      id,
+      "bright",
+      { value: Math.max(1, Math.min(100, Number.isFinite(value) ? value : 100)) },
+      120
+    );
+  });
+
   actuatorsList.addEventListener("click", async (event) => {
     const button = event.target.closest("button[data-actuator-action]");
     if (!button) return;
@@ -1974,13 +2499,68 @@ if (actuatorsList) {
     const id = card.dataset.actuatorId;
     const action = button.dataset.actuatorAction;
     if (!id || !action) return;
+    if (action === "color-preset") {
+      const hex = String(button.dataset.colorValue || "#ffffff");
+      const colorInput = card.querySelector('input[type="color"][data-actuator-action="color"]');
+      if (colorInput) colorInput.value = hex;
+      setActuatorsMessage("Envoi color...");
+      button.disabled = true;
+      try {
+        await sendActuatorCommand(id, "color", { value: hex });
+        await fetchActuatorStatus(id, true);
+        renderActuators();
+        setActuatorsMessage("Commande color envoyée");
+      } catch (err) {
+        setActuatorsMessage(
+          `Erreur color: ${err && err.message ? err.message : "échec"}`,
+          true
+        );
+      } finally {
+        button.disabled = false;
+      }
+      return;
+    }
+    const effectiveAction =
+      action === "toggle"
+        ? String(button.dataset.actuatorNextAction || "on").toLowerCase()
+        : action;
     const nameInput = card.querySelector(".actuator-name-input");
     const params =
-      action === "validate"
+      effectiveAction === "validate"
         ? { name: nameInput ? String(nameInput.value || "").trim() : "" }
         : {};
-    setActuatorsMessage(`Envoi ${action}...`);
+    setActuatorsMessage(`Envoi ${effectiveAction}...`);
     button.disabled = true;
+    try {
+      await sendActuatorCommand(id, effectiveAction, params);
+      await fetchActuatorStatus(id, true);
+      renderActuators();
+      setActuatorsMessage(`Commande ${effectiveAction} envoyée`);
+    } catch (err) {
+      setActuatorsMessage(
+        `Erreur ${effectiveAction}: ${err && err.message ? err.message : "échec"}`,
+        true
+      );
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  actuatorsList.addEventListener("change", async (event) => {
+    const input = event.target.closest("input[data-actuator-action]");
+    if (!input) return;
+    const card = input.closest(".actuator-card");
+    if (!card) return;
+    const id = card.dataset.actuatorId;
+    const action = String(input.dataset.actuatorAction || "").toLowerCase();
+    if (!id || !action) return;
+    if (action !== "color") return;
+
+    let params = {};
+    params = { value: String(input.value || "#ffffff") };
+
+    input.disabled = true;
+    setActuatorsMessage(`Envoi ${action}...`);
     try {
       await sendActuatorCommand(id, action, params);
       await fetchActuatorStatus(id, true);
@@ -1992,7 +2572,7 @@ if (actuatorsList) {
         true
       );
     } finally {
-      button.disabled = false;
+      input.disabled = false;
     }
   });
 }
@@ -2062,33 +2642,47 @@ function appendTerminal(target, text) {
   target.scrollTop = target.scrollHeight;
 }
 
-async function sendConsolePrompt(target, endpoint, prompt) {
-  appendTerminal(target, `> ${prompt}`);
-  appendTerminal(target, "... réflexion ...");
+async function runEdgeTerminalCommand(command) {
+  const cmd = String(command || "").trim();
+  if (!cmd) return;
+  appendTerminal(edgeTerminalOutput, `$ ${cmd}`);
   try {
-    const { controller, clear } = withTimeout(CLAWBOT_TIMEOUT_MS);
-    const res = await fetch(endpoint, {
+    const { controller, clear } = withTimeout(TERMINAL_TIMEOUT_MS);
+    const res = await fetch("/terminal/exec", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt }),
+      body: JSON.stringify({ command: cmd }),
       signal: controller.signal,
     });
     clear();
     if (!res.ok) {
       const detail = await readErrorDetail(res);
-      throw new Error(detail || "service indisponible");
+      throw new Error(detail || "commande refusée");
     }
     const data = await res.json();
-    appendTerminal(target, data.response || "(pas de réponse)");
+    const out = String(data.output || "").trim();
+    appendTerminal(edgeTerminalOutput, out || "(aucune sortie)");
+    appendTerminal(
+      edgeTerminalOutput,
+      `[exit:${Number(data.exit_code || 0)} · ${Number(data.elapsed_ms || 0)}ms]`
+    );
   } catch (err) {
     const timeout = err && err.name === "AbortError";
     appendTerminal(
-      target,
+      edgeTerminalOutput,
       timeout
-        ? "erreur : délai dépassé"
-        : `erreur : ${err && err.message ? err.message : "service indisponible"}`
+        ? "Erreur: timeout commande"
+        : `Erreur: ${err && err.message ? err.message : "execution impossible"}`
     );
   }
+}
+
+function setWakeLoopResult(message, state = "info") {
+  if (!wakeLoopTestResult) return;
+  wakeLoopTestResult.textContent = message || "--";
+  wakeLoopTestResult.classList.remove("ok", "err");
+  if (state === "ok") wakeLoopTestResult.classList.add("ok");
+  if (state === "err") wakeLoopTestResult.classList.add("err");
 }
 
 if (didierForm) {
@@ -2101,13 +2695,72 @@ if (didierForm) {
   });
 }
 
-if (clawbotForm) {
-  clawbotForm.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const prompt = clawbotPrompt.value.trim();
-    if (!prompt) return;
-    clawbotPrompt.value = "";
-    await sendConsolePrompt(clawbotOutput, "/clawbot", prompt);
+if (edgeTerminalForm && edgeTerminalInput) {
+  edgeTerminalForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const command = edgeTerminalInput.value.trim();
+    if (!command) return;
+    edgeTerminalInput.value = "";
+    await runEdgeTerminalCommand(command);
+  });
+}
+
+if (wakeLoopTestBtn) {
+  wakeLoopTestBtn.addEventListener("click", async () => {
+    wakeLoopTestBtn.disabled = true;
+    setWakeLoopResult("Test en cours...", "info");
+    appendTerminal(
+      didierOutput,
+      'Wake-test micro: parle maintenant "Yo Didier" (aucune injection enceinte).'
+    );
+    try {
+      const res = await fetch("/asr/wake-test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          timeout_seconds: 12,
+          inject_wake_tts: false,
+          loopback_tts_fallback: false,
+          reply_on_wake: true,
+        }),
+      });
+      if (!res.ok) {
+        const detail = await readErrorDetail(res);
+        throw new Error(detail || "test wake indisponible");
+      }
+      const data = await res.json();
+      if (data && data.matched) {
+        const heard = data.heard_transcript || "(transcript vide)";
+        const elapsed = Number(data.elapsed_seconds || 0).toFixed(2);
+        setWakeLoopResult(`OK (${elapsed}s)`, "ok");
+        appendTerminal(
+          didierOutput,
+          `Wake-test OK: entendu "${heard}" en ${elapsed}s`
+        );
+      } else if (data && data.status === "audio_only") {
+        const heard = data.heard_transcript || "(audio detecte)";
+        const elapsed = Number(data.elapsed_seconds || 0).toFixed(2);
+        setWakeLoopResult(`Micro OK, wake KO (${elapsed}s)`, "err");
+        appendTerminal(
+          didierOutput,
+          `Wake-test partiel: micro detecte mais wake non reconnu ("${heard}")`
+        );
+      } else {
+        const heard = data && data.heard_transcript ? data.heard_transcript : "rien";
+        const elapsed = Number((data && data.elapsed_seconds) || 0).toFixed(2);
+        setWakeLoopResult(`KO (${elapsed}s)`, "err");
+        appendTerminal(
+          didierOutput,
+          `Wake-test KO: wake-word non validé (entendu: "${heard}")`
+        );
+      }
+    } catch (err) {
+      const msg = err && err.message ? err.message : "échec";
+      setWakeLoopResult(`Erreur: ${msg}`, "err");
+      appendTerminal(didierOutput, `Wake-test erreur: ${msg}`);
+    } finally {
+      wakeLoopTestBtn.disabled = false;
+    }
   });
 }
 

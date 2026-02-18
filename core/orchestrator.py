@@ -1,12 +1,21 @@
 import asyncio
 import importlib
 import logging
+import os
 from pathlib import Path
 from types import ModuleType
 from typing import List, Type
 
 from core.config import DidierConfig
 from tentacles.base import BaseTentacle
+
+
+def _flag_enabled(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 class Orchestrator:
@@ -21,6 +30,9 @@ class Orchestrator:
         self._tentacle_start_timeout = float(
             self._config.get("system.tentacle_start_timeout_seconds", 12)
         )
+        self._asr_worker_mode = _flag_enabled(
+            self._config.get("asr.worker_mode", False)
+        ) or _flag_enabled(os.getenv("DIDIER_ASR_WORKER_MODE", "0"))
         self._tentacles: List[BaseTentacle] = []
         self._tentacle_map: dict[str, BaseTentacle] = {}
         self._stop_event = asyncio.Event()
@@ -37,6 +49,11 @@ class Orchestrator:
         modules = []
         for path in sorted(self._tentacles_path.glob("*.py")):
             if path.name.startswith("_") or path.name == "base.py":
+                continue
+            if self._asr_worker_mode and path.stem == "hearing":
+                self._logger.info(
+                    "Skipping tentacle %s (ASR worker mode enabled).", path.stem
+                )
                 continue
             module_name = f"tentacles.{path.stem}"
             try:

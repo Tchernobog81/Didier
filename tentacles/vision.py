@@ -399,6 +399,12 @@ class Tentacle(BaseTentacle):
         self._height = self.config.get("vision.height", None)
         self._fps = self.config.get("vision.fps", None)
         self._fourcc = self.config.get("vision.fourcc", None)
+        self._loop_sleep_s = max(
+            0.02, float(self.config.get("vision.loop_sleep_seconds", 0.08))
+        )
+        self._background_detect = bool(
+            self.config.get("vision.background_detect", True)
+        )
         self._model_path = Path(
             self.config.get("vision.model_path", "config/hailo_model.hef")
         )
@@ -1085,9 +1091,14 @@ class Tentacle(BaseTentacle):
                     failures = 0
                 self._last_frame_shape = frame.shape[:2]
                 await asyncio.to_thread(self._update_stream_frame, frame)
-                detections = await asyncio.to_thread(self._detect_with_lock, frame)
-                detections = self._tag_detections(detections, frame)
-                self._store_detections(detections)
+                if self._background_detect:
+                    detections = await asyncio.to_thread(self._detect_with_lock, frame)
+                    detections = self._tag_detections(detections, frame)
+                    self._store_detections(detections)
+                else:
+                    now = time.time()
+                    self._last_ts = now
+                    self._last_error = None
                 now = time.time()
                 if (
                     hasattr(self._detector, "read_npu_load")
@@ -1101,10 +1112,7 @@ class Tentacle(BaseTentacle):
                             self._logger.info("NPU load: %s%%", load)
                     except Exception:
                         pass
-                if use_fallback:
-                    await asyncio.sleep(0.05)
-                else:
-                    await asyncio.sleep(0)
+                await asyncio.sleep(max(0.05, self._loop_sleep_s) if use_fallback else self._loop_sleep_s)
         finally:
             if cap is not None:
                 cap.release()

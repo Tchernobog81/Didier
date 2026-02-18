@@ -1,10 +1,13 @@
 import random
+import logging
 from typing import Any
 
 class DidierAgent:
-    def __init__(self, memory, model_manager):
+    def __init__(self, memory, model_manager, audio_manager=None, vision_manager=None):
         self.memory = memory
         self.model_manager = model_manager
+        self.audio_manager = audio_manager
+        self.vision_manager = vision_manager
         # persona config
         self.name = "Didier"
         self.personality = {
@@ -23,9 +26,26 @@ class DidierAgent:
         except Exception:
             pass
 
+        # 1. Gestion de la Vision (Déclencheur simple par mot-clé)
+        vision_context = ""
+        if self.vision_manager:
+            keywords = ["regarde", "vois", "photo", "image", "see", "look"]
+            if any(k in prompt.lower() for k in keywords):
+                logging.info("👀 Didier ouvre les yeux (Vision demandée)...")
+                frame = self.vision_manager.capture(save=True)
+                if frame is not None:
+                    # Appel au NPU
+                    detections = self.vision_manager.detect(frame)
+                    det_str = "Rien de spécial."
+                    if detections:
+                        det_str = f"Objets détectés via NPU: {len(detections)} (Flux actif)."
+                    vision_context = f"\n[Système: Photo prise. Analyse NPU: {det_str}]"
+                else:
+                    vision_context = "\n[Système: Échec de la capture caméra.]"
+
         # Build a short persona / system prompt for models
         sys_prompt = self._persona_prefix()
-        full_prompt = f"{sys_prompt}\nHuman: {prompt}\nDidier:"
+        full_prompt = f"{sys_prompt}{vision_context}\nHuman: {prompt}\nDidier:"
 
         # Try to get a response from the model manager (Ollama by default)
         try:
@@ -45,4 +65,9 @@ class DidierAgent:
             self.memory.save_message("assistant", reply)
         except Exception:
             pass
-        return f"{self._persona_prefix()} {reply}"
+            
+        # 2. Synthèse Vocale (TTS)
+        if self.audio_manager:
+            self.audio_manager.speak(reply)
+            
+        return reply

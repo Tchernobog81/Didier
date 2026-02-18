@@ -7,7 +7,7 @@ router = APIRouter()
 
 @router.get("/vision/capture")
 async def capture() -> dict[str, Any]:
-    from core import api as api_module
+    from core import runtime_bridge as api_module
 
     orchestrator = api_module._require_orchestrator()
     vision = orchestrator.get_tentacle("vision")
@@ -21,7 +21,7 @@ async def capture() -> dict[str, Any]:
 
 @router.post("/vision/describe")
 async def vision_describe(payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    from core import api as api_module
+    from core import runtime_bridge as api_module
 
     orchestrator = api_module._require_orchestrator()
     vision = orchestrator.get_tentacle("vision")
@@ -77,7 +77,7 @@ async def vision_describe(payload: dict[str, Any] | None = None) -> dict[str, An
 
 @router.post("/vision/enroll")
 async def vision_enroll(payload: dict[str, Any]) -> dict[str, Any]:
-    from core import api as api_module
+    from core import runtime_bridge as api_module
 
     orchestrator = api_module._require_orchestrator()
     vision = orchestrator.get_tentacle("vision")
@@ -90,7 +90,7 @@ async def vision_enroll(payload: dict[str, Any]) -> dict[str, Any]:
 
 @router.get("/vision/owner")
 async def vision_owner() -> dict[str, Any]:
-    from core import api as api_module
+    from core import runtime_bridge as api_module
 
     orchestrator = api_module._require_orchestrator()
     vision = orchestrator.get_tentacle("vision")
@@ -102,7 +102,7 @@ async def vision_owner() -> dict[str, Any]:
 
 @router.get("/vision/status")
 async def vision_status() -> dict[str, Any]:
-    from core import api as api_module
+    from core import runtime_bridge as api_module
 
     orchestrator = api_module._require_orchestrator()
     vision = orchestrator.get_tentacle("vision")
@@ -115,14 +115,14 @@ async def vision_status() -> dict[str, Any]:
 
 @router.get("/vision/tags")
 async def vision_tags() -> dict[str, Any]:
-    from core import api as api_module
+    from core import runtime_bridge as api_module
 
     return {"tags": api_module._load_vision_tags()}
 
 
 @router.post("/vision/tags")
 async def vision_tags_update(payload: dict[str, Any]) -> dict[str, Any]:
-    from core import api as api_module
+    from core import runtime_bridge as api_module
 
     if not payload:
         raise HTTPException(status_code=400, detail="payload required")
@@ -150,7 +150,7 @@ async def vision_tags_update(payload: dict[str, Any]) -> dict[str, Any]:
 
 @router.get("/vision/zones")
 async def vision_zones() -> dict[str, Any]:
-    from core import api as api_module
+    from core import runtime_bridge as api_module
 
     orchestrator = api_module._require_orchestrator()
     width = orchestrator.config.get("vision.width", None)
@@ -165,7 +165,7 @@ async def vision_zones() -> dict[str, Any]:
 
 @router.post("/vision/detect")
 async def vision_detect() -> dict[str, Any]:
-    from core import api as api_module
+    from core import runtime_bridge as api_module
 
     orchestrator = api_module._require_orchestrator()
     vision = orchestrator.get_tentacle("vision")
@@ -178,7 +178,7 @@ async def vision_detect() -> dict[str, Any]:
 
 @router.get("/vision/detections")
 async def vision_detections() -> dict[str, Any]:
-    from core import api as api_module
+    from core import runtime_bridge as api_module
 
     orchestrator = api_module._require_orchestrator()
     vision = orchestrator.get_tentacle("vision")
@@ -191,7 +191,7 @@ async def vision_detections() -> dict[str, Any]:
 
 @router.get("/vision/detections-secondary")
 async def vision_detections_secondary() -> dict[str, Any]:
-    from core import api as api_module
+    from core import runtime_bridge as api_module
 
     orchestrator = api_module._require_orchestrator()
     vision = orchestrator.get_tentacle("vision")
@@ -210,7 +210,8 @@ async def vision_detections_secondary() -> dict[str, Any]:
     frame_bytes, ts = stream.get_last()
     if not frame_bytes:
         raise HTTPException(status_code=503, detail="secondary stream not ready")
-    frame = api_module.cv2.imdecode(
+    frame = await api_module.asyncio.to_thread(
+        api_module.cv2.imdecode,
         api_module.np.frombuffer(frame_bytes, api_module.np.uint8),
         api_module.cv2.IMREAD_COLOR,
     )
@@ -228,14 +229,21 @@ async def vision_status_secondary() -> dict[str, Any]:
     Route ultra-légère pour la pastille d'état (CPU < 1%).
     Vérifie juste si des paquets UDP arrivent sans décoder d'image.
     """
-    from core import api as api_module
+    from core import runtime_bridge as api_module
 
     orchestrator = api_module._require_orchestrator()
     cfg = orchestrator.config.get("vision.remote_stream", {}) or {}
     input_url = cfg.get("input_url", "udp://0.0.0.0:1234")
 
-    # On récupère le flux (déjà géré par le thread ffmpeg en arrière-plan)
-    stream = api_module._get_remote_stream(str(input_url))
+    # Endpoint passif: ne démarre pas ffmpeg, lit seulement l'état du stream déjà actif.
+    with api_module._REMOTE_STREAM_LOCK:
+        stream = api_module._REMOTE_STREAM
+    if stream is None:
+        return {
+            "status": "offline",
+            "age_s": None,
+            "ts": 0.0,
+        }
     _frame, ts = stream.get_last()
 
     # On calcule si le flux est récent (moins de 3 secondes)
@@ -251,7 +259,7 @@ async def vision_status_secondary() -> dict[str, Any]:
 
 @router.get("/video/stream")
 async def video_stream():
-    from core import api as api_module
+    from core import runtime_bridge as api_module
 
     orchestrator = api_module._require_orchestrator()
     vision = orchestrator.get_tentacle("vision")
@@ -286,7 +294,7 @@ async def video_stream():
 
 @router.get("/video/stream-secondary")
 async def video_stream_secondary():
-    from core import api as api_module
+    from core import runtime_bridge as api_module
 
     orchestrator = api_module._require_orchestrator()
     cfg = orchestrator.config.get("vision.remote_stream", {}) or {}

@@ -20,12 +20,12 @@ Didier a été forgé avec des traits de caractère spécifiques pour éviter l'
 | Yeux & Oreilles | Caméra PS3 Eye (OmniVision) |
 | Langage | Python 3.11 / Flask |
 | Modèles IA | Ollama (Llama 3.2 1b / 3b) |
-| Conteneurisation | Docker & Docker-Compose |
+| Déploiement | Systemd natif (production) |
 
 🚀 Fonctionnalités Vitales
 
 ### 🧼 Protocole "Chambre Propre"
-Didier a horreur du désordre numérique. Il surveille l'espace disque, les logs et les images Docker orphelines. Un clic sur le bouton **CLEAN** et il effectue sa propre maintenance système.
+Didier a horreur du désordre numérique. Il surveille l'espace disque, les logs et les artefacts système orphelins. Un clic sur le bouton **CLEAN** et il effectue sa propre maintenance système.
 
 ### 👁 Vision & Veille
 - **Capture Visuelle** : Via la PS3 Eye, Didier peut prendre des clichés de son environnement pour s'assurer que Florian et Sacha travaillent.
@@ -65,9 +65,10 @@ Quickstart (sur le Pi)
 Stabilisation migration SSD (recommandé)
 1. Vérifier l'état sans modifier
    bash scripts/stabilize_ssd_migration.sh --check
-2. Réparer les dérives (symlinks/paths Docker/workspace)
+2. Réparer les dérives (symlinks/paths workspace)
    sudo bash scripts/stabilize_ssd_migration.sh --fix
 
-Voir run_didier.service pour service systemd et docker-compose.yml pour exécution en conteneur.
+Point d'entrée systemd unifié: `didier-api.service` (API sur `:5010`).
+Stack Docker conservée uniquement pour le dev: `docker-compose.dev.yml`.
 
 Licence: MIT

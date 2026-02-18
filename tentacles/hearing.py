@@ -1,5 +1,6 @@
 import asyncio
 import csv
+import difflib
 import json
 import logging
 import os
@@ -96,6 +97,15 @@ class Tentacle(BaseTentacle):
         self._wake_timeout = float(
             self.config.get("asr.wake_timeout_seconds", 12)
         )
+        self._wake_reply_enabled = bool(
+            self.config.get("asr.wake_reply_enabled", True)
+        )
+        self._wake_reply_text = str(
+            self.config.get(
+                "asr.wake_reply_text",
+                "Salut Tcherno, qu'est-ce que je peux faire pour toi ?",
+            )
+        ).strip()
         self._armed = False
         self._armed_until = 0.0
         self._data_dir = Path("data")
@@ -164,8 +174,10 @@ class Tentacle(BaseTentacle):
             if self._wake_word_norms:
                 now = time.time()
                 if use_wake_model:
+                    # Keep wake-pass transcript visible for diagnostics and tuning.
+                    self._logger.info("Wake candidate transcript: %s", text)
+                    self._write_status(last_transcript=text, last_heard_at=now)
                     if self._matches_wake_word(text):
-                        self._write_status(last_transcript=text, last_heard_at=now)
                         extra = None
                         if self._allow_inline_command and self._wake_model_path == self._model_path:
                             extra = self._extract_after_wake(text)
@@ -402,7 +414,7 @@ class Tentacle(BaseTentacle):
                 str(wav_path),
             ]
             try:
-                subprocess.run(cmd, check=True, capture_output=True)
+                result = subprocess.run(cmd, check=False, capture_output=True)
             except Exception as exc:
                 self._capture_failures += 1
                 now = time.time()
@@ -415,6 +427,27 @@ class Tentacle(BaseTentacle):
                         self._capture_failures,
                         retry_delay,
                         exc,
+                    )
+                    self._last_capture_error_log = now
+                self._cleanup_path(wav_path)
+                if self._capture_stop.wait(timeout=retry_delay):
+                    break
+                retry_delay = min(self._capture_max_backoff, retry_delay * 1.8)
+                continue
+            if result.returncode != 0:
+                self._capture_failures += 1
+                now = time.time()
+                stderr = (result.stderr or b"").decode("utf-8", errors="ignore").strip()
+                detail = stderr or f"exit {result.returncode}"
+                if (
+                    self._capture_failures <= 3
+                    or now - self._last_capture_error_log >= self._capture_error_log_interval
+                ):
+                    self._logger.warning(
+                        "arecord failed (%s, retry in %.1fs): %s",
+                        self._capture_failures,
+                        retry_delay,
+                        detail,
                     )
                     self._last_capture_error_log = now
                 self._cleanup_path(wav_path)
@@ -459,7 +492,14 @@ class Tentacle(BaseTentacle):
                 sf.read, str(wav_path), dtype="float32"
             )
             if data.ndim > 1:
-                data = np.mean(data, axis=1)
+                # Pick the hottest channel to avoid destructive averaging on PS3 Eye 4ch.
+                rms_by_channel = np.sqrt(np.mean(np.square(data), axis=0))
+                best_idx = int(np.argmax(rms_by_channel))
+                data = data[:, best_idx]
+            peak = float(np.max(np.abs(data))) if data.size else 0.0
+            if peak > 1e-6 and peak < 0.2:
+                gain = min(12.0, 0.2 / peak)
+                data = np.clip(data * gain, -1.0, 1.0)
             await asyncio.to_thread(sf.write, str(mono_path), data, sr)
         except Exception as exc:
             self._logger.warning("audio downmix failed: %s", exc)
@@ -556,6 +596,26 @@ class Tentacle(BaseTentacle):
         for wake in self._wake_word_compact:
             if wake and wake in compact:
                 return True
+        # Tolerate common ASR slips around "Yo Didier".
+        tokens = normalized.split()
+        has_yo = any(tok.startswith("yo") for tok in tokens)
+        has_did = any(tok.startswith("didi") or tok.startswith("didie") for tok in tokens)
+        if has_yo and has_did:
+            return True
+        has_y = any(tok.startswith("y") for tok in tokens)
+        di_letters = sum(1 for tok in tokens if tok in {"d", "i"})
+        if has_y and di_letters >= 3:
+            return True
+        if compact.startswith("ya") and "ddii" in compact:
+            return True
+        # Common FR-ASR slip for "Yo Didier" observed with local TTS.
+        if normalized in {"j ai dit yeah", "jai dit yeah"}:
+            return True
+        for wake in self._wake_word_compact:
+            if not wake:
+                continue
+            if difflib.SequenceMatcher(None, compact, wake).ratio() >= 0.82:
+                return True
         return False
 
     async def _on_wake_word(self, text: str) -> None:
@@ -565,6 +625,17 @@ class Tentacle(BaseTentacle):
         self._write_status(state="LISTENING")
         orchestrator = self._orchestrator
         vocal = getattr(orchestrator, "get_tentacle", lambda name: None)("vocal")
+        if (
+            self._wake_reply_enabled
+            and self._wake_reply_text
+            and vocal
+            and hasattr(vocal, "speak")
+        ):
+            try:
+                await vocal.speak(self._wake_reply_text)
+                return
+            except Exception:
+                self._logger.debug("Wake word voice reply failed.", exc_info=True)
         if vocal and hasattr(vocal, "beep"):
             try:
                 await vocal.beep()
@@ -634,8 +705,8 @@ class Tentacle(BaseTentacle):
                 last_response_at=last_response_at,
                 state=state,
             )
-        except Exception:
-            self._logger.debug("Failed to update ASR status", exc_info=True)
+        except Exception as exc:
+            self._logger.warning("Failed to update ASR status: %s", exc)
 
     def _cleanup_path(self, path: Path) -> None:
         try:

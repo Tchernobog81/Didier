@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-OLLAMA_BASE="${DIDIER_OLLAMA_URL:-http://127.0.0.1:11434}"
+OLLAMA_BASE="${DIDIER_OLLAMA_URL:-http://127.0.0.1:11435}"
 MODEL="${DIDIER_CODING_MODEL:-qwen2.5-coder:1.5b}"
 TIMEOUT="${DIDIER_CODING_TIMEOUT:-180}"
 SYSTEM_PROMPT="${DIDIER_CODING_SYSTEM:-Tu es un assistant de code précis, concis, et pragmatique. Donne des réponses courtes et exécutables.}"

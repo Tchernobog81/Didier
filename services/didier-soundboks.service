@@ -1,0 +1,26 @@
+[Unit]
+Description=Didier Soundboks Watchdog
+After=bluetooth.service didier-audio.service
+Wants=bluetooth.service didier-audio.service
+
+[Service]
+WorkingDirectory=/mnt/didier_ssd/didier/workspace/Didier
+User=tchernobog
+Environment=PATH=/mnt/didier_ssd/didier/workspace/Didier/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=PULSE_SERVER=unix:/run/user/1000/pulse/native
+Environment=DIDIER_SB_WATCHDOG_INTERVAL=8
+Environment=DIDIER_SB_WATCHDOG_WAIT_STEPS=20
+ExecStart=/bin/bash /mnt/didier_ssd/didier/workspace/Didier/scripts/soundboks_watchdog.sh
+Restart=always
+RestartSec=2s
+TimeoutStartSec=20s
+TimeoutStopSec=10s
+KillSignal=SIGTERM
+Nice=8
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+

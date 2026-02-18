@@ -8,6 +8,7 @@ ollama/
 __pycache__/
 *.pyc
 .env
+config/openclaw.env
 data/*.db
 *.log
 .DS_Store

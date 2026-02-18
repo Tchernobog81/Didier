@@ -11,10 +11,14 @@
     "pcie_address": "0001:01:00.0"
   },
   "ollama": {
-    "base_url": "http://localhost:11435",
+    "base_url": "http://localhost:11434",
     "model": "llama3.2:1b",
+    "model_profiles": {
+      "ask": "deepseek-r1:1.5b",
+      "coding": "deepseek-coder:1.3b"
+    },
     "timeout_seconds": 120,
-    "num_predict": 64,
+    "num_predict": 48,
     "temperature": 0.4,
     "autotune_enabled": true,
     "autotune_interval_seconds": 1800,
@@ -56,25 +60,43 @@
         "model": "llama3.2:1b",
         "system_prompt": "Tu es créatif et amusant. Réponses courtes, ton léger."
       }
-    }
+    },
+    "model_selected_at": 1771407770.378275
+  },
+  "openclaw": {
+    "enabled": true,
+    "repo_path": "openclaw",
+    "env_file": "config/openclaw.env",
+    "gateway_url": "http://127.0.0.1:3800",
+    "gateway_token_env": "OPENCLAW_GATEWAY_TOKEN",
+    "prefer_compiled_aot": true,
+    "compiled_entrypoint": "dist/index.js",
+    "precompile_on_start": false,
+    "precompile_cmd": [
+      "pnpm",
+      "build"
+    ],
+    "precompile_timeout_s": 180,
+    "heartbeat_interval_seconds": 30,
+    "memory_markdown_files": [
+      "openclaw/AGENTS.md"
+    ],
+    "api_keys": {
+      "anthropic_env": "ANTHROPIC_API_KEY",
+      "telegram_env": "TELEGRAM_BOT_TOKEN"
+    },
+    "pnpm_cmd": "pnpm",
+    "node_min_major": 22,
+    "install_verified": true,
+    "memory_refresh_seconds": 60,
+    "memory_preview_chars": 300,
+    "restart_interval_seconds": 8
   },
   "coding": {
     "model": "qwen2.5-coder:1.5b",
     "num_predict": 400,
     "temperature": 0.2,
     "system_prompt": "Tu es un assistant de code précis, concis, et pragmatique. Donne des réponses courtes et exécutables."
-  },
-  "clawbot": {
-    "model": "llama3.2:1b",
-    "num_predict": 96,
-    "temperature": 0.3,
-    "system_prompt": "Tu es Clawbot, un agent OpenClaw. Tu réponds en français, brièvement, avec un ton direct. Tu suis AGENTS/TOOLS/SOUL/USER et la mémoire persistante.",
-    "enabled": true,
-    "interval_seconds": 300,
-    "report_path": "data/clawbot_report.json",
-    "max_reports": 50,
-    "summary_max_chars": 400,
-    "write_memory": true
   },
   "music": {
     "enabled": true,
@@ -89,16 +111,6 @@
       "Les cons ça ose tout, c'est même à ça qu'on les reconnait."
     ]
   },
-  "openclaw": {
-    "workspace": "openclaw",
-    "bootstrap_files": [
-      "AGENTS.md",
-      "MEMORY.md",
-      "SOUL.md",
-      "USER.md",
-      "TOOLS.md"
-    ]
-  },
   "memory": {
     "path": "data/memory.json",
     "max_items": 1200,
@@ -108,13 +120,13 @@
     "enabled": true,
     "alsa_device": "hw:2,0",
     "sample_rate": 16000,
-    "chunk_seconds": 2,
+    "chunk_seconds": 3,
     "command_chunk_seconds": 3,
     "channels": 4,
     "threads": 4,
     "beam_size": 1,
     "best_of": 1,
-    "no_fallback": true,
+    "no_fallback": false,
     "no_timestamps": true,
     "use_vad": false,
     "vad_threshold": 0.5,
@@ -134,22 +146,29 @@
     "command_rtf_target": 1.2,
     "command_min_quality": "base",
     "command_allow_below_min_quality": false,
-    "wake_model_path": "models/ggml-tiny.bin",
+    "wake_model_path": "/mnt/didier_ssd/didier/code/models/ggml-small.bin",
     "allow_inline_command": false,
-    "wake_word": "Yo! Didier! Cafarte?",
+    "wake_word": "Yo! Didier",
     "wake_word_aliases": [
-      "Yo! Didier! Ca farte?",
-      "Yo Didier cafarte",
-      "Yo Didier ca farte"
+      "Yo Didier",
+      "Yo Didier !",
+      "Yo! Didier!",
+      "Y'a D D I I",
+      "Yadii"
     ],
+    "wake_reply_enabled": true,
+    "wake_reply_text": "Salut Tcherno, qu'est-ce que je peux faire pour toi ?",
     "wake_timeout_seconds": 12,
     "language": "fr",
-    "whisper_cpp_bin": "bin/whisper.cpp",
-    "model_path": "models/ggml-small.bin"
+    "whisper_cpp_bin": "/mnt/didier_ssd/didier/code/bin/whisper.cpp",
+    "model_path": "/mnt/didier_ssd/didier/code/models/ggml-small.bin"
   },
   "tts": {
-    "model_path": "voices/kokoro-v1.0.onnx",
-    "voices_path": "voices/voices-v1.0.bin",
+    "model_path": "/mnt/didier_ssd/didier/models/tts/kokoro-v1.0.onnx",
+    "config_path": "/mnt/didier_ssd/didier/models/tts/kokoro-v0.19.json",
+    "voices_path": "/mnt/didier_ssd/didier/models/tts/voices-v1.0.bin",
+    "voice": "ff_siwis",
+    "lang": "fr-fr",
     "output_path": "data/didier_speaks.wav"
   },
   "vision": {
@@ -207,8 +226,10 @@
     "describe_num_predict": 120,
     "remote_stream": {
       "enabled": true,
-      "input_url": "udp://192.168.1.47:1234?overrun_nonfatal=1&fifo_size=5000000",
+      "input_url": "udp://0.0.0.0:1234?overrun_nonfatal=1&fifo_size=5000000",
       "fps": 15
-    }
+    },
+    "background_detect": false,
+    "loop_sleep_seconds": 0.12
   }
 }
