@@ -1,0 +1,44 @@
+{
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "ollama/qwen2.5:1.5b",
+        "fallbacks": []
+      },
+      "models": {
+        "ollama/qwen2.5:1.5b": {
+          "alias": "Didier Local Ollama"
+        }
+      },
+      "compaction": {
+        "mode": "safeguard"
+      }
+    }
+  },
+  "commands": {
+    "native": "auto",
+    "nativeSkills": "auto"
+  },
+  "gateway": {
+    "mode": "local"
+  },
+  "channels": {
+    "signal": {
+      "enabled": true,
+      "account": "+33676662470",
+      "httpUrl": "http://127.0.0.1:8082",
+      "autoStart": false
+    }
+  },
+  "plugins": {
+    "entries": {
+      "signal": {
+        "enabled": true
+      }
+    }
+  },
+  "meta": {
+    "lastTouchedVersion": "2026.2.18",
+    "lastTouchedAt": "2026-02-19T22:51:41.426Z"
+  }
+}
