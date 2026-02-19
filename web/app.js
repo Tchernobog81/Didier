@@ -65,6 +65,11 @@ const tabButtons = document.querySelectorAll("[data-tab]");
 const tabPanels = document.querySelectorAll("[data-tab-panel]");
 const dockerGraph = document.getElementById("docker-graph");
 const dockerMeta = document.getElementById("docker-meta");
+const openclawKpis = document.getElementById("openclaw-kpis");
+const openclawMeta = document.getElementById("openclaw-meta");
+const openclawTaskList = document.getElementById("openclaw-task-list");
+const openclawTimeline = document.getElementById("openclaw-timeline");
+const openclawRefresh = document.getElementById("openclaw-refresh");
 const actuatorsList = document.getElementById("actuators-list");
 const actuatorsRefresh = document.getElementById("actuators-refresh");
 const actuatorsMessage = document.getElementById("actuators-message");
@@ -830,6 +835,8 @@ let activeDetection = null;
 let activeDetectionKey = null;
 let dockerNodesMap = new Map();
 let dockerEdges = [];
+let openclawCachedTasks = [];
+let openclawLastMetrics = null;
 let localDidierFiles = [];
 let fileSearchResults = [];
 let lastFileSearch = "";
@@ -1150,6 +1157,27 @@ function statusToShortLabel(status) {
   return "UNK";
 }
 
+function workerTypeLabel(value) {
+  const key = String(value || "edge").toLowerCase();
+  if (key === "entry") return "Entry";
+  if (key === "gateway") return "Gateway";
+  if (key === "perception") return "Perception";
+  if (key === "cognition") return "Cognition";
+  if (key === "audio") return "Audio";
+  if (key === "speech") return "Speech";
+  if (key === "agentic") return "Agentic";
+  if (key === "device") return "Device";
+  if (key === "llm") return "Model";
+  if (key === "runtime") return "Runtime";
+  return "Edge";
+}
+
+function workerTypeClass(value) {
+  return String(value || "edge")
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]/g, "-");
+}
+
 function shortImageName(image) {
   if (!image) return "";
   const value = String(image);
@@ -1162,12 +1190,13 @@ function buildDockerLayout(payload) {
   const containers = Array.isArray(payload?.containers) ? payload.containers : [];
   const workers = Array.isArray(payload?.workers) ? payload.workers : [];
   const deviceStatus = payload?.deviceStatus || {};
-  const addNode = (column, id, label, status, meta) => {
+  const addNode = (column, id, label, status, meta, nodeType = "infra") => {
     columns[column].push({
       id,
       label,
       status: status || "inconnu",
       meta: meta || "",
+      nodeType: nodeType || "infra",
     });
   };
 
@@ -1183,20 +1212,25 @@ function buildDockerLayout(payload) {
     (models.clawbot && String(models.clawbot)) ||
     "";
 
-  addNode(0, "edge-dashboard", "Dashboard", healthOk ? "ok" : "inconnu", "HTTP 5003");
-  addNode(0, "edge-vscode", "VSCode", "ok", "/vscode");
-  addNode(1, "edge-api", healthName, healthOk ? "running" : "inconnu", "legacy API");
+  addNode(0, "edge-dashboard", "Dashboard", healthOk ? "ok" : "inconnu", "HTTP 5010", "entry");
+  addNode(0, "edge-vscode", "VSCode", "ok", "/vscode", "entry");
+  addNode(1, "edge-api", healthName, healthOk ? "running" : "inconnu", "API gateway 5010", "gateway");
   const workerNodeIds = [];
   workers.forEach((worker, idx) => {
     const rawName = worker && worker.name ? String(worker.name) : `worker-${idx + 1}`;
     const nodeId = `edge-worker-${rawName.replace(/[^a-zA-Z0-9_-]/g, "_")}`;
     workerNodeIds.push(nodeId);
+    const typeValue = worker && worker.worker_type ? String(worker.worker_type) : "edge";
+    const ipcValue = worker && worker.ipc ? String(worker.ipc) : "unix";
+    const metaParts = [workerTypeLabel(typeValue), ipcValue];
+    if (worker && worker.meta) metaParts.push(String(worker.meta));
     addNode(
       2,
       nodeId,
       worker && worker.label ? String(worker.label) : rawName,
       worker && worker.status ? String(worker.status) : "inconnu",
-      worker && worker.meta ? String(worker.meta) : "worker"
+      metaParts.filter(Boolean).join(" · "),
+      typeValue
     );
   });
   addNode(
@@ -1204,7 +1238,8 @@ function buildDockerLayout(payload) {
     "edge-didier-model",
     "LLM Didier",
     llmModel ? "ok" : "inconnu",
-    llmModel || "modèle non défini"
+    llmModel || "modèle non défini",
+    "llm"
   );
 
   const camera = deviceStatus.camera || {};
@@ -1220,7 +1255,8 @@ function buildDockerLayout(payload) {
     "edge-camera",
     "Caméra PS3",
     cameraState,
-    camera.device ? String(camera.device) : "source locale"
+    camera.device ? String(camera.device) : "source locale",
+    "device"
   );
 
   const secondary = deviceStatus.camera_secondary || {};
@@ -1235,7 +1271,7 @@ function buildDockerLayout(payload) {
   } else if (secondary.enabled === true) {
     secondaryState = "ko";
   }
-  addNode(3, "edge-camera-secondary", "Caméra Surface", secondaryState, "flux secondaire");
+  addNode(3, "edge-camera-secondary", "Caméra Surface", secondaryState, "flux secondaire", "device");
 
   const micAvail = deviceStatus.mic ? deviceStatus.mic.available : null;
   const soundAvail = deviceStatus.sound ? deviceStatus.sound.available : null;
@@ -1254,7 +1290,8 @@ function buildDockerLayout(payload) {
     audioState,
     `mic:${micAvail === true ? "ok" : micAvail === false ? "ko" : "?"} · son:${
       soundAvail === true ? "ok" : soundAvail === false ? "ko" : "?"
-    }`
+    }`,
+    "device"
   );
 
   const npu = deviceStatus.npu || {};
@@ -1273,7 +1310,8 @@ function buildDockerLayout(payload) {
     npuState,
     `dev:${npu.device === true ? "ok" : npu.device === false ? "ko" : "?"} · pcie:${
       npu.pcie === true ? "ok" : npu.pcie === false ? "ko" : "?"
-    }`
+    }`,
+    "device"
   );
 
   const tts = deviceStatus.tts || {};
@@ -1292,7 +1330,8 @@ function buildDockerLayout(payload) {
     "edge-tts",
     "TTS",
     ttsState,
-    `modèle:${tts.model === true ? "ok" : tts.model === false ? "ko" : "?"}`
+    `modèle:${tts.model === true ? "ok" : tts.model === false ? "ko" : "?"}`,
+    "device"
   );
 
   const containerNodeIds = [];
@@ -1302,7 +1341,8 @@ function buildDockerLayout(payload) {
       "edge-docker-runtime",
       "Runtime Dev",
       "ok",
-      `${containers.length} service${containers.length > 1 ? "s" : ""} dev`
+      `${containers.length} service${containers.length > 1 ? "s" : ""} dev`,
+      "runtime"
     );
     containers.slice(0, 8).forEach((container, idx) => {
       const rawName = container && container.name ? String(container.name) : `container-${idx + 1}`;
@@ -1314,24 +1354,44 @@ function buildDockerLayout(payload) {
         nodeId,
         serviceName,
         container && container.status ? String(container.status) : "inconnu",
-        shortImageName(container && container.image ? container.image : "")
+        shortImageName(container && container.image ? container.image : ""),
+        "runtime"
       );
     });
   }
 
-  dockerEdges = [
-    ["edge-dashboard", "edge-api"],
-    ["edge-vscode", "edge-api"],
-    ...workerNodeIds.map((nodeId) => ["edge-api", nodeId]),
-    ["edge-api", "edge-didier-model"],
-    ["edge-api", "edge-camera"],
-    ["edge-api", "edge-camera-secondary"],
-    ["edge-api", "edge-audio"],
-    ["edge-api", "edge-npu"],
-    ["edge-api", "edge-tts"],
-    ["edge-api", "edge-docker-runtime"],
-    ...containerNodeIds.map((nodeId) => ["edge-docker-runtime", nodeId]),
-  ];
+  const linkSource = Array.isArray(payload?.links) ? payload.links : [];
+  if (linkSource.length) {
+    dockerEdges = linkSource
+      .map((link) => {
+        const from = link && link.from ? String(link.from) : "";
+        const to = link && link.to ? String(link.to) : "";
+        if (!from || !to) return null;
+        const mode = String(link.mode || "sync").toLowerCase() === "async" ? "async" : "sync";
+        const label = link && link.label ? String(link.label) : "";
+        return { from, to, mode, label };
+      })
+      .filter(Boolean);
+  } else {
+    dockerEdges = [
+      { from: "edge-dashboard", to: "edge-api", mode: "sync", label: "HTTP" },
+      { from: "edge-vscode", to: "edge-api", mode: "sync", label: "HTTP" },
+      ...workerNodeIds.map((nodeId) => ({ from: "edge-api", to: nodeId, mode: "sync", label: "RPC" })),
+      { from: "edge-api", to: "edge-didier-model", mode: "sync", label: "LLM" },
+      { from: "edge-api", to: "edge-camera", mode: "sync", label: "I/O" },
+      { from: "edge-api", to: "edge-camera-secondary", mode: "sync", label: "I/O" },
+      { from: "edge-api", to: "edge-audio", mode: "async", label: "queue" },
+      { from: "edge-api", to: "edge-npu", mode: "sync", label: "PCIe" },
+      { from: "edge-api", to: "edge-tts", mode: "async", label: "queue" },
+      { from: "edge-api", to: "edge-docker-runtime", mode: "async", label: "dev" },
+      ...containerNodeIds.map((nodeId) => ({
+        from: "edge-docker-runtime",
+        to: nodeId,
+        mode: "async",
+        label: "dev",
+      })),
+    ];
+  }
   return columns;
 }
 
@@ -1345,7 +1405,7 @@ function drawDockerLinks(svg) {
   svg.innerHTML = "";
   const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
   const marker = document.createElementNS("http://www.w3.org/2000/svg", "marker");
-  marker.setAttribute("id", "arrow");
+  marker.setAttribute("id", "arrow-sync");
   marker.setAttribute("markerWidth", "8");
   marker.setAttribute("markerHeight", "8");
   marker.setAttribute("refX", "6");
@@ -1355,9 +1415,23 @@ function drawDockerLinks(svg) {
   markerPath.setAttribute("d", "M0,0 L6,3 L0,6 Z");
   marker.appendChild(markerPath);
   defs.appendChild(marker);
+  const markerAsync = document.createElementNS("http://www.w3.org/2000/svg", "marker");
+  markerAsync.setAttribute("id", "arrow-async");
+  markerAsync.setAttribute("markerWidth", "8");
+  markerAsync.setAttribute("markerHeight", "8");
+  markerAsync.setAttribute("refX", "6");
+  markerAsync.setAttribute("refY", "3");
+  markerAsync.setAttribute("orient", "auto");
+  const markerPathAsync = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  markerPathAsync.setAttribute("d", "M0,0 L6,3 L0,6 Z");
+  markerAsync.appendChild(markerPathAsync);
+  defs.appendChild(markerAsync);
   svg.appendChild(defs);
 
-  dockerEdges.forEach(([fromId, toId]) => {
+  dockerEdges.forEach((edge) => {
+    const fromId = edge && edge.from ? String(edge.from) : "";
+    const toId = edge && edge.to ? String(edge.to) : "";
+    const mode = edge && String(edge.mode || "sync").toLowerCase() === "async" ? "async" : "sync";
     const fromEl = dockerNodesMap.get(fromId);
     const toEl = dockerNodesMap.get(toId);
     if (!fromEl || !toEl) return;
@@ -1373,8 +1447,19 @@ function drawDockerLinks(svg) {
       "d",
       `M ${startX} ${startY} C ${midX} ${startY}, ${midX} ${endY}, ${endX} ${endY}`
     );
-    path.setAttribute("marker-end", "url(#arrow)");
+    path.setAttribute("class", `docker-link docker-link-${mode}`);
+    path.setAttribute("marker-end", mode === "async" ? "url(#arrow-async)" : "url(#arrow-sync)");
     svg.appendChild(path);
+
+    const label = edge && edge.label ? String(edge.label) : "";
+    if (label) {
+      const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      text.setAttribute("class", `docker-link-label docker-link-label-${mode}`);
+      text.setAttribute("x", String(midX));
+      text.setAttribute("y", String((startY + endY) / 2 - 4));
+      text.textContent = label;
+      svg.appendChild(text);
+    }
   });
 }
 
@@ -1397,11 +1482,15 @@ function renderDockerDiagram(payload) {
     columnEl.appendChild(columnTitle);
     col.forEach((node) => {
       const nodeEl = document.createElement("div");
-      nodeEl.className = `docker-node ${statusToClass(node.status)}`;
+      const workerTypeCls = workerTypeClass(node.nodeType || "edge");
+      nodeEl.className = `docker-node ${statusToClass(node.status)} worker-type-${workerTypeCls}`;
       nodeEl.dataset.nodeId = node.id;
       const title = document.createElement("span");
       title.className = "docker-node-title";
       title.textContent = node.label;
+      const typeBadge = document.createElement("span");
+      typeBadge.className = `docker-node-type worker-type-${workerTypeCls}`;
+      typeBadge.textContent = workerTypeLabel(node.nodeType);
       const metaRow = document.createElement("div");
       metaRow.className = "docker-node-meta-row";
       const pill = document.createElement("span");
@@ -1411,6 +1500,7 @@ function renderDockerDiagram(payload) {
       meta.className = "docker-node-meta";
       meta.textContent = node.meta ? String(node.meta) : (node.status ? String(node.status) : "inconnu");
       nodeEl.appendChild(title);
+      nodeEl.appendChild(typeBadge);
       metaRow.appendChild(pill);
       metaRow.appendChild(meta);
       nodeEl.appendChild(metaRow);
@@ -1425,8 +1515,10 @@ function renderDockerDiagram(payload) {
     const suffix = count > 1 ? "composants" : "composant";
     const runtime = `${containers.length} service${containers.length > 1 ? "s dev" : " dev"}`;
     const workersLabel = `${workersCount} worker${workersCount > 1 ? "s" : ""}`;
+    const syncLinks = dockerEdges.filter((edge) => edge && edge.mode !== "async").length;
+    const asyncLinks = dockerEdges.filter((edge) => edge && edge.mode === "async").length;
     const at = payload?.ts ? formatTime(payload.ts) : "--:--:--";
-    dockerMeta.textContent = `${count} ${suffix} · ${workersLabel} · ${runtime} · ${at}`;
+    dockerMeta.textContent = `${count} ${suffix} · ${workersLabel} · sync:${syncLinks} async:${asyncLinks} · ${runtime} · ${at}`;
   }
   requestAnimationFrame(() => drawDockerLinks(svg));
   setTimeout(() => drawDockerLinks(svg), 120);
@@ -1466,14 +1558,45 @@ async function fetchDockerDiagram() {
         meta: info && info.service ? String(info.service) : "",
       }));
     }
+    const diagramWorkers = diagramData && Array.isArray(diagramData.workers) ? diagramData.workers : [];
+    const workerMap = new Map();
+    diagramWorkers.forEach((worker) => {
+      const key = worker && worker.name ? String(worker.name) : "";
+      if (!key) return;
+      workerMap.set(key, worker);
+    });
+    workersFromMetrics.forEach((worker) => {
+      const key = worker && worker.name ? String(worker.name) : "";
+      if (!key) return;
+      const previous = workerMap.get(key) || {};
+      workerMap.set(key, {
+        ...worker,
+        ...previous,
+        name: key,
+        label:
+          previous && previous.label ? String(previous.label) : worker.label ? String(worker.label) : `Worker ${key}`,
+        worker_type:
+          previous && previous.worker_type
+            ? String(previous.worker_type)
+            : worker.worker_type
+            ? String(worker.worker_type)
+            : "edge",
+        ipc:
+          previous && previous.ipc
+            ? String(previous.ipc)
+            : worker.ipc
+            ? String(worker.ipc)
+            : "unix",
+      });
+    });
+    const mergedWorkers = Array.from(workerMap.values());
+
     const payload = {
       ts: diagramData && diagramData.ts ? diagramData.ts : Date.now() / 1000,
       containers:
         diagramData && Array.isArray(diagramData.containers) ? diagramData.containers : [],
-      workers:
-        workersFromMetrics.length
-          ? workersFromMetrics
-          : diagramData && Array.isArray(diagramData.workers) ? diagramData.workers : [],
+      workers: mergedWorkers,
+      links: diagramData && Array.isArray(diagramData.links) ? diagramData.links : [],
       healthOk:
         healthData &&
         String(healthData.status || "").toLowerCase() === "ok",
@@ -1484,6 +1607,266 @@ async function fetchDockerDiagram() {
   } catch (err) {
     dockerGraph.textContent = "Schéma Workers Edge indisponible.";
     if (dockerMeta) dockerMeta.textContent = "--";
+  }
+}
+
+function normalizeEpochSeconds(value) {
+  const raw = Number(value);
+  if (!Number.isFinite(raw) || raw <= 0) return null;
+  if (raw > 1e12) return raw / 1000;
+  if (raw > 1e10) return raw / 1000;
+  return raw;
+}
+
+function formatAgeSeconds(tsSeconds) {
+  if (!tsSeconds) return "--";
+  const delta = Math.max(0, Date.now() / 1000 - Number(tsSeconds));
+  if (delta < 1) return "maintenant";
+  if (delta < 60) return `${Math.floor(delta)}s`;
+  if (delta < 3600) return `${Math.floor(delta / 60)}m`;
+  return `${Math.floor(delta / 3600)}h`;
+}
+
+function normalizeOpenclawTasks(payload) {
+  let rawList = [];
+  if (Array.isArray(payload)) {
+    rawList = payload;
+  } else if (payload && Array.isArray(payload.tasks)) {
+    rawList = payload.tasks;
+  } else if (payload && Array.isArray(payload.items)) {
+    rawList = payload.items;
+  }
+  return rawList
+    .map((item, index) => {
+      const task = item && typeof item === "object" ? item : {};
+      const startedAt =
+        normalizeEpochSeconds(task.started_at) ||
+        normalizeEpochSeconds(task.created_at) ||
+        normalizeEpochSeconds(task.ts);
+      const updatedAt =
+        normalizeEpochSeconds(task.updated_at) ||
+        normalizeEpochSeconds(task.finished_at) ||
+        startedAt;
+      const status = String(task.status || task.state || "unknown");
+      return {
+        id: String(task.id || task.task_id || task.name || `task-${index + 1}`),
+        title: String(task.title || task.name || task.prompt || `Task ${index + 1}`),
+        status,
+        progress: Number.isFinite(Number(task.progress)) ? Number(task.progress) : null,
+        started_at: startedAt,
+        updated_at: updatedAt,
+        duration_s: Number.isFinite(Number(task.duration_s))
+          ? Number(task.duration_s)
+          : startedAt && updatedAt
+          ? Math.max(0, Number(updatedAt) - Number(startedAt))
+          : null,
+        result: task.result,
+        error: task.error,
+      };
+    })
+    .sort((a, b) => Number(b.updated_at || 0) - Number(a.updated_at || 0));
+}
+
+function taskProgressPercent(task) {
+  const normalized = String(task && task.status ? task.status : "").toLowerCase();
+  if (Number.isFinite(Number(task && task.progress))) {
+    const p = Number(task.progress);
+    if (p <= 1) return clampPercent(p * 100);
+    return clampPercent(p);
+  }
+  if (normalized.includes("done") || normalized.includes("success") || normalized.includes("ok")) {
+    return 100;
+  }
+  if (normalized.includes("error") || normalized.includes("fail")) {
+    return 100;
+  }
+  if (normalized.includes("run") || normalized.includes("progress") || normalized.includes("queue")) {
+    return 55;
+  }
+  return 15;
+}
+
+function renderOpenclawKpis(metricsPayload, tasks, latencyMs, tasksEndpointAvailable) {
+  if (!openclawKpis) return;
+  const metrics = metricsPayload && typeof metricsPayload === "object" ? metricsPayload : {};
+  const runtime =
+    metrics.shared_state &&
+    metrics.shared_state.runtime &&
+    typeof metrics.shared_state.runtime === "object"
+      ? metrics.shared_state.runtime
+      : {};
+  const runtimeStatus = String(runtime.status || metrics.status?.running || "inconnu");
+  const runningCount = tasks.filter((task) =>
+    statusToClass(task.status) === "is-running" || String(task.status || "").toLowerCase().includes("run")
+  ).length;
+  const errorCount = tasks.filter(
+    (task) =>
+      statusToClass(task.status) === "is-stopped" ||
+      String(task.status || "").toLowerCase().includes("error")
+  ).length;
+  const kpis = [
+    { label: "Runtime", value: statusToShortLabel(runtimeStatus) },
+    { label: "Latency bridge", value: `${Math.max(0, Math.round(latencyMs))} ms` },
+    { label: "Tâches actives", value: String(runningCount) },
+    { label: "En erreur", value: String(errorCount) },
+    { label: "Scheduler", value: runtime.scheduler_hz ? `${runtime.scheduler_hz} Hz` : "--" },
+    { label: "Endpoint /agent/tasks", value: tasksEndpointAvailable ? "OK" : "ABSENT" },
+  ];
+  openclawKpis.innerHTML = "";
+  kpis.forEach((item) => {
+    const card = document.createElement("div");
+    card.className = "openclaw-kpi";
+    const label = document.createElement("span");
+    label.className = "openclaw-kpi-label";
+    label.textContent = item.label;
+    const value = document.createElement("span");
+    value.className = "openclaw-kpi-value";
+    value.textContent = item.value;
+    card.appendChild(label);
+    card.appendChild(value);
+    openclawKpis.appendChild(card);
+  });
+}
+
+function renderOpenclawTasks(tasks, tasksEndpointAvailable) {
+  if (!openclawTaskList) return;
+  openclawTaskList.innerHTML = "";
+  if (!tasks.length) {
+    const empty = document.createElement("div");
+    empty.className = "openclaw-empty";
+    empty.textContent = tasksEndpointAvailable
+      ? "Aucune tâche active."
+      : "Endpoint /agent/tasks non disponible (prévu étape 5).";
+    openclawTaskList.appendChild(empty);
+    return;
+  }
+  tasks.slice(0, 10).forEach((task) => {
+    const card = document.createElement("article");
+    card.className = `openclaw-task-card ${statusToClass(task.status)}`;
+
+    const head = document.createElement("div");
+    head.className = "openclaw-task-head";
+    const title = document.createElement("h4");
+    title.className = "openclaw-task-title";
+    title.textContent = task.title || task.id;
+    const pill = document.createElement("span");
+    pill.className = `openclaw-task-pill ${statusToClass(task.status)}`;
+    pill.textContent = statusToShortLabel(task.status);
+    head.appendChild(title);
+    head.appendChild(pill);
+
+    const meta = document.createElement("div");
+    meta.className = "openclaw-task-meta";
+    const started = task.started_at ? formatTime(task.started_at) : "--:--:--";
+    const age = formatAgeSeconds(task.updated_at || task.started_at);
+    const duration = Number.isFinite(Number(task.duration_s))
+      ? `${Math.round(Number(task.duration_s))}s`
+      : "--";
+    meta.innerHTML = `<span>ID: ${task.id}</span><span>Start: ${started}</span><span>Age: ${age}</span><span>Durée: ${duration}</span>`;
+
+    const progress = document.createElement("div");
+    progress.className = "openclaw-progress";
+    const fill = document.createElement("div");
+    fill.className = "openclaw-progress-fill";
+    fill.style.width = `${taskProgressPercent(task)}%`;
+    progress.appendChild(fill);
+
+    const note = document.createElement("p");
+    note.className = "openclaw-task-note";
+    note.textContent =
+      (task.error !== undefined && task.error !== null
+        ? `Erreur: ${String(task.error)}`
+        : task.result !== undefined && task.result !== null
+        ? `Résultat: ${String(task.result).slice(0, 160)}`
+        : "Traitement en cours.");
+
+    card.appendChild(head);
+    card.appendChild(meta);
+    card.appendChild(progress);
+    card.appendChild(note);
+    openclawTaskList.appendChild(card);
+  });
+}
+
+function renderOpenclawTimeline(tasks) {
+  if (!openclawTimeline) return;
+  openclawTimeline.innerHTML = "";
+  if (!tasks.length) {
+    const empty = document.createElement("div");
+    empty.className = "openclaw-empty";
+    empty.textContent = "Timeline vide.";
+    openclawTimeline.appendChild(empty);
+    return;
+  }
+  tasks.slice(0, 16).forEach((task) => {
+    const event = document.createElement("article");
+    event.className = "openclaw-event";
+    const title = document.createElement("p");
+    title.className = "openclaw-event-title";
+    title.textContent = `${task.title || task.id} · ${statusToShortLabel(task.status)}`;
+    const meta = document.createElement("p");
+    meta.className = "openclaw-event-meta";
+    meta.textContent = `${formatTime(task.updated_at || task.started_at)} · ${formatAgeSeconds(
+      task.updated_at || task.started_at
+    )}`;
+    event.appendChild(title);
+    event.appendChild(meta);
+    openclawTimeline.appendChild(event);
+  });
+}
+
+async function fetchOpenclawTasks(force = false) {
+  if (!openclawTaskList || !openclawTimeline) return;
+  if (!force && currentActiveTab !== "openclaw") return;
+  const startedMs = Date.now();
+  try {
+    const [metricsPayload, tasksPayload] = await Promise.all([
+      fetchJsonSafe("/agent/metrics?timeout_s=2"),
+      fetchJsonSafe("/agent/tasks"),
+    ]);
+    let tasks = normalizeOpenclawTasks(tasksPayload);
+    const tasksEndpointAvailable = tasksPayload !== null;
+    if (!tasks.length && metricsPayload && metricsPayload.shared_state && metricsPayload.shared_state.runtime) {
+      const runtime = metricsPayload.shared_state.runtime;
+      const runtimeStatus = String(runtime.status || "").toLowerCase();
+      if (runtimeStatus && runtimeStatus !== "idle") {
+        tasks = [
+          {
+            id: "runtime",
+            title: `Runtime ${runtime.status || "active"}`,
+            status: runtime.status || "running",
+            progress: null,
+            started_at: normalizeEpochSeconds(runtime.ts),
+            updated_at: normalizeEpochSeconds(runtime.ts),
+            duration_s: null,
+            result: null,
+            error: null,
+          },
+        ];
+      }
+    }
+    openclawCachedTasks = tasks;
+    openclawLastMetrics = metricsPayload;
+    renderOpenclawKpis(metricsPayload, tasks, Date.now() - startedMs, tasksEndpointAvailable);
+    renderOpenclawTasks(tasks, tasksEndpointAvailable);
+    renderOpenclawTimeline(tasks);
+    if (openclawMeta) {
+      const ts = normalizeEpochSeconds(
+        (metricsPayload && metricsPayload.ts) ||
+          (metricsPayload && metricsPayload.status && metricsPayload.status.ts) ||
+          Date.now() / 1000
+      );
+      openclawMeta.textContent = `Sync ${formatTime(ts)} · ${tasks.length} tâche${
+        tasks.length > 1 ? "s" : ""
+      }`;
+    }
+  } catch (_err) {
+    renderOpenclawKpis(openclawLastMetrics, openclawCachedTasks, Date.now() - startedMs, false);
+    renderOpenclawTasks(openclawCachedTasks, false);
+    renderOpenclawTimeline(openclawCachedTasks);
+    if (openclawMeta) {
+      openclawMeta.textContent = "OpenClaw indisponible";
+    }
   }
 }
 
@@ -2085,6 +2468,9 @@ function setActiveTab(name) {
   if (name === "docker") {
     fetchDockerDiagram();
   }
+  if (name === "openclaw") {
+    fetchOpenclawTasks(true);
+  }
   if (name === "vscode") {
     initVscodeFrame(true);
   }
@@ -2135,6 +2521,10 @@ async function sendDidierPrompt(prompt) {
       thinkingBadge.classList.remove("thinking-active");
     }
     appendTerminal(didierOutput, data.response || "Pas de réponse.");
+    const audioNote = String(data.audio_note || "").trim();
+    if (audioNote) {
+      appendTerminal(didierOutput, `[Audio] ${audioNote}`);
+    }
   } catch (err) {
     if (thinkingBadge) {
       thinkingBadge.textContent = "Réflexion : erreur";
@@ -2242,6 +2632,8 @@ fetchVisionDetections();
 setInterval(fetchVisionDetections, 1000);
 fetchVisionDetectionsSecondary();
 setInterval(fetchVisionDetectionsSecondary, 1500);
+fetchOpenclawTasks();
+setInterval(fetchOpenclawTasks, 4000);
 loadLogo();
 loadFallbackLogo(primaryStreamFallbackLogo);
 loadFallbackLogo(surfaceStreamFallbackLogo);
@@ -2267,6 +2659,12 @@ if (dockerGraph) {
   window.addEventListener("resize", () => {
     const svg = dockerGraph.querySelector("svg.docker-links");
     if (svg) drawDockerLinks(svg);
+  });
+}
+
+if (openclawRefresh) {
+  openclawRefresh.addEventListener("click", () => {
+    fetchOpenclawTasks(true);
   });
 }
 

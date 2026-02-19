@@ -161,6 +161,13 @@ body {
   --tab-active-text: #083344;
 }
 
+.tab[data-tab="openclaw"] {
+  --tab-accent: #f87171;
+  --tab-active-top: rgba(254, 205, 211, 0.94);
+  --tab-active-bottom: rgba(248, 113, 113, 0.38);
+  --tab-active-text: #4a0d18;
+}
+
 .tab[data-tab="actuators"] {
   --tab-accent: #34d399;
   --tab-active-top: rgba(167, 243, 208, 0.92);
@@ -814,6 +821,10 @@ body {
   padding: 0 40px 40px;
 }
 
+.openclaw-panel {
+  padding: 0 40px 40px;
+}
+
 .actuators-panel {
   padding: 0 40px 40px;
 }
@@ -1060,6 +1071,55 @@ body {
   line-height: 1.3;
 }
 
+.docker-node-type {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1px 7px;
+  margin-bottom: 6px;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.45);
+  background: rgba(30, 41, 59, 0.65);
+  color: #cbd5e1;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.docker-node-type.worker-type-gateway {
+  border-color: rgba(56, 189, 248, 0.7);
+  color: #7dd3fc;
+}
+
+.docker-node-type.worker-type-perception {
+  border-color: rgba(96, 165, 250, 0.7);
+  color: #bfdbfe;
+}
+
+.docker-node-type.worker-type-cognition {
+  border-color: rgba(167, 139, 250, 0.7);
+  color: #ddd6fe;
+}
+
+.docker-node-type.worker-type-audio,
+.docker-node-type.worker-type-speech {
+  border-color: rgba(52, 211, 153, 0.7);
+  color: #a7f3d0;
+}
+
+.docker-node-type.worker-type-agentic {
+  border-color: rgba(248, 113, 113, 0.75);
+  color: #fecaca;
+}
+
+.docker-node-type.worker-type-entry,
+.docker-node-type.worker-type-runtime,
+.docker-node-type.worker-type-device,
+.docker-node-type.worker-type-llm {
+  border-color: rgba(148, 163, 184, 0.55);
+}
+
 .docker-node-meta-row {
   display: flex;
   align-items: center;
@@ -1144,14 +1204,244 @@ body {
   pointer-events: none;
 }
 
-.docker-links path {
-  stroke: rgba(148, 163, 184, 0.55);
+.docker-links path,
+.docker-link {
   stroke-width: 1.4;
   fill: none;
 }
 
-.docker-links marker path {
-  fill: rgba(148, 163, 184, 0.6);
+.docker-link-sync {
+  stroke: rgba(56, 189, 248, 0.68);
+}
+
+.docker-link-async {
+  stroke: rgba(248, 113, 113, 0.7);
+  stroke-dasharray: 4 3;
+}
+
+.docker-links marker#arrow-sync path {
+  fill: rgba(56, 189, 248, 0.75);
+}
+
+.docker-links marker#arrow-async path {
+  fill: rgba(248, 113, 113, 0.8);
+}
+
+.docker-link-label {
+  font-size: 9px;
+  text-anchor: middle;
+  paint-order: stroke;
+  stroke: rgba(15, 23, 42, 0.95);
+  stroke-width: 2px;
+  stroke-linejoin: round;
+}
+
+.docker-link-label-sync {
+  fill: rgba(125, 211, 252, 0.92);
+}
+
+.docker-link-label-async {
+  fill: rgba(252, 165, 165, 0.92);
+}
+
+.openclaw-card {
+  display: grid;
+  gap: 14px;
+}
+
+.openclaw-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.openclaw-header-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.openclaw-meta {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.openclaw-kpis {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 10px;
+}
+
+.openclaw-kpi {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px;
+  background: rgba(15, 23, 42, 0.58);
+}
+
+.openclaw-kpi-label {
+  display: block;
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.openclaw-kpi-value {
+  display: block;
+  margin-top: 3px;
+  font-family: var(--metric-font);
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.openclaw-board {
+  display: grid;
+  grid-template-columns: 1.2fr 1fr;
+  gap: 12px;
+}
+
+.openclaw-lane {
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgba(15, 23, 42, 0.62), rgba(15, 23, 42, 0.44));
+  padding: 12px;
+  min-height: 360px;
+}
+
+.openclaw-lane h3 {
+  margin: 0 0 10px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #fca5a5;
+}
+
+.openclaw-task-list {
+  display: grid;
+  gap: 9px;
+}
+
+.openclaw-empty {
+  border: 1px dashed rgba(148, 163, 184, 0.35);
+  border-radius: 12px;
+  padding: 10px;
+  color: var(--muted);
+  font-size: 12px;
+  background: rgba(15, 23, 42, 0.4);
+}
+
+.openclaw-task-card {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px;
+  background: rgba(15, 23, 42, 0.72);
+  display: grid;
+  gap: 8px;
+}
+
+.openclaw-task-card.is-running {
+  border-color: rgba(56, 189, 248, 0.6);
+  background: rgba(56, 189, 248, 0.12);
+}
+
+.openclaw-task-card.is-warn {
+  border-color: rgba(251, 191, 36, 0.64);
+  background: rgba(251, 191, 36, 0.12);
+}
+
+.openclaw-task-card.is-stopped {
+  border-color: rgba(239, 68, 68, 0.66);
+  background: rgba(239, 68, 68, 0.12);
+}
+
+.openclaw-task-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.openclaw-task-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.openclaw-task-pill {
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+}
+
+.openclaw-task-meta {
+  font-size: 11px;
+  color: var(--muted);
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.openclaw-task-note {
+  margin: 0;
+  font-size: 11px;
+  color: #cbd5e1;
+  white-space: pre-wrap;
+}
+
+.openclaw-progress {
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.2);
+  overflow: hidden;
+}
+
+.openclaw-progress-fill {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, #fb7185 0%, #f59e0b 50%, #22d3ee 100%);
+  transition: width 0.25s ease;
+}
+
+.openclaw-timeline {
+  display: grid;
+  gap: 8px;
+}
+
+.openclaw-event {
+  position: relative;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 12px;
+  padding: 9px 10px 9px 26px;
+  background: rgba(15, 23, 42, 0.58);
+}
+
+.openclaw-event::before {
+  content: "";
+  position: absolute;
+  left: 10px;
+  top: 12px;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: #f97316;
+  box-shadow: 0 0 0 3px rgba(249, 115, 22, 0.2);
+}
+
+.openclaw-event-title {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.openclaw-event-meta {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--muted);
 }
 
 .vscode-frame {
@@ -1327,10 +1617,16 @@ button {
   .docker-panel {
     padding: 0 20px 20px;
   }
+  .openclaw-panel {
+    padding: 0 20px 20px;
+  }
   .actuators-panel {
     padding: 0 20px 20px;
   }
   .docker-graph {
+    grid-template-columns: 1fr;
+  }
+  .openclaw-board {
     grid-template-columns: 1fr;
   }
   .actuator-rename {

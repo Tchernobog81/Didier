@@ -2,7 +2,7 @@
 
 Date de reference: 2026-02-19
 Statut global: ARCHITECTURE OPENCLAW NATIVE STABILISEE (etapes 1 a 6 validees)
-- Release UI: `V3r1`
+- Release UI: `V3r2`
 - Tag de reference: `didier_alive`
 
 ## 1) Architecture active
@@ -166,7 +166,7 @@ curl -sS http://127.0.0.1:5010/agent/memory
     - bandeau KPI (runtime, latence bridge, taches actives, erreurs, scheduler, etat endpoint)
     - liste de cartes taches "En cours"
     - timeline verticale des evenements recents
-  - version UI incrementee: `V3r1 · 2026-02-19`
+  - version UI incrementee: `V3r2 · 2026-02-19`
 - JS (`web/app.js`):
   - polling live sur `/agent/metrics?timeout_s=2` et `/agent/tasks` (4s)
   - normalisation robuste des payloads taches

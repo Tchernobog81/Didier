@@ -17,6 +17,8 @@ _EDGE_WORKERS = (
         "label": "Worker API",
         "fallback_base": "http://127.0.0.1:5010",
         "meta": "FastAPI 5010",
+        "worker_type": "gateway",
+        "ipc": "unix+http",
     },
     {
         "name": "didier-vision",
@@ -24,6 +26,8 @@ _EDGE_WORKERS = (
         "label": "Worker Vision",
         "fallback_base": "http://127.0.0.1:5011",
         "meta": "Vision 5011",
+        "worker_type": "perception",
+        "ipc": "unix",
     },
     {
         "name": "didier-brain",
@@ -31,6 +35,8 @@ _EDGE_WORKERS = (
         "label": "Worker Brain",
         "fallback_base": "http://127.0.0.1:5012",
         "meta": "Brain 5012",
+        "worker_type": "cognition",
+        "ipc": "unix",
     },
     {
         "name": "didier-audio",
@@ -38,6 +44,8 @@ _EDGE_WORKERS = (
         "label": "Worker Audio",
         "fallback_base": "http://127.0.0.1:5013",
         "meta": "Audio/TTS 5013",
+        "worker_type": "audio",
+        "ipc": "unix",
     },
     {
         "name": "didier-asr",
@@ -45,7 +53,29 @@ _EDGE_WORKERS = (
         "label": "Worker ASR",
         "fallback_base": "http://127.0.0.1:5014",
         "meta": "Wake/ASR 5014",
+        "worker_type": "speech",
+        "ipc": "unix+http",
     },
+    {
+        "name": "didier-openclaw",
+        "service": "openclaw",
+        "label": "Worker OpenClaw",
+        "fallback_base": "http://127.0.0.1:3901",
+        "meta": "Agent bridge 3901",
+        "worker_type": "agentic",
+        "ipc": "unix",
+    },
+)
+
+_EDGE_LINKS = (
+    {"from": "edge-dashboard", "to": "edge-api", "mode": "sync", "label": "HTTP"},
+    {"from": "edge-vscode", "to": "edge-api", "mode": "sync", "label": "HTTP"},
+    {"from": "edge-api", "to": "edge-worker-didier-vision", "mode": "sync", "label": "RPC"},
+    {"from": "edge-api", "to": "edge-worker-didier-brain", "mode": "sync", "label": "RPC"},
+    {"from": "edge-api", "to": "edge-worker-didier-audio", "mode": "async", "label": "queue"},
+    {"from": "edge-api", "to": "edge-worker-didier-asr", "mode": "async", "label": "stream"},
+    {"from": "edge-worker-didier-brain", "to": "edge-worker-didier-openclaw", "mode": "async", "label": "react"},
+    {"from": "edge-worker-didier-openclaw", "to": "edge-didier-model", "mode": "sync", "label": "LLM"},
 )
 
 _TERMINAL_REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -229,9 +259,16 @@ async def docker_diagram() -> dict[str, Any]:
                 "status": status,
                 "meta": item["meta"],
                 "detail": detail,
+                "worker_type": item.get("worker_type", "edge"),
+                "ipc": item.get("ipc", "unix"),
             }
         )
-    return {"ts": time.time(), "containers": containers, "workers": workers}
+    return {
+        "ts": time.time(),
+        "containers": containers,
+        "workers": workers,
+        "links": list(_EDGE_LINKS),
+    }
 
 
 @router.get("/files/search")
