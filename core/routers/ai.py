@@ -7,7 +7,13 @@ from typing import Any
 
 import httpx
 from fastapi import APIRouter, HTTPException
-from orchestrator.openclaw_bridge import get_openclaw_bridge
+from core.shared_state import openclaw_state_snapshot
+from orchestrator.openclaw_bridge_native import fetch_memory
+from orchestrator.openclaw_bridge_native import fetch_metrics
+from orchestrator.openclaw_bridge_native import fetch_tasks
+from orchestrator.openclaw_bridge_native import relay_react
+from orchestrator.openclaw_bridge_native import write_memory
+from shared.ipc import request as ipc_request
 
 router = APIRouter()
 
@@ -228,25 +234,20 @@ async def _relay_openclaw_react(
     agent_id = str(payload.get("react_agent_id", "")).strip() or None
     session_key = str(payload.get("react_session_key", "")).strip() or None
 
-    def _call_bridge() -> dict[str, Any]:
-        bridge = get_openclaw_bridge()
-        return bridge.relay_prompt(
+    try:
+        return await relay_react(
             prompt,
             agent_id=agent_id,
             session_key=session_key,
             wake_mode=wake_mode,
             timeout_s=timeout_s,
         )
-
-    try:
-        return await api_module.asyncio.to_thread(_call_bridge)
     except Exception as exc:
         return {"ok": False, "error": f"openclaw react relay failed: {exc}"}
 
 
-def _metrics_from_openclaw(timeout_s: float) -> dict[str, Any]:
-    bridge = get_openclaw_bridge()
-    return bridge.metrics(timeout_s=timeout_s)
+async def _metrics_from_openclaw(timeout_s: float) -> dict[str, Any]:
+    return await fetch_metrics(timeout_s)
 
 
 def _resolve_actuator_target(
@@ -278,6 +279,367 @@ def _resolve_actuator_target(
     if best_score <= 0:
         return None
     return best_id, best_name
+
+
+_TASK_INTENT_KEYWORDS = {
+    "allume",
+    "allumer",
+    "eteins",
+    "eteindre",
+    "active",
+    "desactive",
+    "lance",
+    "arrete",
+    "stop",
+    "rappelle",
+    "rappelle moi",
+    "programme",
+    "planifie",
+    "cree",
+    "ajoute",
+    "ouvre",
+    "ferme",
+    "envoie",
+    "mets",
+    "regle",
+}
+
+
+def _looks_like_task_request(text: str, *, is_voice: bool = False) -> bool:
+    norm = _normalize_text(text)
+    if not norm:
+        return False
+
+    conversational_prefixes = (
+        "salut",
+        "bonjour",
+        "comment",
+        "pourquoi",
+        "qui",
+        "qu est ce",
+        "explique",
+    )
+    if any(norm.startswith(prefix) for prefix in conversational_prefixes) and not any(
+        kw in norm for kw in _TASK_INTENT_KEYWORDS
+    ):
+        return False
+
+    if any(kw in norm for kw in _TASK_INTENT_KEYWORDS):
+        return True
+
+    first_word = norm.split(" ", 1)[0]
+    imperative_verbs = {"allume", "eteins", "lance", "arrete", "ouvre", "ferme", "ajoute", "cree"}
+    if first_word in imperative_verbs:
+        return True
+
+    if is_voice and any(token in norm for token in ("fais", "vas y", "ok didier")):
+        return True
+    return False
+
+
+def _extract_openclaw_reply(result: dict[str, Any] | None) -> str:
+    if not isinstance(result, dict):
+        return ""
+    candidate_keys = ("response", "reply", "message", "output", "text", "result")
+    for key in candidate_keys:
+        value = result.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    nested = result.get("data")
+    if isinstance(nested, dict):
+        for key in candidate_keys:
+            value = nested.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+async def _vision_see_user(timeout_s: float = 0.8) -> dict[str, Any] | None:
+    timeout_s = max(0.2, min(float(timeout_s), 2.0))
+    try:
+        response = await ipc_request(
+            "GET",
+            "/vision/see_user",
+            service="vision",
+            timeout=timeout_s,
+        )
+    except Exception:
+        return None
+    if not response.is_success:
+        return None
+    try:
+        payload = response.json()
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _vision_glance_text(payload: dict[str, Any] | None) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    if str(payload.get("status", "")).lower() != "ok":
+        return ""
+    if not bool(payload.get("seen", False)):
+        return ""
+    summary = str(payload.get("summary", "")).strip()
+    if summary:
+        return summary
+    location = str(payload.get("location", "")).strip()
+    if location and location.lower() != "inconnue":
+        return f"Je te vois dans {location}."
+    return "Je te vois bien devant la camera."
+
+
+def _prepend_glance(response: str, glance_text: str) -> str:
+    base = str(response or "").strip()
+    intro = str(glance_text or "").strip()
+    if not intro:
+        return base
+    if not base:
+        return intro
+    if _normalize_text(intro) in _normalize_text(base):
+        return base
+    return f"{intro} {base}".strip()
+
+
+async def _queue_audio_worker_speak(text: str, timeout_s: float = 1.0) -> tuple[bool, str]:
+    message = str(text or "").strip()
+    if not message:
+        return False, "empty_text"
+    timeout_s = max(0.2, min(float(timeout_s), 2.5))
+    try:
+        response = await ipc_request(
+            "POST",
+            "/speak",
+            service="audio",
+            payload={"text": message},
+            timeout=timeout_s,
+        )
+    except Exception as exc:
+        return False, f"audio_worker_unavailable: {exc}"
+    if not response.is_success:
+        try:
+            payload = response.json()
+        except Exception:
+            payload = {}
+        detail = str(payload.get("detail") or payload.get("error") or f"http {response.status_code}")
+        return False, detail
+    return True, "queued"
+
+
+async def _soundboks_ready(orchestrator: Any, api_module: Any) -> tuple[bool, str]:
+    sink = str(orchestrator.config.get("bluetooth.sink_name", "")).strip()
+    if not sink:
+        return False, "sink_missing"
+    try:
+        sound = await api_module.asyncio.wait_for(
+            api_module.asyncio.to_thread(api_module._check_soundboks_sink, sink),
+            timeout=0.8,
+        )
+    except Exception as exc:
+        return False, f"sound_check_failed: {exc}"
+    if not isinstance(sound, dict):
+        return False, "sound_status_invalid"
+    if bool(sound.get("available", False)):
+        return True, str(sound.get("matched_sink") or sound.get("sink") or sink)
+    return False, "soundboks_absente_ou_non_connectee"
+
+
+async def _deliver_dual_response(
+    response_text: str,
+    *,
+    orchestrator: Any,
+    api_module: Any,
+) -> dict[str, Any]:
+    text = str(response_text or "").strip()
+    delivery: dict[str, Any] = {
+        "audio": False,
+        "audio_status": "written_only",
+        "audio_note": "Enceinte absente: reponse ecrite uniquement.",
+    }
+    if not text:
+        return delivery
+    speaker_ok, speaker_detail = await _soundboks_ready(orchestrator, api_module)
+    if not speaker_ok:
+        delivery["audio_status"] = "speaker_unavailable"
+        delivery["audio_detail"] = speaker_detail
+        return delivery
+    queued, queue_detail = await _queue_audio_worker_speak(text)
+    if queued:
+        return {
+            "audio": True,
+            "audio_status": "queued",
+            "audio_detail": speaker_detail,
+            "audio_note": "",
+        }
+    return {
+        "audio": False,
+        "audio_status": "queue_failed",
+        "audio_detail": queue_detail,
+        "audio_note": "Enceinte detectee mais TTS indisponible: reponse ecrite uniquement.",
+    }
+
+
+async def _generate_conversation_response(
+    *,
+    clean_prompt: str,
+    expert_model: str | None,
+    expert_system: str | None,
+    payload: dict[str, Any],
+    orchestrator: Any,
+    api_module: Any,
+) -> dict[str, Any]:
+    base_url = orchestrator.config.get("ollama.base_url", "http://localhost:11434")
+    ask_profile_model = orchestrator.config.get(
+        "ollama.model_profiles.ask",
+        orchestrator.config.get("ollama.ask_model", None),
+    )
+    default_model = orchestrator.config.get("ollama.model", None)
+    available_models = await _list_ollama_models(base_url)
+    resolved_model = _pick_model(
+        available_models, [expert_model, ask_profile_model, default_model]
+    )
+    if not resolved_model:
+        raise HTTPException(status_code=503, detail="Ollama unavailable: no model configured")
+
+    full_prompt = f"Reponds en francais, brievement.\n{clean_prompt}"
+    if expert_system:
+        full_prompt = (
+            f"Reponds en francais, brievement.\n{str(expert_system).strip()}\n\n{clean_prompt}"
+        )
+    ask_num_predict = int(orchestrator.config.get("ollama.ask_num_predict", 24))
+    if ask_num_predict <= 0:
+        ask_num_predict = 24
+    ask_num_predict = min(ask_num_predict, 24)
+    payload_data: dict[str, Any] = {
+        "model": resolved_model,
+        "prompt": full_prompt,
+        "stream": False,
+        "options": {
+            "num_predict": ask_num_predict,
+            "temperature": float(orchestrator.config.get("ollama.temperature", 0.4)),
+        },
+    }
+    keep_alive = orchestrator.config.get("ollama.keep_alive", None)
+    if keep_alive:
+        payload_data["keep_alive"] = keep_alive
+
+    timeout_s = float(orchestrator.config.get("ollama.timeout_seconds", 120))
+    timeout_s = max(5.0, min(timeout_s, 25.0))
+    url = f"{base_url}/api/generate"
+    try:
+        api_module.update_status(
+            thinking=True,
+            state="THINKING",
+            last_prompt=clean_prompt,
+            last_prompt_at=api_module.time.time(),
+        )
+        async with httpx.AsyncClient(timeout=timeout_s) as client:
+            ollama_response = await client.post(url, json=payload_data)
+            ollama_response.raise_for_status()
+            data = ollama_response.json()
+        response = str(data.get("response", "")).strip()
+        if not response:
+            response = "Je t'ecoute."
+        if _is_listening_only_response(response):
+            response = "Salut. Dis-moi l'action precise que tu veux lancer."
+        api_module.update_status(
+            thinking=False,
+            state="IDLE",
+            last_response=response,
+            last_response_at=api_module.time.time(),
+        )
+    except Exception as exc:
+        api_module.update_status(thinking=False, state="IDLE", error=str(exc))
+        raise HTTPException(status_code=503, detail=f"Ollama unavailable: {exc}")
+    return {"response": response, "model": resolved_model, "task": False, "route": "ollama"}
+
+
+async def process_input(
+    text: str,
+    is_voice: bool = False,
+    image_bytes: bytes | None = None,
+    *,
+    payload: dict[str, Any] | None = None,
+    orchestrator: Any | None = None,
+    api_module: Any | None = None,
+) -> dict[str, Any]:
+    from core import runtime_bridge as runtime_api
+
+    _ = image_bytes  # Reserved for the vision-aware path (step 2).
+    payload = payload or {}
+    api_module = api_module or runtime_api
+    orchestrator = orchestrator or api_module._require_orchestrator()
+
+    prompt = str(text or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="prompt required")
+
+    clean_prompt, expert_model, expert_system, _expert = api_module._resolve_expert_prompt(
+        prompt, orchestrator.config
+    )
+    vision_glance_payload: dict[str, Any] | None = None
+    if bool(payload.get("vision_glance", True)):
+        vision_timeout_s = float(payload.get("vision_timeout_s", 0.8))
+        vision_glance_payload = await _vision_see_user(vision_timeout_s)
+    glance_text = _vision_glance_text(vision_glance_payload)
+
+    force_task = bool(payload.get("force_task", False))
+    is_task = force_task or _looks_like_task_request(clean_prompt, is_voice=is_voice)
+
+    if is_task:
+        react_payload = dict(payload)
+        react_payload["react_filter"] = True
+        react_result = await _relay_openclaw_react(
+            payload=react_payload,
+            prompt=clean_prompt,
+            orchestrator=orchestrator,
+            api_module=api_module,
+        )
+        react_text = _extract_openclaw_reply(react_result)
+        if not react_text and isinstance(react_result, dict) and react_result.get("ok", False):
+            react_text = "Tache OpenClaw en cours."
+        if not react_text:
+            error_msg = (
+                str((react_result or {}).get("error", "")).strip()
+                if isinstance(react_result, dict)
+                else ""
+            )
+            react_text = (
+                f"OpenClaw indisponible: {error_msg}"
+                if error_msg
+                else "OpenClaw indisponible pour cette tache."
+            )
+        react_text = _prepend_glance(react_text, glance_text)
+        return {
+            "response": react_text,
+            "task": True,
+            "route": "openclaw",
+            "react": react_result,
+            "vision": vision_glance_payload,
+            "source": "process_input",
+        }
+
+    result = await _generate_conversation_response(
+        clean_prompt=clean_prompt,
+        expert_model=expert_model,
+        expert_system=expert_system,
+        payload=payload,
+        orchestrator=orchestrator,
+        api_module=api_module,
+    )
+    react_result = await _relay_openclaw_react(
+        payload=payload,
+        prompt=clean_prompt,
+        orchestrator=orchestrator,
+        api_module=api_module,
+    )
+    if react_result is not None:
+        result["react"] = react_result
+    result["response"] = _prepend_glance(str(result.get("response", "")), glance_text)
+    result["vision"] = vision_glance_payload
+    result["source"] = "process_input"
+    return result
 
 
 @router.post("/speak")
@@ -358,82 +720,13 @@ async def ask(payload: dict[str, Any]) -> dict[str, Any]:
     prompt = str(payload.get("prompt", "")).strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt required")
-    orchestrator = api_module._require_orchestrator()
-    base_url = orchestrator.config.get("ollama.base_url", "http://localhost:11434")
-    ask_profile_model = orchestrator.config.get(
-        "ollama.model_profiles.ask",
-        orchestrator.config.get("ollama.ask_model", None),
-    )
-    default_model = orchestrator.config.get("ollama.model", None)
-    available_models = await _list_ollama_models(base_url)
-    clean_prompt, expert_model, expert_system, _expert = api_module._resolve_expert_prompt(
-        prompt, orchestrator.config
-    )
-    react_result = await _relay_openclaw_react(
+    return await process_input(
+        prompt,
+        is_voice=bool(payload.get("is_voice", False)),
+        image_bytes=None,
         payload=payload,
-        prompt=clean_prompt,
-        orchestrator=orchestrator,
         api_module=api_module,
     )
-    resolved_model = _pick_model(
-        available_models, [expert_model, ask_profile_model, default_model]
-    )
-    if not resolved_model:
-        raise HTTPException(status_code=503, detail="Ollama unavailable: no model configured")
-    # Keep chat path low-latency: send a compact prompt to avoid long prefill stalls.
-    full_prompt = f"Reponds en francais, brievement.\n{clean_prompt}"
-    if expert_system:
-        full_prompt = (
-            f"Reponds en francais, brievement.\n{str(expert_system).strip()}\n\n{clean_prompt}"
-        )
-    ask_num_predict = int(orchestrator.config.get("ollama.ask_num_predict", 24))
-    if ask_num_predict <= 0:
-        ask_num_predict = 24
-    ask_num_predict = min(ask_num_predict, 24)
-    payload_data: dict[str, Any] = {
-        "model": resolved_model,
-        "prompt": full_prompt,
-        "stream": False,
-        "options": {
-            "num_predict": ask_num_predict,
-            "temperature": float(orchestrator.config.get("ollama.temperature", 0.4)),
-        },
-    }
-    keep_alive = orchestrator.config.get("ollama.keep_alive", None)
-    if keep_alive:
-        payload_data["keep_alive"] = keep_alive
-    timeout_s = float(orchestrator.config.get("ollama.timeout_seconds", 120))
-    timeout_s = max(5.0, min(timeout_s, 25.0))
-    url = f"{base_url}/api/generate"
-    try:
-        api_module.update_status(
-            thinking=True,
-            state="THINKING",
-            last_prompt=clean_prompt,
-            last_prompt_at=api_module.time.time(),
-        )
-        async with httpx.AsyncClient(timeout=timeout_s) as client:
-            ollama_response = await client.post(url, json=payload_data)
-            ollama_response.raise_for_status()
-            data = ollama_response.json()
-        response = str(data.get("response", "")).strip()
-        if not response:
-            response = "Je t'ecoute."
-        if _is_listening_only_response(response):
-            response = "Salut. Dis-moi l'action precise que tu veux lancer."
-        api_module.update_status(
-            thinking=False,
-            state="IDLE",
-            last_response=response,
-            last_response_at=api_module.time.time(),
-        )
-    except Exception as exc:
-        api_module.update_status(thinking=False, state="IDLE", error=str(exc))
-        raise HTTPException(status_code=503, detail=f"Ollama unavailable: {exc}")
-    result: dict[str, Any] = {"response": response}
-    if react_result is not None:
-        result["react"] = react_result
-    return result
 
 
 @router.post("/agent/react")
@@ -459,12 +752,55 @@ async def agent_react(payload: dict[str, Any]) -> dict[str, Any]:
 
 @router.get("/agent/metrics")
 async def agent_metrics(timeout_s: float = 4.0) -> dict[str, Any]:
-    from core import runtime_bridge as api_module
-
     timeout_s = max(0.5, min(float(timeout_s), 12.0))
-    result = await api_module.asyncio.to_thread(_metrics_from_openclaw, timeout_s)
+    result = await _metrics_from_openclaw(timeout_s)
+    if result.get("ok", False):
+        return result
+    snapshot = openclaw_state_snapshot(include_content=False)
+    return {
+        "ok": True,
+        "degraded": True,
+        "error": result.get("error", "openclaw unavailable"),
+        "shared_state": snapshot,
+    }
+
+
+@router.get("/agent/tasks")
+async def agent_tasks(timeout_s: float = 3.0) -> dict[str, Any]:
+    timeout_s = max(0.5, min(float(timeout_s), 12.0))
+    result = await fetch_tasks(timeout_s=timeout_s)
+    if result.get("ok", False):
+        return result
+    snapshot = openclaw_state_snapshot(include_content=False)
+    tasks_block = snapshot.get("tasks", {}) if isinstance(snapshot, dict) else {}
+    tasks = tasks_block.get("items", []) if isinstance(tasks_block, dict) else []
+    return {
+        "ok": True,
+        "degraded": True,
+        "error": result.get("error", "openclaw tasks unavailable"),
+        "tasks": tasks if isinstance(tasks, list) else [],
+        "shared_state": snapshot,
+    }
+
+
+@router.get("/agent/memory")
+async def agent_memory(include_content: bool = False) -> dict[str, Any]:
+    result = await fetch_memory(include_content=bool(include_content), timeout_s=3.0)
     if not result.get("ok", False):
-        raise HTTPException(status_code=503, detail=result.get("error", "openclaw unavailable"))
+        raise HTTPException(status_code=503, detail=result.get("error", "openclaw memory unavailable"))
+    return result
+
+
+@router.post("/agent/memory")
+async def agent_memory_write(payload: dict[str, Any]) -> dict[str, Any]:
+    path = str(payload.get("path", "")).strip()
+    if not path:
+        raise HTTPException(status_code=400, detail="path required")
+    content = str(payload.get("content", ""))
+    append = bool(payload.get("append", False))
+    result = await write_memory(path, content, append=append, timeout_s=4.0)
+    if not result.get("ok", False):
+        raise HTTPException(status_code=503, detail=result.get("error", "openclaw memory write unavailable"))
     return result
 
 
@@ -747,8 +1083,27 @@ async def ask_and_speak(payload: dict[str, Any]) -> dict[str, Any]:
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt required")
     orchestrator = api_module._require_orchestrator()
-    vocal = orchestrator.get_tentacle("vocal")
     music = orchestrator.get_tentacle("music")
+
+    # Voice task/action requests are delegated to OpenClaw first.
+    if bool(payload.get("force_task", False)) or _looks_like_task_request(prompt, is_voice=True):
+        routed = await process_input(
+            prompt,
+            is_voice=True,
+            payload=payload,
+            orchestrator=orchestrator,
+            api_module=api_module,
+        )
+        routed_response = str(routed.get("response", "")).strip()
+        routed.update(
+            await _deliver_dual_response(
+                routed_response,
+                orchestrator=orchestrator,
+                api_module=api_module,
+            )
+        )
+        return routed
+
     base_url = orchestrator.config.get("ollama.base_url", "http://localhost:11434")
     ask_profile_model = orchestrator.config.get(
         "ollama.model_profiles.ask",
@@ -774,13 +1129,14 @@ async def ask_and_speak(payload: dict[str, Any]) -> dict[str, Any]:
         for key in ("parle moi en francais", "reponds en francais", "en francais")
     ):
         response = "D'accord, je te reponds en francais."
-        if vocal:
-            await vocal.speak(response)
-            result = {"response": response, "audio": True}
-            if react_result is not None:
-                result["react"] = react_result
-            return result
-        result = {"response": response, "audio": False}
+        result = {"response": response}
+        result.update(
+            await _deliver_dual_response(
+                response,
+                orchestrator=orchestrator,
+                api_module=api_module,
+            )
+        )
         if react_result is not None:
             result["react"] = react_result
         return result
@@ -810,21 +1166,17 @@ async def ask_and_speak(payload: dict[str, Any]) -> dict[str, Any]:
                     f"Action impossible sur {actuator_name}: "
                     f"{result.get('error', 'erreur inconnue')}"
                 )
-            if vocal:
-                await vocal.speak(response)
-                result = {
-                    "response": response,
-                    "audio": True,
-                    "actuator": {"id": actuator_id, "name": actuator_name, "action": action, "ok": ok},
-                }
-                if react_result is not None:
-                    result["react"] = react_result
-                return result
             result = {
                 "response": response,
-                "audio": False,
                 "actuator": {"id": actuator_id, "name": actuator_name, "action": action, "ok": ok},
             }
+            result.update(
+                await _deliver_dual_response(
+                    response,
+                    orchestrator=orchestrator,
+                    api_module=api_module,
+                )
+            )
             if react_result is not None:
                 result["react"] = react_result
             return result
@@ -832,9 +1184,14 @@ async def ask_and_speak(payload: dict[str, Any]) -> dict[str, Any]:
     if music and api_module._is_music_prompt(prompt):
         await music.play(prompt)
         response = "Musique lancée."
-        if vocal:
-            await vocal.speak(response)
-        result = {"response": response, "audio": bool(vocal), "music": True}
+        result = {"response": response, "music": True}
+        result.update(
+            await _deliver_dual_response(
+                response,
+                orchestrator=orchestrator,
+                api_module=api_module,
+            )
+        )
         if react_result is not None:
             result["react"] = react_result
         return result
@@ -907,13 +1264,14 @@ async def ask_and_speak(payload: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         api_module.update_status(thinking=False, state="IDLE", error=str(exc))
         response = "Je suis encore en charge. Reessaie dans quelques secondes."
-    audio_ok = False
-    if vocal:
-        await vocal.speak(response)
-        audio_ok = True
-    else:
-        api_module.update_status(state="IDLE")
-    result = {"response": response, "audio": audio_ok}
+    result = {"response": response}
+    result.update(
+        await _deliver_dual_response(
+            response,
+            orchestrator=orchestrator,
+            api_module=api_module,
+        )
+    )
     if react_result is not None:
         result["react"] = react_result
     return result
