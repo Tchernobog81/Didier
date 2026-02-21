@@ -1,0 +1,10 @@
+/mnt/didier_ssd/didier/logs/* {
+  daily
+  rotate 7
+  compress
+  delaycompress
+  missingok
+  notifempty
+  copytruncate
+  su tchernobog tchernobog
+}

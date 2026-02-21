@@ -216,6 +216,28 @@ curl -sS http://127.0.0.1:5010/agent/memory
   - toggle reel `video: stop -> inactive`
   - toggle reel `video: start -> active`
 
+## 12) Correctifs systeme et thermique (2026-02-21)
+
+- Correctif `logrotate.service`:
+  - cause: rotation Didier sur dossier groupe-writable sans `su`
+  - fix: regle `/etc/logrotate.d/didier` avec `su tchernobog tchernobog`
+  - etat apres fix: `logrotate.service` passe en succes
+- Correctif `NetworkManager-wait-online.service`:
+  - cause: timeout trop court pendant reprise reseau post-coupure
+  - fix: override systemd `ExecStart=/usr/bin/nm-online -s -q -t 120`
+  - etat apres fix: service `active (exited)`
+- Persistance:
+  - template logrotate versionne: `config/logrotate.d/didier`
+  - override NM wait-online versionne: `services/NetworkManager-wait-online.override.conf`
+  - installation idempotente mise a jour: `scripts/install_systemd.sh`
+- Tuning charge/thermique ASR:
+  - `DIDIER_ASR_MODEL_PATH` -> `ggml-base.bin`
+  - `DIDIER_ASR_WAKE_MODEL_PATH` -> `ggml-tiny.bin`
+  - `DIDIER_ASR_WAKE_EVERY_N_CHUNKS=3`
+  - wake VAD renforce (`min_speech_ratio=0.22`, `abs_min=0.015`)
+  - cgroup ASR ajuste: `CPUQuota=70%`, `Nice=7`
+  - effet observe: plus de process `whisper.cpp` runaway, temperature stabilisee ~49C en mesure post-fix
+
 ### Etape 5 (en place)
 
 - Bridge OpenClaw natif:

@@ -14,9 +14,9 @@ Environment=DIDIER_ASR_API_URL=http://127.0.0.1:5010
 Environment=DIDIER_ASR_ALSA_DEVICE=hw:2,0
 Environment=DIDIER_ASR_SAMPLE_RATE=16000
 Environment=DIDIER_ASR_CHANNELS=4
-Environment=DIDIER_ASR_CHUNK_SECONDS=2
-Environment=DIDIER_ASR_COMMAND_CHUNK_SECONDS=3
-Environment=DIDIER_ASR_WAKE_EVERY_N_CHUNKS=2
+Environment=DIDIER_ASR_CHUNK_SECONDS=3
+Environment=DIDIER_ASR_COMMAND_CHUNK_SECONDS=4
+Environment=DIDIER_ASR_WAKE_EVERY_N_CHUNKS=3
 Environment=DIDIER_ASR_LANGUAGE=fr
 Environment=DIDIER_ASR_THREADS=2
 Environment=DIDIER_ASR_WAKE_THREADS=1
@@ -25,11 +25,20 @@ Environment=DIDIER_ASR_BEST_OF=1
 Environment=DIDIER_ASR_NO_FALLBACK=0
 Environment=DIDIER_ASR_NO_TIMESTAMPS=1
 Environment=DIDIER_ASR_WHISPER_BIN=/mnt/didier_ssd/didier/code/bin/whisper.cpp
-Environment=DIDIER_ASR_MODEL_PATH=/mnt/didier_ssd/didier/code/models/ggml-small.bin
+Environment=DIDIER_ASR_MODEL_PATH=/mnt/didier_ssd/didier/code/models/ggml-base.bin
 Environment=DIDIER_ASR_WAKE_MODEL_PATH=/mnt/didier_ssd/didier/code/models/ggml-tiny.bin
 Environment="DIDIER_ASR_WAKE_WORD=Yo! Didier"
 Environment="DIDIER_ASR_WAKE_WORD_ALIASES=Yo Didier|Yo! Didier!|Yadii"
 Environment=DIDIER_ASR_WAKE_TIMEOUT_SECONDS=12
+Environment=DIDIER_ASR_WAKE_SIMILARITY=0.78
+Environment=DIDIER_ASR_USE_VAD=1
+Environment=DIDIER_ASR_VAD_FRAME_MS=20
+Environment=DIDIER_ASR_VAD_ENERGY_FACTOR=3.0
+Environment=DIDIER_ASR_VAD_MIN_SPEECH_RATIO=0.12
+Environment=DIDIER_ASR_VAD_ABS_MIN=0.008
+Environment=DIDIER_ASR_WAKE_VAD_MIN_SPEECH_RATIO=0.22
+Environment=DIDIER_ASR_WAKE_VAD_ABS_MIN=0.015
+Environment=DIDIER_ASR_SHARED_STATE_INTERVAL_S=1.0
 Environment=DIDIER_ASR_WAKE_REPLY_ENABLED=1
 Environment="DIDIER_ASR_WAKE_REPLY_TEXT=Salut Tcherno, qu'est-ce que je peux faire pour toi ?"
 Environment=DIDIER_ASR_ALLOW_INLINE_COMMAND=0
@@ -39,8 +48,8 @@ RestartSec=2s
 TimeoutStartSec=20s
 TimeoutStopSec=10s
 KillSignal=SIGTERM
-CPUQuota=150%
-Nice=5
+CPUQuota=70%
+Nice=7
 IOSchedulingClass=best-effort
 IOSchedulingPriority=6
 StandardOutput=journal

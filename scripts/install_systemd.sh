@@ -4,7 +4,13 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC_DIR="${ROOT_DIR}/services"
 DST_DIR="/etc/systemd/system"
-UNITS=(didier-api didier-vision didier-brain didier-audio didier-asr didier-soundboks)
+LOGROTATE_SRC="${ROOT_DIR}/config/logrotate.d/didier"
+LOGROTATE_DST="/etc/logrotate.d/didier"
+NM_WAIT_OVERRIDE_SRC="${ROOT_DIR}/services/NetworkManager-wait-online.override.conf"
+NM_WAIT_OVERRIDE_DIR="/etc/systemd/system/NetworkManager-wait-online.service.d"
+NM_WAIT_OVERRIDE_DST="${NM_WAIT_OVERRIDE_DIR}/override.conf"
+UNITS=(didier-api didier-vision didier-brain didier-audio didier-asr didier-soundboks openclaw didier-openclaw-bridge)
+AUX_UNITS=(openclaw-recover)
 
 if [[ ! -d "${SRC_DIR}" ]]; then
   echo "Missing directory: ${SRC_DIR}" >&2
@@ -13,6 +19,19 @@ fi
 
 changed=0
 for unit in "${UNITS[@]}"; do
+  src="${SRC_DIR}/${unit}.service"
+  dst="${DST_DIR}/${unit}.service"
+  if [[ ! -f "${src}" ]]; then
+    echo "Missing unit file: ${src}" >&2
+    exit 1
+  fi
+  if ! sudo -n cmp -s "${src}" "${dst}" 2>/dev/null; then
+    sudo -n cp "${src}" "${dst}"
+    changed=1
+  fi
+done
+
+for unit in "${AUX_UNITS[@]}"; do
   src="${SRC_DIR}/${unit}.service"
   dst="${DST_DIR}/${unit}.service"
   if [[ ! -f "${src}" ]]; then
@@ -38,6 +57,20 @@ if [[ "${changed}" -eq 1 ]]; then
   sudo -n systemctl daemon-reload
 fi
 
+if [[ -f "${LOGROTATE_SRC}" ]]; then
+  if ! sudo -n cmp -s "${LOGROTATE_SRC}" "${LOGROTATE_DST}" 2>/dev/null; then
+    sudo -n cp "${LOGROTATE_SRC}" "${LOGROTATE_DST}"
+  fi
+fi
+
+if [[ -f "${NM_WAIT_OVERRIDE_SRC}" ]]; then
+  sudo -n mkdir -p "${NM_WAIT_OVERRIDE_DIR}"
+  if ! sudo -n cmp -s "${NM_WAIT_OVERRIDE_SRC}" "${NM_WAIT_OVERRIDE_DST}" 2>/dev/null; then
+    sudo -n cp "${NM_WAIT_OVERRIDE_SRC}" "${NM_WAIT_OVERRIDE_DST}"
+    sudo -n systemctl daemon-reload
+  fi
+fi
+
 for unit in "${UNITS[@]}"; do
   sudo -n systemctl enable "${unit}.service"
   if [[ "${changed}" -eq 1 ]]; then
@@ -59,4 +92,4 @@ done
 echo "Legacy services disabled: run_didier.service, didier.service"
 
 sudo -n systemctl --no-pager --full status \
-  didier-api.service didier-vision.service didier-brain.service didier-audio.service didier-asr.service didier-soundboks.service
+  didier-api.service didier-vision.service didier-brain.service didier-audio.service didier-asr.service didier-soundboks.service openclaw.service didier-openclaw-bridge.service
