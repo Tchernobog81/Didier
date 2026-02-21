@@ -1,10 +1,11 @@
-import time
 import asyncio
+import os
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from core.shared_state import metrics_snapshot
 from shared.ipc import request as ipc_request
 
@@ -88,6 +89,99 @@ _TERMINAL_BLOCKED_SNIPPETS = (
     "reboot",
     "poweroff",
 )
+_METRICS_WS_INTERVAL_S = max(
+    0.5, min(float(os.getenv("DIDIER_METRICS_WS_INTERVAL_S", "1.0")), 5.0)
+)
+_PERIPHERAL_SPECS: dict[str, dict[str, str]] = {
+    "video": {
+        "label": "Flux video",
+        "kind": "sense",
+        "channel": "video",
+        "service": "didier-vision.service",
+    },
+    "sound": {
+        "label": "Sortie son",
+        "kind": "actionneur",
+        "channel": "audio",
+        "service": "didier-audio.service",
+    },
+    "mic": {
+        "label": "Entree micro",
+        "kind": "sense",
+        "channel": "audio",
+        "service": "didier-asr.service",
+    },
+    "wifi": {
+        "label": "Connecteur reseau",
+        "kind": "connectivite",
+        "channel": "wifi",
+        "service": "didier-openclaw-bridge.service",
+    },
+}
+
+
+def _fallback_metrics_payload() -> dict[str, Any]:
+    return {
+        "timestamp": time.time(),
+        "cpu": {"percent": 0.0, "temp_c": None, "per_core": []},
+        "memory": {"total": 0, "used": 0, "percent": 0.0},
+        "disk": {
+            "root": {"available": False, "path": "/"},
+            "ssd": {"available": False, "path": "/mnt/didier_ssd"},
+        },
+        "npu": {"available": False, "device": False, "pcie": False, "utilization": None},
+        "audio": {"available": False, "level_percent": 0, "listening": False},
+        "workers": {},
+        "source": "shared_state_v1",
+    }
+
+
+async def _run_systemctl(*args: str) -> tuple[int, str]:
+    cmd = ["sudo", "-n", "systemctl", *args]
+
+    def _run() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+    proc = await asyncio.to_thread(_run)
+    detail = (proc.stdout or proc.stderr or "").strip()
+    return proc.returncode, detail
+
+
+async def _service_state(service: str) -> tuple[bool, str]:
+    rc, detail = await _run_systemctl("is-active", service)
+    state = (detail or "unknown").splitlines()[0].strip().lower()
+    if rc == 0 and state in {"active", "activating"}:
+        return True, state
+    if not state:
+        state = "inactive"
+    return False, state
+
+
+def _wifi_link_state() -> str:
+    oper_path = Path("/sys/class/net/wlan0/operstate")
+    if oper_path.exists():
+        try:
+            return oper_path.read_text(encoding="utf-8").strip().lower() or "unknown"
+        except Exception:
+            return "unknown"
+    return "not-present"
+
+
+async def _peripheral_item(key: str, spec: dict[str, str]) -> dict[str, Any]:
+    service = spec["service"]
+    active, state = await _service_state(service)
+    item: dict[str, Any] = {
+        "id": key,
+        "label": spec["label"],
+        "kind": spec["kind"],
+        "channel": spec["channel"],
+        "service": service,
+        "active": active,
+        "state": state,
+    }
+    if key == "wifi":
+        item["link_state"] = _wifi_link_state()
+    return item
 
 async def _probe_worker_health(service: str, fallback_base: str) -> tuple[str, str]:
     try:
@@ -125,16 +219,34 @@ async def metrics() -> dict[str, Any]:
     snapshot = metrics_snapshot()
     if snapshot:
         return snapshot
-    return {
-        "timestamp": time.time(),
-        "cpu": {"percent": 0.0, "temp_c": None, "per_core": []},
-        "memory": {"total": 0, "used": 0, "percent": 0.0},
-        "disk": {"root": {"available": False, "path": "/"}, "ssd": {"available": False, "path": "/mnt/didier_ssd"}},
-        "npu": {"available": False, "device": False, "pcie": False, "utilization": None},
-        "audio": {"available": False, "level_percent": 0, "listening": False},
-        "workers": {},
-        "source": "shared_state_v1",
-    }
+    return _fallback_metrics_payload()
+
+
+@router.websocket("/ws/metrics")
+async def ws_metrics(websocket: WebSocket) -> None:
+    from core import runtime_bridge as api_module
+
+    await websocket.accept()
+    try:
+        while True:
+            snapshot = metrics_snapshot() or _fallback_metrics_payload()
+            asr_payload = api_module._read_asr_status()
+            await websocket.send_json(
+                {
+                    "type": "metrics_update",
+                    "ts": time.time(),
+                    "metrics": snapshot,
+                    "asr": asr_payload,
+                }
+            )
+            await asyncio.sleep(_METRICS_WS_INTERVAL_S)
+    except WebSocketDisconnect:
+        return
+    except Exception:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 @router.get("/device-status")
@@ -236,6 +348,65 @@ async def device_status() -> dict[str, Any]:
             "ask": orchestrator.config.get("ollama.model_profiles.ask", None),
             "coding": orchestrator.config.get("ollama.model_profiles.coding", None),
         },
+    }
+
+
+@router.get("/peripherals")
+async def peripherals() -> dict[str, Any]:
+    items = await asyncio.gather(
+        *[_peripheral_item(key, spec) for key, spec in _PERIPHERAL_SPECS.items()]
+    )
+    return {
+        "ok": True,
+        "ts": time.time(),
+        "items": items,
+    }
+
+
+@router.post("/peripherals/toggle")
+async def peripherals_toggle(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    body = payload or {}
+    peripheral_id = str(body.get("id", "")).strip().lower()
+    if peripheral_id not in _PERIPHERAL_SPECS:
+        raise HTTPException(status_code=400, detail="unknown peripheral id")
+
+    spec = _PERIPHERAL_SPECS[peripheral_id]
+    service = spec["service"]
+    current_active, current_state = await _service_state(service)
+
+    requested_enabled: bool | None = None
+    if "enabled" in body:
+        requested_enabled = bool(body.get("enabled"))
+    else:
+        action = str(body.get("action", "")).strip().lower()
+        if action in {"start", "on", "enable"}:
+            requested_enabled = True
+        elif action in {"stop", "off", "disable"}:
+            requested_enabled = False
+
+    if requested_enabled is None:
+        requested_enabled = not current_active
+
+    cmd = "start" if requested_enabled else "stop"
+    rc, detail = await _run_systemctl(cmd, service)
+    if rc != 0:
+        raise HTTPException(
+            status_code=500,
+            detail=f"systemctl {cmd} failed for {service}: {detail or f'rc={rc}'}",
+        )
+
+    active, state = await _service_state(service)
+    item = await _peripheral_item(peripheral_id, spec)
+    return {
+        "ok": True,
+        "ts": time.time(),
+        "id": peripheral_id,
+        "service": service,
+        "requested": cmd,
+        "before": {"active": current_active, "state": current_state},
+        "after": {"active": active, "state": state},
+        "detail": detail,
+        "item": item,
     }
 
 

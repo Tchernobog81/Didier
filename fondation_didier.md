@@ -1,8 +1,8 @@
 # Fondation Didier (Version Exportable)
 
-Date de reference: 2026-02-19
-Statut global: ARCHITECTURE OPENCLAW NATIVE STABILISEE (etapes 1 a 6 validees)
-- Release UI: `V3r2`
+Date de reference: 2026-02-20
+Statut global: ARCHITECTURE OPENCLAW NATIVE STABILISEE (etapes 1 a 6 validees) + FLUIDITE ETAPES 3-5 VALIDEE (reserve idle strict)
+- Release UI: `V3r3`
 - Tag de reference: `didier_alive`
 
 ## 1) Architecture active
@@ -77,9 +77,30 @@ Statut global: ARCHITECTURE OPENCLAW NATIVE STABILISEE (etapes 1 a 6 validees)
 
 ### Points encore ouverts
 
-- `POST /agent/react` retourne encore `405 Method Not Allowed` sur `http://127.0.0.1:3800/hooks/agent`
-- Wake test ASR valide le flux audio mais ne matche pas toujours le wake word sur echantillon court
-- Critere load idle strict `<0.3` non atteint sur la derniere mesure (load > 1)
+- Critere load idle strict `<0.3` non atteint en charge de validation (reserve acceptee)
+
+### Optimisations fluidite (2026-02-20, etapes 3-5 validees)
+
+- Brain worker:
+  - filtre `MicroGPTLite` renforce pour court-circuiter plus de prompts courts
+  - nouvelles metriques: `requests_total`, `micro_shortcuts`, `micro_bypass_ratio`
+- SharedState loops:
+  - intervals de publication parametrables par env (`DIDIER_*_SHARED_STATE_INTERVAL_S`, valeur courante `1.0`)
+  - `core/api.py` utilise `psutil.cpu_percent(interval=None)` (non bloquant) au lieu de sondage bloquant
+  - boucle `openclaw_memory_watch_loop` intervallee par `DIDIER_OPENCLAW_MEMORY_WATCH_INTERVAL_S`
+- Systemd CPU scheduling:
+  - ajout `CPUQuota` + `Nice` sur `didier-api`, `didier-brain`, `didier-vision`, `didier-audio`, `didier-asr`, `didier-openclaw-bridge`, `openclaw`, `didier-soundboks`
+- Etape 4 (bonus fluidite UI):
+  - nouveau flux WebSocket `GET ws://<host>:5010/ws/metrics` (router system)
+  - payload live: `metrics` + `asr`
+  - `web/app.js` bascule auto en mode WS et coupe les polls `fetchMetrics`/`fetchAsrStatus` tant que le socket est connecte
+  - fallback automatique au polling HTTP si WS coupe, puis reconnexion
+- Etape 5 (validation globale, 2026-02-20):
+  - `POST /agent/react`: OK (`status_code=202`)
+  - wake test ASR (`/asr/wake-test` text probes): OK
+  - chaine `/ask-and-speak`: OK (reponse + audio queue)
+  - script unique mis a jour: `scripts/check_edge.sh` (ports, health, bench, react, wake, ask-and-speak, idle gate)
+  - point restant: idle strict `<0.3` non atteint sur la machine de validation (load1 observe > 9), principalement pendant activite inference (`ollama runner`, `whisper.cpp`) et outillage dev actif
 
 ## 6) Rollback officiel
 
@@ -174,6 +195,26 @@ curl -sS http://127.0.0.1:5010/agent/memory
   - bouton `Rafraichir` pour forcer la synchro
 - CSS (`web/styles.css`):
   - theme OpenClaw (cartes + timeline + KPI), responsive mobile
+
+## 10) Incident micro-coupure (2026-02-21)
+
+- Cause confirmee: micro-coupure electrique (intemperies), pas un crash applicatif pur.
+- Verification post-redemarrage:
+  - `didier-api` `didier-asr` `didier-brain` `didier-audio` `didier-vision` actifs
+  - endpoints critiques OK: `/health`, `/peripherals`, `POST /agent/react`
+  - IPC sockets workers presentes
+- Point d'attention non bloquant:
+  - `NetworkManager-wait-online.service` et `logrotate.service` en failed dans `systemctl --failed`
+
+## 11) UI Peripheriques (etape 4 du protocole UI) - 2026-02-21
+
+- Onglet `Sens & Actionneurs` cable complet:
+  - boutons `Activer`/`Desactiver` branches sur `POST /peripherals/toggle`
+  - feedback utilisateur clair (progression, succes, erreur)
+  - rafraichissement automatique de l'etat apres action
+- Validation fonctionnelle:
+  - toggle reel `video: stop -> inactive`
+  - toggle reel `video: start -> active`
 
 ### Etape 5 (en place)
 

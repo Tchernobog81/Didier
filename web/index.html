@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Didier — Console</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260219-v3r2" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260220-v3r3" />
   </head>
   <body>
     <div class="bg"></div>
@@ -22,6 +22,9 @@
           <button class="tab" type="button" data-tab="terminal">Terminal</button>
           <button class="tab" type="button" data-tab="docker">Workers Edge</button>
           <button class="tab" type="button" data-tab="openclaw">Tâches OpenClaw</button>
+          <button class="tab" type="button" data-tab="peripherals">
+            Sens & Actionneurs
+          </button>
           <button class="tab" type="button" data-tab="actuators">Actionneurs</button>
         </div>
         <div class="title">
@@ -30,7 +33,7 @@
             <h1>Didier</h1>
             <p>
               Raspberry Pi 5 · Orchestrateur
-              <span class="ui-version">V3r2 · 2026-02-19</span>
+              <span class="ui-version">V3r3 · 2026-02-20</span>
             </p>
           </div>
         </div>
@@ -255,6 +258,24 @@
     </main>
 
     <main
+      class="peripherals-panel"
+      id="peripherals-panel"
+      data-tab-panel="peripherals"
+      hidden
+    >
+      <section class="card peripherals-card">
+        <div class="peripherals-toolbar">
+          <h2>Sens & Actionneurs</h2>
+          <div class="peripherals-toolbar-right">
+            <button type="button" id="peripherals-refresh">Rafraîchir</button>
+            <span class="peripherals-message" id="peripherals-message">--</span>
+          </div>
+        </div>
+        <div class="peripherals-list" id="peripherals-list"></div>
+      </section>
+    </main>
+
+    <main
       class="actuators-panel"
       id="actuators-panel"
       data-tab-panel="actuators"
@@ -272,6 +293,6 @@
       </section>
     </main>
 
-    <script src="/static/app.js?v=20260219-v3r2"></script>
+    <script src="/static/app.js?v=20260220-v3r3"></script>
   </body>
 </html>

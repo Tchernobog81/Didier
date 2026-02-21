@@ -168,6 +168,13 @@ body {
   --tab-active-text: #4a0d18;
 }
 
+.tab[data-tab="peripherals"] {
+  --tab-accent: #67e8f9;
+  --tab-active-top: rgba(207, 250, 254, 0.94);
+  --tab-active-bottom: rgba(6, 182, 212, 0.34);
+  --tab-active-text: #164e63;
+}
+
 .tab[data-tab="actuators"] {
   --tab-accent: #34d399;
   --tab-active-top: rgba(167, 243, 208, 0.92);
@@ -825,6 +832,10 @@ body {
   padding: 0 40px 40px;
 }
 
+.peripherals-panel {
+  padding: 0 40px 40px;
+}
+
 .actuators-panel {
   padding: 0 40px 40px;
 }
@@ -861,6 +872,138 @@ body {
   background: rgba(2, 6, 12, 0.92);
   border-color: rgba(96, 165, 250, 0.35);
   color: #dbeafe;
+}
+
+.peripherals-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.peripherals-toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.peripherals-message {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.peripherals-message.is-error {
+  color: #fca5a5;
+}
+
+.peripherals-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 12px;
+}
+
+.peripheral-empty {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.65);
+  color: var(--muted);
+  padding: 12px;
+  font-size: 12px;
+}
+
+.peripheral-card {
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: rgba(15, 23, 42, 0.68);
+  padding: 12px;
+  display: grid;
+  gap: 12px;
+}
+
+.peripheral-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.peripheral-title {
+  margin: 0;
+  font-size: 14px;
+  font-family: var(--mono-font);
+}
+
+.peripheral-badges {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.peripheral-badge {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 11px;
+  color: #cbd5e1;
+  background: rgba(15, 23, 42, 0.68);
+  letter-spacing: 0.01em;
+}
+
+.peripheral-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+}
+
+.peripheral-state-pill {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 11px;
+  letter-spacing: 0.01em;
+}
+
+.peripheral-state-pill.is-on {
+  border-color: rgba(34, 197, 94, 0.45);
+  background: rgba(34, 197, 94, 0.2);
+  color: #bbf7d0;
+}
+
+.peripheral-state-pill.is-off {
+  border-color: rgba(248, 113, 113, 0.45);
+  background: rgba(248, 113, 113, 0.2);
+  color: #fecaca;
+}
+
+.peripheral-state-pill.is-unknown {
+  border-color: rgba(148, 163, 184, 0.45);
+  background: rgba(148, 163, 184, 0.18);
+  color: #e2e8f0;
+}
+
+.peripheral-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.peripheral-actions button {
+  padding: 8px 10px;
+  font-size: 12px;
+}
+
+.peripheral-actions .peripheral-on {
+  background: rgba(34, 197, 94, 0.9);
+  color: #052e16;
+}
+
+.peripheral-actions .peripheral-off {
+  background: rgba(248, 113, 113, 0.9);
+  color: #450a0a;
 }
 
 .actuators-toolbar {
@@ -1618,6 +1761,9 @@ button {
     padding: 0 20px 20px;
   }
   .openclaw-panel {
+    padding: 0 20px 20px;
+  }
+  .peripherals-panel {
     padding: 0 20px 20px;
   }
   .actuators-panel {

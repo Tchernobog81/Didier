@@ -70,6 +70,9 @@ const openclawMeta = document.getElementById("openclaw-meta");
 const openclawTaskList = document.getElementById("openclaw-task-list");
 const openclawTimeline = document.getElementById("openclaw-timeline");
 const openclawRefresh = document.getElementById("openclaw-refresh");
+const peripheralsList = document.getElementById("peripherals-list");
+const peripheralsRefresh = document.getElementById("peripherals-refresh");
+const peripheralsMessage = document.getElementById("peripherals-message");
 const actuatorsList = document.getElementById("actuators-list");
 const actuatorsRefresh = document.getElementById("actuators-refresh");
 const actuatorsMessage = document.getElementById("actuators-message");
@@ -109,6 +112,8 @@ const METRICS_POLL_MS = 2000;
 const CPU_GRAPH_REFRESH_MS = 5000;
 const SURFACE_STATUS_POLL_MS = 3000;
 const SERVICE_503_BACKOFF_MS = 30000;
+const METRICS_WS_RETRY_MS = 3000;
+const METRICS_WS_PATH = "/ws/metrics";
 
 let lastVideoRefreshAt = 0;
 let lastSecondaryRefreshAt = 0;
@@ -116,6 +121,7 @@ let latestCpuMetrics = null;
 let hasRenderedCpuMetrics = false;
 let actuatorsDevices = [];
 let actuatorsStatusById = new Map();
+let peripheralsItems = [];
 let ollamaBackoffUntil = 0;
 let visionSecondaryBackoffUntil = 0;
 let latestDeviceStatus = null;
@@ -124,6 +130,11 @@ let vscodeInitInFlight = false;
 let asrChatSyncInitialized = false;
 let asrSeenPromptAt = 0;
 let asrSeenResponseAt = 0;
+let metricsSocket = null;
+let metricsSocketRetryTimer = null;
+let metricsSocketConnected = false;
+let metricsPollTimer = null;
+let asrPollTimer = null;
 const actuatorRealtimeTimers = new Map();
 const ACTUATOR_COLOR_PRESETS = [
   "#ffffff",
@@ -497,68 +508,74 @@ function refreshCpuMetrics() {
   renderCpuMetrics(latestCpuMetrics);
 }
 
-async function fetchMetrics() {
-  try {
-    const res = await fetch("/metrics");
-    if (!res.ok) throw new Error("metrics");
-    const data = await res.json();
-    statusPill.textContent = "EN LIGNE";
-    statusPill.style.background = "rgba(34, 211, 238, 0.2)";
-    tempEl.textContent =
-      data.cpu.temp_c !== null ? `${data.cpu.temp_c.toFixed(1)}°C` : "N/D";
-    setBar(barTemp, tempToPercent(data.cpu.temp_c));
-    latestCpuMetrics = data.cpu || null;
-    if (!hasRenderedCpuMetrics) refreshCpuMetrics();
-    memEl.textContent = `${data.memory.percent.toFixed(1)}%`;
-    setBar(barMem, data.memory.percent);
-    const rootDisk = data.disk && (data.disk.root || data.disk);
-    const ssdDisk = data.disk && data.disk.ssd;
-    setDisk(rootDisk, diskRootEl, barDiskRoot);
-    setDisk(ssdDisk, diskSsdEl, barDiskSsd);
-    if (diskRootPathEl) {
-      const rootPath = rootDisk && rootDisk.path ? rootDisk.path : "/";
-      diskRootPathEl.textContent = formatDiskPath(rootPath);
-    }
-    if (diskSsdPathEl) {
-      const ssdPath = ssdDisk && ssdDisk.path ? ssdDisk.path : null;
-      diskSsdPathEl.textContent = ssdPath ? formatDiskPath(ssdPath) : "";
-    }
-    if (data.npu && data.npu.available) {
-      const utilRaw = data.npu.utilization;
-      if (utilRaw === null || utilRaw === undefined) {
-        npuEl.textContent = "ACTIF";
-        setBar(barNpu, 25);
-      } else {
-        const util = Number.isFinite(Number(utilRaw)) ? Number(utilRaw) : 0;
-        npuEl.textContent = `${util}%`;
-        setBar(barNpu, util);
-      }
+function applyMetricsData(data) {
+  if (!data || typeof data !== "object") return;
+  if (!data.cpu || !data.memory) return;
+  statusPill.textContent = "EN LIGNE";
+  statusPill.style.background = "rgba(34, 211, 238, 0.2)";
+  tempEl.textContent =
+    data.cpu.temp_c !== null ? `${data.cpu.temp_c.toFixed(1)}°C` : "N/D";
+  setBar(barTemp, tempToPercent(data.cpu.temp_c));
+  latestCpuMetrics = data.cpu || null;
+  if (!hasRenderedCpuMetrics) refreshCpuMetrics();
+  memEl.textContent = `${data.memory.percent.toFixed(1)}%`;
+  setBar(barMem, data.memory.percent);
+  const rootDisk = data.disk && (data.disk.root || data.disk);
+  const ssdDisk = data.disk && data.disk.ssd;
+  setDisk(rootDisk, diskRootEl, barDiskRoot);
+  setDisk(ssdDisk, diskSsdEl, barDiskSsd);
+  if (diskRootPathEl) {
+    const rootPath = rootDisk && rootDisk.path ? rootDisk.path : "/";
+    diskRootPathEl.textContent = formatDiskPath(rootPath);
+  }
+  if (diskSsdPathEl) {
+    const ssdPath = ssdDisk && ssdDisk.path ? ssdDisk.path : null;
+    diskSsdPathEl.textContent = ssdPath ? formatDiskPath(ssdPath) : "";
+  }
+  if (data.npu && data.npu.available) {
+    const utilRaw = data.npu.utilization;
+    if (utilRaw === null || utilRaw === undefined) {
+      npuEl.textContent = "ACTIF";
+      setBar(barNpu, 25);
     } else {
-      npuEl.textContent = "INACTIF";
-      setBar(barNpu, 0);
+      const util = Number.isFinite(Number(utilRaw)) ? Number(utilRaw) : 0;
+      npuEl.textContent = `${util}%`;
+      setBar(barNpu, util);
     }
-    if (data.audio && data.audio.available) {
-      const rawLevel =
-        data.audio.level_percent !== undefined ? data.audio.level_percent : null;
-      const level = Number.isFinite(Number(rawLevel)) ? Number(rawLevel) : null;
-      if (level !== null) {
-        audioEl.textContent = `${level}%`;
-        setBar(barAudio, level);
-        setAudioDot(level);
-      } else if (data.audio.listening) {
-        audioEl.textContent = "Écoute";
-        setBar(barAudio, 0);
-        setAudioDot(10);
-      } else {
-        audioEl.textContent = "N/D";
-        setBar(barAudio, 0);
-        setAudioDot(null);
-      }
+  } else {
+    npuEl.textContent = "INACTIF";
+    setBar(barNpu, 0);
+  }
+  if (data.audio && data.audio.available) {
+    const rawLevel =
+      data.audio.level_percent !== undefined ? data.audio.level_percent : null;
+    const level = Number.isFinite(Number(rawLevel)) ? Number(rawLevel) : null;
+    if (level !== null) {
+      audioEl.textContent = `${level}%`;
+      setBar(barAudio, level);
+      setAudioDot(level);
+    } else if (data.audio.listening) {
+      audioEl.textContent = "Écoute";
+      setBar(barAudio, 0);
+      setAudioDot(10);
     } else {
       audioEl.textContent = "N/D";
       setBar(barAudio, 0);
       setAudioDot(null);
     }
+  } else {
+    audioEl.textContent = "N/D";
+    setBar(barAudio, 0);
+    setAudioDot(null);
+  }
+}
+
+async function fetchMetrics() {
+  try {
+    const res = await fetch("/metrics");
+    if (!res.ok) throw new Error("metrics");
+    const data = await res.json();
+    applyMetricsData(data);
   } catch (err) {
     statusPill.textContent = "HORS LIGNE";
     statusPill.style.background = "rgba(248, 113, 113, 0.2)";
@@ -756,72 +773,161 @@ function loadLogo() {
   tryNext();
 }
 
+function applyAsrStatusData(data) {
+  if (!listeningBadge) return;
+  const state = String(data.state || "").toLowerCase();
+  listeningBadge.textContent = `Écoute : ${data.listening ? "oui" : "non"}`;
+  listeningBadge.classList.toggle("on", !!data.listening);
+  listeningBadge.classList.toggle("off", !data.listening);
+  if (thinkingBadge) {
+    const thinking = data.thinking || state === "thinking";
+    thinkingBadge.textContent = `Réflexion : ${thinking ? "en cours" : "repos"}`;
+    thinkingBadge.classList.toggle("thinking-active", !!thinking);
+  }
+  if (speakingBadge) {
+    const speaking = data.speaking || state === "speaking";
+    speakingBadge.textContent = `Voix : ${speaking ? "oui" : "non"}`;
+    speakingBadge.classList.toggle("on", !!speaking);
+    speakingBadge.classList.toggle("off", !speaking);
+  }
+  if (lastHeardEl) {
+    const heard = data.last_transcript || "";
+    lastHeardEl.textContent = heard ? `Entendu : ${heard}` : "Entendu : --";
+  }
+  const promptAt = Number(data.last_prompt_at || 0);
+  const responseAt = Number(data.last_response_at || 0);
+  const promptText = String(data.last_prompt || "").trim();
+  const responseText = String(data.last_response || "").trim();
+  if (!asrChatSyncInitialized) {
+    asrSeenPromptAt = promptAt;
+    asrSeenResponseAt = responseAt;
+    asrChatSyncInitialized = true;
+  } else {
+    if (promptAt && promptAt > asrSeenPromptAt) {
+      asrSeenPromptAt = promptAt;
+      const promptLine = `> ${promptText}`;
+      if (
+        promptText &&
+        !terminalHasRecentLine(didierOutput, promptLine, 10)
+      ) {
+        appendTerminal(didierOutput, promptLine);
+      }
+    }
+    if (responseAt && responseAt > asrSeenResponseAt) {
+      asrSeenResponseAt = responseAt;
+      if (
+        responseText &&
+        !terminalHasRecentLine(didierOutput, responseText, 10)
+      ) {
+        appendTerminal(didierOutput, responseText);
+      }
+    }
+  }
+}
+
+function setAsrUnavailableState() {
+  listeningBadge.textContent = "Écoute : inconnue";
+  listeningBadge.classList.remove("on", "off");
+  if (speakingBadge) {
+    speakingBadge.textContent = "Voix : inconnue";
+    speakingBadge.classList.remove("on", "off");
+  }
+  if (thinkingBadge) {
+    thinkingBadge.textContent = "Réflexion : inconnue";
+    thinkingBadge.classList.remove("thinking-active");
+  }
+}
+
 async function fetchAsrStatus() {
   if (!listeningBadge) return;
   try {
     const res = await fetch("/asr/status");
     if (!res.ok) throw new Error("asr");
     const data = await res.json();
-    const state = String(data.state || "").toLowerCase();
-    listeningBadge.textContent = `Écoute : ${data.listening ? "oui" : "non"}`;
-    listeningBadge.classList.toggle("on", !!data.listening);
-    listeningBadge.classList.toggle("off", !data.listening);
-    if (thinkingBadge) {
-      const thinking = data.thinking || state === "thinking";
-      thinkingBadge.textContent = `Réflexion : ${thinking ? "en cours" : "repos"}`;
-      thinkingBadge.classList.toggle("thinking-active", !!thinking);
-    }
-    if (speakingBadge) {
-      const speaking = data.speaking || state === "speaking";
-      speakingBadge.textContent = `Voix : ${speaking ? "oui" : "non"}`;
-      speakingBadge.classList.toggle("on", !!speaking);
-      speakingBadge.classList.toggle("off", !speaking);
-    }
-    if (lastHeardEl) {
-      const heard = data.last_transcript || "";
-      lastHeardEl.textContent = heard ? `Entendu : ${heard}` : "Entendu : --";
-    }
-    const promptAt = Number(data.last_prompt_at || 0);
-    const responseAt = Number(data.last_response_at || 0);
-    const promptText = String(data.last_prompt || "").trim();
-    const responseText = String(data.last_response || "").trim();
-    if (!asrChatSyncInitialized) {
-      asrSeenPromptAt = promptAt;
-      asrSeenResponseAt = responseAt;
-      asrChatSyncInitialized = true;
-    } else {
-      if (promptAt && promptAt > asrSeenPromptAt) {
-        asrSeenPromptAt = promptAt;
-        const promptLine = `> ${promptText}`;
-        if (
-          promptText &&
-          !terminalHasRecentLine(didierOutput, promptLine, 10)
-        ) {
-          appendTerminal(didierOutput, promptLine);
-        }
-      }
-      if (responseAt && responseAt > asrSeenResponseAt) {
-        asrSeenResponseAt = responseAt;
-        if (
-          responseText &&
-          !terminalHasRecentLine(didierOutput, responseText, 10)
-        ) {
-          appendTerminal(didierOutput, responseText);
-        }
-      }
-    }
+    applyAsrStatusData(data);
   } catch (err) {
-    listeningBadge.textContent = "Écoute : inconnue";
-    listeningBadge.classList.remove("on", "off");
-    if (speakingBadge) {
-      speakingBadge.textContent = "Voix : inconnue";
-      speakingBadge.classList.remove("on", "off");
-    }
-    if (thinkingBadge) {
-      thinkingBadge.textContent = "Réflexion : inconnue";
-      thinkingBadge.classList.remove("thinking-active");
-    }
+    setAsrUnavailableState();
   }
+}
+
+function startFallbackStatusPolling() {
+  if (!metricsPollTimer) {
+    metricsPollTimer = setInterval(fetchMetrics, METRICS_POLL_MS);
+  }
+  if (!asrPollTimer) {
+    asrPollTimer = setInterval(fetchAsrStatus, 1500);
+  }
+}
+
+function stopFallbackStatusPolling() {
+  if (metricsPollTimer) {
+    clearInterval(metricsPollTimer);
+    metricsPollTimer = null;
+  }
+  if (asrPollTimer) {
+    clearInterval(asrPollTimer);
+    asrPollTimer = null;
+  }
+}
+
+function metricsSocketUrl() {
+  const wsProto = window.location.protocol === "https:" ? "wss" : "ws";
+  return `${wsProto}://${window.location.host}${METRICS_WS_PATH}`;
+}
+
+function scheduleMetricsSocketReconnect() {
+  if (metricsSocketRetryTimer) return;
+  metricsSocketRetryTimer = setTimeout(() => {
+    metricsSocketRetryTimer = null;
+    connectMetricsSocket();
+  }, METRICS_WS_RETRY_MS);
+}
+
+function connectMetricsSocket() {
+  if (metricsSocket && (metricsSocket.readyState === WebSocket.OPEN || metricsSocket.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+  try {
+    metricsSocket = new WebSocket(metricsSocketUrl());
+  } catch (_err) {
+    metricsSocketConnected = false;
+    startFallbackStatusPolling();
+    scheduleMetricsSocketReconnect();
+    return;
+  }
+
+  metricsSocket.onopen = () => {
+    metricsSocketConnected = true;
+    stopFallbackStatusPolling();
+  };
+
+  metricsSocket.onmessage = (event) => {
+    let payload = null;
+    try {
+      payload = JSON.parse(String(event.data || "{}"));
+    } catch (_err) {
+      return;
+    }
+    if (payload && payload.metrics) {
+      applyMetricsData(payload.metrics);
+    }
+    if (payload && payload.asr) {
+      applyAsrStatusData(payload.asr);
+    }
+  };
+
+  metricsSocket.onerror = () => {
+    if (metricsSocket && metricsSocket.readyState === WebSocket.OPEN) {
+      metricsSocket.close();
+    }
+  };
+
+  metricsSocket.onclose = () => {
+    metricsSocketConnected = false;
+    metricsSocket = null;
+    startFallbackStatusPolling();
+    scheduleMetricsSocketReconnect();
+  };
 }
 
 let visionZones = [];
@@ -1876,6 +1982,153 @@ function setActuatorsMessage(text, isError = false) {
   actuatorsMessage.classList.toggle("is-error", !!isError);
 }
 
+function setPeripheralsMessage(text, isError = false) {
+  if (!peripheralsMessage) return;
+  peripheralsMessage.textContent = text || "--";
+  peripheralsMessage.classList.toggle("is-error", !!isError);
+}
+
+function normalizePeripheralItems(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (payload && Array.isArray(payload.items)) return payload.items;
+  return [];
+}
+
+function peripheralStateData(item) {
+  const state = String(item && item.state ? item.state : "").toLowerCase();
+  const active = item && item.active === true;
+  if (active || state === "active" || state === "activating") {
+    return { cls: "is-on", text: "connecté" };
+  }
+  if (state === "inactive" || state === "failed" || state === "deactivating") {
+    return { cls: "is-off", text: "déconnecté" };
+  }
+  return { cls: "is-unknown", text: state || "inconnu" };
+}
+
+function renderPeripherals() {
+  if (!peripheralsList) return;
+  peripheralsList.innerHTML = "";
+  if (!peripheralsItems.length) {
+    const empty = document.createElement("div");
+    empty.className = "peripheral-empty";
+    empty.textContent = "Aucun périphérique déclaré.";
+    peripheralsList.appendChild(empty);
+    return;
+  }
+
+  peripheralsItems.forEach((item) => {
+    const state = peripheralStateData(item);
+    const card = document.createElement("article");
+    card.className = "peripheral-card";
+    card.dataset.peripheralId = String(item && item.id ? item.id : "");
+
+    const head = document.createElement("div");
+    head.className = "peripheral-head";
+    const title = document.createElement("h3");
+    title.className = "peripheral-title";
+    title.textContent = String(item && item.label ? item.label : item.id || "Périphérique");
+    head.appendChild(title);
+
+    const badges = document.createElement("div");
+    badges.className = "peripheral-badges";
+    const kind = document.createElement("span");
+    kind.className = "peripheral-badge";
+    kind.textContent = String(item && item.kind ? item.kind : "inconnu");
+    badges.appendChild(kind);
+    const channel = document.createElement("span");
+    channel.className = "peripheral-badge";
+    channel.textContent = String(item && item.channel ? item.channel : "n/a");
+    badges.appendChild(channel);
+    head.appendChild(badges);
+
+    const status = document.createElement("div");
+    status.className = "peripheral-status";
+    const service = document.createElement("span");
+    const svc = String(item && item.service ? item.service : "service n/a");
+    const link = String(item && item.link_state ? item.link_state : "").trim();
+    service.textContent = link ? `${svc} · lien ${link}` : svc;
+    status.appendChild(service);
+    const pill = document.createElement("span");
+    pill.className = `peripheral-state-pill ${state.cls}`;
+    pill.textContent = state.text;
+    status.appendChild(pill);
+
+    const actions = document.createElement("div");
+    actions.className = "peripheral-actions";
+    const btnOn = document.createElement("button");
+    btnOn.type = "button";
+    btnOn.className = "peripheral-on";
+    btnOn.dataset.peripheralAction = "start";
+    btnOn.dataset.peripheralId = String(item && item.id ? item.id : "");
+    btnOn.textContent = "Activer";
+    const btnOff = document.createElement("button");
+    btnOff.type = "button";
+    btnOff.className = "peripheral-off";
+    btnOff.dataset.peripheralAction = "stop";
+    btnOff.dataset.peripheralId = String(item && item.id ? item.id : "");
+    btnOff.textContent = "Désactiver";
+    actions.appendChild(btnOn);
+    actions.appendChild(btnOff);
+
+    card.appendChild(head);
+    card.appendChild(status);
+    card.appendChild(actions);
+    peripheralsList.appendChild(card);
+  });
+}
+
+async function fetchPeripherals() {
+  if (!peripheralsList) return;
+  setPeripheralsMessage("Chargement...");
+  try {
+    const res = await fetch("/peripherals");
+    if (!res.ok) {
+      const detail = await readErrorDetail(res);
+      throw new Error(detail || "peripherals indisponible");
+    }
+    const data = await res.json();
+    const items = normalizePeripheralItems(data)
+      .filter((item) => item && item.id)
+      .sort((a, b) =>
+        String(a.label || a.id).localeCompare(String(b.label || b.id), "fr")
+      );
+    peripheralsItems = items;
+    renderPeripherals();
+    setPeripheralsMessage(`${items.length} périphérique${items.length > 1 ? "s" : ""}`);
+  } catch (err) {
+    peripheralsItems = [];
+    renderPeripherals();
+    setPeripheralsMessage(
+      `Erreur: ${err && err.message ? err.message : "peripherals indisponible"}`,
+      true
+    );
+  }
+}
+
+async function sendPeripheralToggle(id, action) {
+  const normalizedAction =
+    String(action || "").toLowerCase() === "stop" ? "stop" : "start";
+  const res = await fetch("/peripherals/toggle", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id, action: normalizedAction }),
+  });
+  if (!res.ok) {
+    const detail = await readErrorDetail(res);
+    throw new Error(detail || "commande refusée");
+  }
+  const data = await res.json();
+  if (data && data.ok === false) {
+    const detail =
+      data.error !== undefined && data.error !== null
+        ? String(data.error)
+        : "commande refusée";
+    throw new Error(detail);
+  }
+  return data;
+}
+
 function normalizeActuatorDevices(payload) {
   if (Array.isArray(payload)) return payload;
   if (payload && Array.isArray(payload.devices)) return payload.devices;
@@ -2468,6 +2721,9 @@ function setActiveTab(name) {
   if (name === "docker") {
     fetchDockerDiagram();
   }
+  if (name === "peripherals") {
+    fetchPeripherals();
+  }
   if (name === "openclaw") {
     fetchOpenclawTasks(true);
   }
@@ -2614,10 +2870,10 @@ if (micBtn) {
 setupSpeech();
 loadDetectionLabelsFromServer();
 fetchMetrics();
-setInterval(fetchMetrics, METRICS_POLL_MS);
+startFallbackStatusPolling();
+connectMetricsSocket();
 setInterval(refreshCpuMetrics, CPU_GRAPH_REFRESH_MS);
 fetchAsrStatus();
-setInterval(fetchAsrStatus, 1500);
 fetchDeviceStatus();
 setInterval(fetchDeviceStatus, 8000);
 fetchVisionStatusSecondary();
@@ -2845,6 +3101,54 @@ renderDidierFiles();
 if (actuatorsRefresh) {
   actuatorsRefresh.addEventListener("click", () => {
     fetchActuators();
+  });
+}
+
+if (peripheralsRefresh) {
+  peripheralsRefresh.addEventListener("click", () => {
+    fetchPeripherals();
+  });
+}
+
+if (peripheralsList) {
+  peripheralsList.addEventListener("click", async (event) => {
+    const button = event.target.closest("button[data-peripheral-action]");
+    if (!button) return;
+    const action = String(button.dataset.peripheralAction || "").toLowerCase();
+    const id = String(button.dataset.peripheralId || "").trim();
+    if (!id || (action !== "start" && action !== "stop")) return;
+    const card = button.closest(".peripheral-card");
+    const titleEl = card ? card.querySelector(".peripheral-title") : null;
+    const label = titleEl ? String(titleEl.textContent || "").trim() : id;
+    const actionText = action === "start" ? "Activation" : "Désactivation";
+
+    const cardButtons = card
+      ? Array.from(card.querySelectorAll("button[data-peripheral-action]"))
+      : [button];
+    cardButtons.forEach((btn) => {
+      btn.disabled = true;
+    });
+
+    setPeripheralsMessage(`${actionText} ${label}...`);
+    try {
+      const data = await sendPeripheralToggle(id, action);
+      await fetchPeripherals();
+      const afterState =
+        data && data.after && data.after.active === true ? "connecté" : "déconnecté";
+      setPeripheralsMessage(
+        `${label} ${action === "start" ? "activé" : "désactivé"} (${afterState})`
+      );
+    } catch (err) {
+      const verb = action === "start" ? "démarrer" : "arrêter";
+      setPeripheralsMessage(
+        `Impossible de ${verb} ${label}: ${err && err.message ? err.message : "échec"}`,
+        true
+      );
+    } finally {
+      cardButtons.forEach((btn) => {
+        btn.disabled = false;
+      });
+    }
   });
 }
 
