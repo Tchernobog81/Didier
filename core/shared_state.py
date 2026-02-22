@@ -35,6 +35,29 @@ def _state_defaults() -> dict[str, Any]:
         "updated_at": 0.0,
         "metrics": {},
         "workers": {},
+        "arbitration": {
+            "ts": 0.0,
+            "mode": "NOMINAL",
+            "load1": 0.0,
+            "limits": {
+                "target_fps": 20,
+                "drop_frames": False,
+                "secondary_stream_enabled": True,
+                "verbose_logs": True,
+                "pause_asr_ingest": False,
+            },
+            "active_brakes": {},
+            "io": {
+                "avg_write_ms": 0.0,
+                "samples": 0,
+                "queued_writes": 0,
+            },
+            "triggers": {
+                "buffer_overrun_recent": False,
+                "io_error_recent": False,
+                "audio_queue_size": 0,
+            },
+        },
         "openclaw": {
             "ts": 0.0,
             "runtime": {"status": "idle", "scheduler_hz": 2.0, "tick": 0},
@@ -177,6 +200,32 @@ def _read_unlocked() -> dict[str, Any]:
         data["metrics"] = {}
     if not isinstance(data.get("workers"), dict):
         data["workers"] = {}
+    arbitration = data.get("arbitration")
+    if not isinstance(arbitration, dict):
+        data["arbitration"] = _state_defaults()["arbitration"]
+    else:
+        if not isinstance(arbitration.get("mode"), str):
+            arbitration["mode"] = "NOMINAL"
+        if not isinstance(arbitration.get("ts"), (int, float)):
+            arbitration["ts"] = 0.0
+        if not isinstance(arbitration.get("load1"), (int, float)):
+            arbitration["load1"] = 0.0
+        if not isinstance(arbitration.get("limits"), dict):
+            arbitration["limits"] = _state_defaults()["arbitration"]["limits"]
+        if not isinstance(arbitration.get("active_brakes"), dict):
+            arbitration["active_brakes"] = {}
+        if not isinstance(arbitration.get("triggers"), dict):
+            arbitration["triggers"] = _state_defaults()["arbitration"]["triggers"]
+        io_block = arbitration.get("io")
+        if not isinstance(io_block, dict):
+            arbitration["io"] = _state_defaults()["arbitration"]["io"]
+        else:
+            if not isinstance(io_block.get("avg_write_ms"), (int, float)):
+                io_block["avg_write_ms"] = 0.0
+            if not isinstance(io_block.get("samples"), int):
+                io_block["samples"] = 0
+            if not isinstance(io_block.get("queued_writes"), int):
+                io_block["queued_writes"] = 0
     openclaw = data.get("openclaw")
     if not isinstance(openclaw, dict):
         data["openclaw"] = defaults["openclaw"]
@@ -207,7 +256,13 @@ def _read_unlocked() -> dict[str, Any]:
 
 
 def _write_unlocked(data: dict[str, Any]) -> None:
-    STATE_PATH.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    payload = json.dumps(data, ensure_ascii=False)
+    tmp_path = STATE_PATH.with_suffix(".tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp_path, STATE_PATH)
 
 
 def read_state() -> dict[str, Any]:
@@ -273,6 +328,23 @@ def update_openclaw_runtime(payload: dict[str, Any]) -> dict[str, Any]:
             data["updated_at"] = now
             _write_unlocked(data)
             return data
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def update_arbitration(payload: dict[str, Any]) -> dict[str, Any]:
+    now = time.time()
+    arbitration = dict(payload or {})
+    arbitration.setdefault("ts", now)
+    _ensure_parent()
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            data = _read_unlocked()
+            data["arbitration"] = arbitration
+            data["updated_at"] = now
+            _write_unlocked(data)
+            return arbitration
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
@@ -434,6 +506,14 @@ def metrics_snapshot() -> dict[str, Any]:
     workers = data.get("workers", {}) or {}
     if "workers" not in metrics:
         metrics["workers"] = workers
+    if "arbitration" not in metrics:
+        metrics["arbitration"] = data.get("arbitration", {})
     if "openclaw" not in metrics:
         metrics["openclaw"] = data.get("openclaw", {})
     return metrics
+
+
+def arbitration_snapshot() -> dict[str, Any]:
+    data = read_state()
+    payload = data.get("arbitration", {})
+    return dict(payload) if isinstance(payload, dict) else {}

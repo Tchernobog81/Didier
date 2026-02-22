@@ -44,11 +44,12 @@ Environment="DIDIER_ASR_WAKE_REPLY_TEXT=Salut Tcherno, qu'est-ce que je peux fai
 Environment=DIDIER_ASR_ALLOW_INLINE_COMMAND=0
 ExecStart=/mnt/didier_ssd/didier/workspace/Didier/venv/bin/python /mnt/didier_ssd/didier/workspace/Didier/scripts/run_asr.py
 Restart=on-failure
-RestartSec=2s
+RestartSec=5s
 TimeoutStartSec=20s
 TimeoutStopSec=10s
 KillSignal=SIGTERM
-CPUQuota=70%
+CPUQuota=80%
+MemoryMax=1.5G
 Nice=7
 IOSchedulingClass=best-effort
 IOSchedulingPriority=6

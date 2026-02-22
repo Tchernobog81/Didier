@@ -19,10 +19,15 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from core.hardware_gatekeeper import get_hardware_gatekeeper
 from core.logging import setup_logging
 from core.orchestrator import Orchestrator
 from core.routers import ai_router, system_router, vision_router
+from core.resource_arbitrator import get_resource_arbitrator
+from core.shared_state import openclaw_memory_watch_loop
+from core.shared_state import openclaw_state_snapshot
 from core.shared_state import read_state as read_shared_state
+from core.shared_state import update_openclaw_runtime
 from core.shared_state import update_metrics as update_shared_metrics
 from core.shared_state import update_worker_metrics
 from core.status import read_status, update_status
@@ -43,11 +48,14 @@ app.include_router(actuators_router)
 _orchestrator: Orchestrator | None = None
 _camera_watchdog_task: asyncio.Task | None = None
 _shared_state_task: asyncio.Task | None = None
+_openclaw_memory_task: asyncio.Task | None = None
+_resource_arbitrator: Any | None = None
 _AUDIO_CACHE: dict[str, Any] = {"ts": 0.0, "level": None, "available": False}
 _AUDIO_CACHE_LOCK = threading.Lock()
 _NPU_CACHE: dict[str, Any] = {"ts": 0.0, "active": None, "util": None}
 _NPU_CACHE_LOCK = threading.Lock()
 _VIDEO_LOCK = threading.Lock()
+_HARDWARE_GATEKEEPER = get_hardware_gatekeeper()
 try:
     import audioop  # type: ignore
 except Exception:  # pragma: no cover
@@ -57,6 +65,33 @@ _VISION_TAGS_PATH = Path("data/vision/tags.json")
 _DOCKER_ROOT_CACHE: dict[str, Any] = {"path": None, "ts": 0.0}
 _VERSION_CACHE: dict[str, Any] = {"git": None, "version": None, "loaded": False}
 APP_STARTED_AT = time.time()
+API_SHARED_STATE_INTERVAL_S = max(
+    0.5, min(float(os.getenv("DIDIER_API_SHARED_STATE_INTERVAL_S", "1.0")), 5.0)
+)
+OPENCLAW_MEMORY_WATCH_INTERVAL_S = max(
+    0.5, min(float(os.getenv("DIDIER_OPENCLAW_MEMORY_WATCH_INTERVAL_S", "1.0")), 5.0)
+)
+DEFAULT_HTTP_TIMEOUT_S = 2.0
+DEFAULT_SUBPROCESS_TIMEOUT_S = 2.0
+
+
+def _http_timeout(seconds: float | int) -> float:
+    return max(0.1, min(float(seconds), DEFAULT_HTTP_TIMEOUT_S))
+
+
+def _run_subprocess(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[Any]:
+    kwargs.setdefault("timeout", DEFAULT_SUBPROCESS_TIMEOUT_S)
+    return subprocess.run(*args, **kwargs)
+
+
+def _target_stream_interval(default_fps: int = 20) -> float:
+    fps = max(1, min(int(default_fps or 20), 60))
+    try:
+        fps = get_resource_arbitrator().get_target_fps(default=fps)
+    except Exception:
+        pass
+    fps = max(1, min(int(fps), 60))
+    return max(1.0 / float(fps), 0.03)
 
 
 def _get_docker_root() -> Path:
@@ -144,7 +179,7 @@ async def _warmup_ollama() -> None:
             payload["keep_alive"] = keep_alive
         import httpx
 
-        async with httpx.AsyncClient(timeout=90) as client:
+        async with httpx.AsyncClient(timeout=_http_timeout(90)) as client:
             await client.post(f"{base_url}/api/generate", json=payload)
     except Exception as exc:
         logging.getLogger("API").warning("Ollama warmup failed: %s", exc)
@@ -169,16 +204,21 @@ async def _shared_state_loop() -> None:
                     "/root/.ollama",
                 ],
             )
-            cpu_per_core = psutil.cpu_percent(interval=0.1, percpu=True)
+            cpu_per_core = psutil.cpu_percent(interval=None, percpu=True)
             if cpu_per_core:
                 cpu_percent = round(sum(cpu_per_core) / len(cpu_per_core), 1)
             else:
-                cpu_percent = psutil.cpu_percent(interval=0.1)
+                cpu_percent = psutil.cpu_percent(interval=None)
             mem = psutil.virtual_memory()
             asr_status = _read_asr_status()
             from orchestrator.openclaw_bridge import get_openclaw_bridge
 
-            openclaw_state = get_openclaw_bridge().shared_state_snapshot()
+            bridge_state = get_openclaw_bridge().shared_state_snapshot()
+            await asyncio.to_thread(
+                update_openclaw_runtime,
+                bridge_state.get("runtime", {}),
+            )
+            openclaw_state = await asyncio.to_thread(openclaw_state_snapshot)
             payload = {
                 "timestamp": time.time(),
                 "cpu": {
@@ -235,7 +275,7 @@ async def _shared_state_loop() -> None:
                     "detail": str(exc),
                 },
             )
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(API_SHARED_STATE_INTERVAL_S)
 
 
 def _rms_pcm16(data: bytes) -> int:
@@ -291,9 +331,14 @@ async def startup_event() -> None:
     global _orchestrator
     _orchestrator = Orchestrator()
     await _orchestrator.start()
-    global _camera_watchdog_task, _shared_state_task
+    global _camera_watchdog_task, _shared_state_task, _openclaw_memory_task, _resource_arbitrator
+    _resource_arbitrator = get_resource_arbitrator()
+    _resource_arbitrator.start()
     _camera_watchdog_task = asyncio.create_task(_camera_watchdog())
     _shared_state_task = asyncio.create_task(_shared_state_loop())
+    _openclaw_memory_task = asyncio.create_task(
+        openclaw_memory_watch_loop(interval_s=OPENCLAW_MEMORY_WATCH_INTERVAL_S)
+    )
     asyncio.create_task(_warmup_ollama())
     logging.getLogger("API").info("Didier API started.")
 
@@ -302,13 +347,19 @@ async def startup_event() -> None:
 async def shutdown_event() -> None:
     if _orchestrator:
         await _orchestrator.stop()
-    global _camera_watchdog_task, _shared_state_task
+    global _camera_watchdog_task, _shared_state_task, _openclaw_memory_task, _resource_arbitrator
     if _camera_watchdog_task:
         _camera_watchdog_task.cancel()
         _camera_watchdog_task = None
     if _shared_state_task:
         _shared_state_task.cancel()
         _shared_state_task = None
+    if _openclaw_memory_task:
+        _openclaw_memory_task.cancel()
+        _openclaw_memory_task = None
+    if _resource_arbitrator:
+        _resource_arbitrator.stop()
+        _resource_arbitrator = None
 
 
 def _require_orchestrator() -> Orchestrator:
@@ -482,8 +533,11 @@ def _read_mic_level(
         "raw",
     ]
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, check=False, timeout=2
+        result = _run_subprocess(
+            cmd,
+            capture_output=True,
+            check=False,
+            timeout=DEFAULT_SUBPROCESS_TIMEOUT_S,
         )
         data = result.stdout or b""
         if not data:
@@ -517,7 +571,7 @@ def _read_version() -> dict[str, Any]:
 
     git_hash = None
     try:
-        result = subprocess.run(
+        result = _run_subprocess(
             ["git", "rev-parse", "--short", "HEAD"],
             capture_output=True,
             text=True,
@@ -543,7 +597,7 @@ async def _resolve_ollama_model(
     try:
         import httpx
 
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=_http_timeout(10)) as client:
             response = await client.get(f"{base_url}/api/tags")
             response.raise_for_status()
             data = response.json()
@@ -580,7 +634,7 @@ def _check_soundboks_sink(sink_name: str) -> dict[str, Any]:
                     names.append(fallback[1].strip())
             return names
 
-        result = subprocess.run(
+        result = _run_subprocess(
             ["pactl", "list", "short", "sinks"],
             capture_output=True,
             text=True,
@@ -600,7 +654,7 @@ def _check_soundboks_sink(sink_name: str) -> dict[str, Any]:
                     break
 
         default_sink = None
-        info = subprocess.run(
+        info = _run_subprocess(
             ["pactl", "info"], capture_output=True, text=True, check=False
         )
         for line in (info.stdout or "").splitlines():
@@ -614,13 +668,13 @@ def _check_soundboks_sink(sink_name: str) -> dict[str, Any]:
         self_healed = False
         if not available and mac_token:
             card_name = f"bluez_card.{mac_token}"
-            subprocess.run(
+            _run_subprocess(
                 ["pactl", "set-card-profile", card_name, "a2dp-sink"],
                 capture_output=True,
                 text=True,
                 check=False,
             )
-            retry = subprocess.run(
+            retry = _run_subprocess(
                 ["pactl", "list", "short", "sinks"],
                 capture_output=True,
                 text=True,
@@ -642,7 +696,7 @@ def _check_soundboks_sink(sink_name: str) -> dict[str, Any]:
                 available = True
                 matched_sink = default_sink
         if available and matched_sink and default_sink != matched_sink:
-            subprocess.run(
+            _run_subprocess(
                 ["pactl", "set-default-sink", matched_sink],
                 capture_output=True,
                 text=True,
@@ -664,10 +718,10 @@ def _camera_holders(device: str | None) -> dict[str, Any]:
         return {"output": "Aucun périphérique configuré"}
     if shutil.which("fuser") is None:
         return {"output": "fuser indisponible"}
-    verbose = subprocess.run(
+    verbose = _run_subprocess(
         ["fuser", "-v", device], capture_output=True, text=True, check=False
     )
-    plain = subprocess.run(
+    plain = _run_subprocess(
         ["fuser", device], capture_output=True, text=True, check=False
     )
     output_verbose = ((verbose.stdout or "") + (verbose.stderr or "")).strip()
@@ -699,7 +753,7 @@ def _camera_holders(device: str | None) -> dict[str, Any]:
         pids = sorted(set(pids))
     details = []
     if pids:
-        ps = subprocess.run(
+        ps = _run_subprocess(
             ["ps", "-o", "pid,user,comm", "-p", ",".join(pids)],
             capture_output=True,
             text=True,
@@ -726,7 +780,7 @@ def _camera_holders(device: str | None) -> dict[str, Any]:
 def _camera_reconnect(device: str | None) -> dict[str, Any]:
     pids: list[int] = []
     if device and shutil.which("fuser"):
-        result = subprocess.run(["fuser", device], capture_output=True, text=True, check=False)
+        result = _run_subprocess(["fuser", device], capture_output=True, text=True, check=False)
         tokens = (result.stdout or "").replace(":", " ").split()
         own_pids = {os.getpid(), os.getppid()}
         for token in tokens:
@@ -736,7 +790,7 @@ def _camera_reconnect(device: str | None) -> dict[str, Any]:
                     pids.append(pid)
     # Kill known camera processes as a fallback
     for name in ["libcamera-vid", "libcamera-still", "libcamera-hello", "rpicam-vid", "rpicam-still", "mjpg_streamer", "ffmpeg", "gst-launch-1.0"]:
-        subprocess.run(["pkill", "-9", "-f", name], check=False)
+        _run_subprocess(["pkill", "-9", "-f", name], check=False)
     if pids:
         for pid in pids:
             try:
@@ -752,8 +806,8 @@ def _camera_reconnect(device: str | None) -> dict[str, Any]:
     if shutil.which("modprobe"):
         modules_dir = Path("/lib/modules")
         if modules_dir.exists():
-            subprocess.run(["modprobe", "-r", "uvcvideo"], check=False)
-            subprocess.run(["modprobe", "uvcvideo"], check=False)
+            _run_subprocess(["modprobe", "-r", "uvcvideo"], check=False)
+            _run_subprocess(["modprobe", "uvcvideo"], check=False)
     return {"status": "relance tentée"}
 
 
@@ -771,12 +825,20 @@ def _camera_force_format(device: str | None, width: int | None, height: int | No
         device,
         f"--set-fmt-video=width={width},height={height},pixelformat={fourcc}",
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    result = _run_subprocess(cmd, capture_output=True, text=True, check=False)
     output = (result.stdout or "") + (result.stderr or "")
     return {"status": "format tenté", "output": output.strip()}
 
 
 def _check_camera(index: int, device: str | None) -> dict[str, Any]:
+    lease = _HARDWARE_GATEKEEPER.acquire("camera", timeout_s=0.2, blocking=False)
+    if lease is None:
+        return {
+            "device": device or f"index:{index}",
+            "opened": False,
+            "busy": True,
+            "error": "camera_gate_locked",
+        }
     try:
         cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
         opened = cap.isOpened()
@@ -791,6 +853,8 @@ def _check_camera(index: int, device: str | None) -> dict[str, Any]:
         }
     except Exception as exc:
         return {"device": device or f"index:{index}", "opened": False, "error": str(exc)}
+    finally:
+        lease.release()
 
 
 def _check_camera_mic() -> dict[str, Any]:
@@ -918,6 +982,11 @@ def _apply_camera_settings(
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     if fps:
         cap.set(cv2.CAP_PROP_FPS, fps)
+    try:
+        # Minimize buffered frames to keep USB PS3 stream responsive.
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception:
+        pass
 
 
 def _open_camera(
@@ -929,43 +998,59 @@ def _open_camera(
     fourcc: str | None,
     kill_on_open: bool = False,
 ) -> cv2.VideoCapture:
-    if kill_on_open and device and shutil.which("fuser"):
-        try:
-            result = subprocess.run(
-                ["fuser", device], capture_output=True, text=True, check=False
+    lease = _HARDWARE_GATEKEEPER.acquire("camera", timeout_s=0.4, blocking=False)
+    if lease is None:
+        raise RuntimeError("camera_gate_locked")
+    try:
+        if kill_on_open and device and shutil.which("fuser"):
+            try:
+                result = _run_subprocess(
+                    ["fuser", device], capture_output=True, text=True, check=False
+                )
+                own_pids = {os.getpid(), os.getppid()}
+                tokens = (result.stdout or "").replace(":", " ").split()
+                for token in tokens:
+                    if not token.isdigit():
+                        continue
+                    pid = int(token)
+                    if pid in own_pids:
+                        continue
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        attempts: list[tuple[str | int, int | None]] = []
+        if device:
+            attempts.append((device, cv2.CAP_V4L2))
+            attempts.append((device, None))
+        attempts.append((index, cv2.CAP_V4L2))
+        attempts.append((index, None))
+
+        for source, api_pref in attempts:
+            cap = (
+                cv2.VideoCapture(source, api_pref)
+                if api_pref is not None
+                else cv2.VideoCapture(source)
             )
-            own_pids = {os.getpid(), os.getppid()}
-            tokens = (result.stdout or "").replace(":", " ").split()
-            for token in tokens:
-                if not token.isdigit():
-                    continue
-                pid = int(token)
-                if pid in own_pids:
-                    continue
+            if not cap.isOpened():
+                cap.release()
+                continue
+            _apply_camera_settings(cap, width, height, fps, fourcc)
+            for _ in range(2):
                 try:
-                    os.kill(pid, signal.SIGTERM)
+                    cap.grab()
                 except Exception:
-                    pass
-        except Exception:
-            pass
-    if device:
-        cap = cv2.VideoCapture(device)
-        if cap.isOpened():
-            _apply_camera_settings(cap, width, height, fps, fourcc)
+                    break
             return cap
-        cap.release()
-        cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
-        if cap.isOpened():
-            _apply_camera_settings(cap, width, height, fps, fourcc)
-            return cap
-    cap = cv2.VideoCapture(index)
-    if cap.isOpened():
-        _apply_camera_settings(cap, width, height, fps, fourcc)
-        return cap
-    cap.release()
-    cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
-    _apply_camera_settings(cap, width, height, fps, fourcc)
-    return cap
+
+        fallback = cv2.VideoCapture(index, cv2.CAP_V4L2)
+        if fallback.isOpened():
+            _apply_camera_settings(fallback, width, height, fps, fourcc)
+        return fallback
+    finally:
+        lease.release()
 
 
 def _mjpeg_generator(
@@ -979,24 +1064,26 @@ def _mjpeg_generator(
 ) -> Generator[bytes, None, None]:
     if not _VIDEO_LOCK.acquire(blocking=False):
         raise RuntimeError("Camera busy")
-    cap = _open_camera(
-        camera_device, camera_index, width, height, fps, fourcc, kill_on_open
-    )
-    if not cap.isOpened():
-        cap.release()
-        if camera_device:
-            try:
+    camera_lease = _HARDWARE_GATEKEEPER.acquire("camera", timeout_s=0.4, blocking=False)
+    if camera_lease is None:
+        _VIDEO_LOCK.release()
+        raise RuntimeError("camera_gate_locked")
+    cap: cv2.VideoCapture | None = None
+    try:
+        cap = _open_camera(
+            camera_device, camera_index, width, height, fps, fourcc, kill_on_open
+        )
+        if not cap.isOpened():
+            cap.release()
+            cap = None
+            if camera_device:
                 yield from _mjpeg_generator_v4l2(
                     camera_device, width, height, fps, fourcc
                 )
-            finally:
-                _VIDEO_LOCK.release()
-            return
-        _VIDEO_LOCK.release()
-        raise RuntimeError("Unable to open camera")
-    failures = 0
-    reopen_attempts = 0
-    try:
+                return
+            raise RuntimeError("Unable to open camera")
+        failures = 0
+        reopen_attempts = 0
         for _ in range(5):
             cap.read()
         while True:
@@ -1033,9 +1120,11 @@ def _mjpeg_generator(
                 b"--frame\r\n"
                 b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
             )
-            time.sleep(0.03)
+            time.sleep(_target_stream_interval(default_fps=int(fps or 20)))
     finally:
-        cap.release()
+        if cap is not None:
+            cap.release()
+        camera_lease.release()
         _VIDEO_LOCK.release()
 
 
@@ -1054,7 +1143,7 @@ def _mjpeg_generator_from_vision(vision: Any) -> Generator[bytes, None, None]:
                 b"--frame\r\n"
                 b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
             )
-        time.sleep(0.03)
+        time.sleep(_target_stream_interval(default_fps=20))
 
 
 def _mjpeg_generator_v4l2(
@@ -1075,9 +1164,9 @@ def _mjpeg_generator_v4l2(
         camera_device,
         f"--set-fmt-video=width={width},height={height},pixelformat={fourcc}",
     ]
-    subprocess.run(fmt_cmd, check=False)
+    _run_subprocess(fmt_cmd, check=False)
     if fps:
-        subprocess.run(
+        _run_subprocess(
             ["v4l2-ctl", "-d", camera_device, f"--set-parm={int(fps)}"],
             check=False,
         )
@@ -1092,10 +1181,13 @@ def _mjpeg_generator_v4l2(
     loop = asyncio.new_event_loop()
     try:
         proc = loop.run_until_complete(
-            asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
+            asyncio.wait_for(
+                asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                ),
+                timeout=DEFAULT_SUBPROCESS_TIMEOUT_S,
             )
         )
     except Exception:
@@ -1116,7 +1208,15 @@ def _mjpeg_generator_v4l2(
     def read_exact(size: int) -> bytes | None:
         data = b""
         while len(data) < size:
-            chunk = loop.run_until_complete(proc.stdout.read(size - len(data)))
+            try:
+                chunk = loop.run_until_complete(
+                    asyncio.wait_for(
+                        proc.stdout.read(size - len(data)),
+                        timeout=DEFAULT_SUBPROCESS_TIMEOUT_S,
+                    )
+                )
+            except asyncio.TimeoutError:
+                return None
             if not chunk:
                 return None
             data += chunk
@@ -1145,14 +1245,16 @@ def _mjpeg_generator_v4l2(
                 b"--frame\r\n"
                 b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
             )
-            time.sleep(0.03)
+            time.sleep(_target_stream_interval(default_fps=int(fps or 20)))
     finally:
         try:
             proc.terminate()
         except Exception:
             pass
         try:
-            loop.run_until_complete(asyncio.wait_for(proc.wait(), timeout=2))
+            loop.run_until_complete(
+                asyncio.wait_for(proc.wait(), timeout=DEFAULT_SUBPROCESS_TIMEOUT_S)
+            )
         except Exception:
             try:
                 proc.kill()
@@ -1212,10 +1314,13 @@ class RemoteMjpegStream:
         try:
             loop = asyncio.new_event_loop()
             self._proc = loop.run_until_complete(
-                asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+                asyncio.wait_for(
+                    asyncio.create_subprocess_exec(
+                        *cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    ),
+                    timeout=DEFAULT_SUBPROCESS_TIMEOUT_S,
                 )
             )
         except Exception as exc:
@@ -1231,7 +1336,15 @@ class RemoteMjpegStream:
             while not self._stop.is_set():
                 if not self._proc or not self._proc.stdout:
                     break
-                chunk = loop.run_until_complete(self._proc.stdout.read(4096))
+                try:
+                    chunk = loop.run_until_complete(
+                        asyncio.wait_for(
+                            self._proc.stdout.read(4096),
+                            timeout=DEFAULT_SUBPROCESS_TIMEOUT_S,
+                        )
+                    )
+                except asyncio.TimeoutError:
+                    continue
                 if not chunk:
                     break
                 buffer += chunk
@@ -1254,7 +1367,12 @@ class RemoteMjpegStream:
                 except Exception:
                     pass
                 try:
-                    loop.run_until_complete(asyncio.wait_for(self._proc.wait(), timeout=2))
+                    loop.run_until_complete(
+                        asyncio.wait_for(
+                            self._proc.wait(),
+                            timeout=DEFAULT_SUBPROCESS_TIMEOUT_S,
+                        )
+                    )
                 except Exception:
                     try:
                         self._proc.kill()
@@ -1291,7 +1409,6 @@ def _get_remote_stream(input_url: str, fps: int = 15) -> RemoteMjpegStream:
 def _remote_mjpeg_generator(stream: RemoteMjpegStream) -> Generator[bytes, None, None]:
     last_sent = None
     target_fps = max(int(getattr(stream, "_fps", 15) or 15), 1)
-    interval_s = max(1.0 / float(target_fps), 0.03)
     while True:
         frame, _ts = stream.get_last()
         if frame and frame is not last_sent:
@@ -1300,4 +1417,4 @@ def _remote_mjpeg_generator(stream: RemoteMjpegStream) -> Generator[bytes, None,
                 b"--frame\r\n"
                 b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
             )
-        time.sleep(interval_s)
+        time.sleep(_target_stream_interval(default_fps=target_fps))

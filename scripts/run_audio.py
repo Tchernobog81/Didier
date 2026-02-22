@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import shutil
 import subprocess
@@ -50,11 +51,18 @@ TTS_OUTPUT_PATH = Path(
 TTS_VOICE = os.getenv("DIDIER_TTS_VOICE", "af_bella")
 TTS_LANG = os.getenv("DIDIER_TTS_LANG", "fr-fr")
 AUDIO_SINK = os.getenv("DIDIER_AUDIO_SINK", "bluez_output.00_07_80_E0_3F_F0.1")
+AUDIO_SOCKET_PATH = os.getenv("DIDIER_AUDIO_SOCK", "/tmp/didier_audio.sock").strip()
+AUDIO_QUEUE_MAXSIZE = max(1, min(int(os.getenv("DIDIER_AUDIO_QUEUE_MAXSIZE", "8")), 64))
+AUDIO_SHARED_STATE_INTERVAL_S = max(
+    0.5, min(float(os.getenv("DIDIER_AUDIO_SHARED_STATE_INTERVAL_S", "1.0")), 5.0)
+)
+DEFAULT_SUBPROCESS_TIMEOUT_S = 2.0
 APP_STARTED_AT = time.time()
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
 app = FastAPI(title="Didier MVP Audio", version="0.1.0")
 
-_queue: asyncio.Queue[str] = asyncio.Queue()
+_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=AUDIO_QUEUE_MAXSIZE)
 _worker_task: asyncio.Task[None] | None = None
 _shared_state_task: asyncio.Task[None] | None = None
 _kokoro: Kokoro | None = None
@@ -63,6 +71,8 @@ audio_state: dict[str, Any] = {
     "model_loaded": False,
     "paplay_ok": False,
     "queue_size": 0,
+    "queue_maxsize": AUDIO_QUEUE_MAXSIZE,
+    "queue_dropped": 0,
     "speaking": False,
     "last_speak_ts": 0.0,
     "last_error": None,
@@ -96,11 +106,19 @@ def _play_file(path: Path) -> None:
     if not shutil.which("paplay"):
         raise RuntimeError("paplay not available in PATH")
     try:
-        subprocess.run(["paplay", "-d", AUDIO_SINK, str(path)], check=True)
+        subprocess.run(
+            ["paplay", "-d", AUDIO_SINK, str(path)],
+            check=True,
+            timeout=DEFAULT_SUBPROCESS_TIMEOUT_S,
+        )
         return
     except subprocess.CalledProcessError:
         # Fallback to the default sink when the configured Bluetooth sink is unavailable.
-        subprocess.run(["paplay", str(path)], check=True)
+        subprocess.run(
+            ["paplay", str(path)],
+            check=True,
+            timeout=DEFAULT_SUBPROCESS_TIMEOUT_S,
+        )
 
 
 async def _synthesize_and_play(text: str) -> None:
@@ -147,7 +165,7 @@ async def _publish_shared_state_loop() -> None:
             "mode": str(audio_state["mode"]),
         }
         await asyncio.to_thread(update_worker_metrics, "audio", payload)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(AUDIO_SHARED_STATE_INTERVAL_S)
 
 
 def _generate_beep(path: Path) -> None:
@@ -160,9 +178,24 @@ def _generate_beep(path: Path) -> None:
     sf.write(str(path), audio, sample_rate)
 
 
+def _cleanup_socket(socket_path: str) -> None:
+    if not socket_path:
+        return
+    try:
+        path = Path(socket_path)
+        if path.exists():
+            path.unlink()
+    except Exception:
+        pass
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     global _kokoro, _worker_task, _shared_state_task
+    logging.basicConfig(
+        level=os.getenv("DIDIER_LOG_LEVEL", "INFO").upper(),
+        format=LOG_FORMAT,
+    )
     audio_state["paplay_ok"] = bool(shutil.which("paplay"))
     try:
         _kokoro = await asyncio.to_thread(_load_model)
@@ -191,6 +224,7 @@ async def _shutdown() -> None:
             await _shared_state_task
         except asyncio.CancelledError:
             pass
+    _cleanup_socket(AUDIO_SOCKET_PATH)
 
 
 @app.get("/health")
@@ -233,7 +267,11 @@ async def speak(payload: dict[str, Any]) -> dict[str, Any]:
     if not audio_state["model_loaded"]:
         detail = audio_state["last_error"] or "TTS model not ready"
         raise HTTPException(status_code=503, detail=str(detail))
-    await _queue.put(text)
+    try:
+        _queue.put_nowait(text)
+    except asyncio.QueueFull:
+        audio_state["queue_dropped"] = int(audio_state["queue_dropped"]) + 1
+        raise HTTPException(status_code=429, detail="audio queue saturated")
     audio_state["queue_size"] = _queue.qsize()
     return {"status": "queued", "queue_size": int(audio_state["queue_size"])}
 
@@ -258,13 +296,12 @@ async def beep() -> dict[str, Any]:
 
 
 def main() -> int:
-    socket_path = os.getenv("DIDIER_AUDIO_SOCK", "/tmp/didier_audio.sock").strip()
-    if socket_path:
+    if AUDIO_SOCKET_PATH:
         try:
-            Path(socket_path).unlink(missing_ok=True)
+            Path(AUDIO_SOCKET_PATH).unlink(missing_ok=True)
         except Exception:
             pass
-        uvicorn.run(app, uds=socket_path, log_level="info")
+        uvicorn.run(app, uds=AUDIO_SOCKET_PATH, log_level="info")
     else:
         uvicorn.run(app, host=AUDIO_HOST, port=AUDIO_PORT, log_level="info")
     return 0

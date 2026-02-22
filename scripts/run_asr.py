@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+from difflib import SequenceMatcher
 import logging
 import os
 import re
@@ -26,6 +27,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.status import read_status, update_status
+from core.shared_state import read_state as read_shared_state
 from core.shared_state import update_worker_metrics
 from shared.ipc import request as ipc_request
 
@@ -73,9 +75,35 @@ ASR_WAKE_REPLY_TEXT = os.getenv(
 ).strip()
 ASR_ALLOW_INLINE_COMMAND = _env_bool("DIDIER_ASR_ALLOW_INLINE_COMMAND", False)
 ASR_ACTION_TIMEOUT_SECONDS = float(os.getenv("DIDIER_ASR_ACTION_TIMEOUT_SECONDS", "25"))
+ASR_WAKE_SIMILARITY = max(
+    0.5, min(float(os.getenv("DIDIER_ASR_WAKE_SIMILARITY", "0.78")), 0.98)
+)
+ASR_USE_VAD = _env_bool("DIDIER_ASR_USE_VAD", True)
+ASR_VAD_FRAME_MS = max(10, min(int(os.getenv("DIDIER_ASR_VAD_FRAME_MS", "20")), 60))
+ASR_VAD_ENERGY_FACTOR = max(
+    1.2, min(float(os.getenv("DIDIER_ASR_VAD_ENERGY_FACTOR", "2.2")), 8.0)
+)
+ASR_VAD_MIN_SPEECH_RATIO = max(
+    0.01, min(float(os.getenv("DIDIER_ASR_VAD_MIN_SPEECH_RATIO", "0.06")), 0.8)
+)
+ASR_VAD_ABS_MIN = max(0.0005, min(float(os.getenv("DIDIER_ASR_VAD_ABS_MIN", "0.004")), 0.2))
+ASR_WAKE_VAD_MIN_SPEECH_RATIO = max(
+    ASR_VAD_MIN_SPEECH_RATIO,
+    min(float(os.getenv("DIDIER_ASR_WAKE_VAD_MIN_SPEECH_RATIO", "0.18")), 0.95),
+)
+ASR_WAKE_VAD_ABS_MIN = max(
+    ASR_VAD_ABS_MIN,
+    min(float(os.getenv("DIDIER_ASR_WAKE_VAD_ABS_MIN", "0.012")), 0.4),
+)
+ASR_SHARED_STATE_INTERVAL_S = max(
+    0.5, min(float(os.getenv("DIDIER_ASR_SHARED_STATE_INTERVAL_S", "1.0")), 5.0)
+)
+DEFAULT_HTTP_TIMEOUT_S = 2.0
+DEFAULT_SUBPROCESS_TIMEOUT_S = 2.0
 
 APP_STARTED_AT = time.time()
 TMP_DIR = Path("/tmp")
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
 app = FastAPI(title="Didier ASR Worker", version="0.1.0")
 logger = logging.getLogger("didier.asr")
@@ -100,8 +128,28 @@ asr_state: dict[str, Any] = {
     "idle_chunk_count": 0,
     "capture_failures": 0,
     "last_asr_ms": 0.0,
+    "last_vad_rms": 0.0,
+    "last_vad_speech_ratio": 0.0,
     "last_error": None,
 }
+_ASR_ARBITRATION_CACHE: dict[str, Any] = {"ts": 0.0, "pause": False}
+
+
+def _asr_paused_by_arbitration() -> bool:
+    now = time.time()
+    if (now - float(_ASR_ARBITRATION_CACHE["ts"])) < 0.5:
+        return bool(_ASR_ARBITRATION_CACHE["pause"])
+    pause = False
+    try:
+        state = read_shared_state()
+        arbitration = state.get("arbitration", {}) if isinstance(state, dict) else {}
+        limits = arbitration.get("limits", {}) if isinstance(arbitration, dict) else {}
+        pause = bool(limits.get("pause_asr_ingest", False))
+    except Exception:
+        pause = False
+    _ASR_ARBITRATION_CACHE["ts"] = now
+    _ASR_ARBITRATION_CACHE["pause"] = pause
+    return pause
 
 
 def _normalize_text(text: str) -> str:
@@ -125,28 +173,58 @@ def _build_wake_words() -> None:
 
 
 def _matches_wake_word(text: str) -> bool:
+    matched, _score, _method = _wake_match_details(text)
+    return matched
+
+
+def _similarity_ratio(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    return float(SequenceMatcher(None, a, b).ratio())
+
+
+def _wake_match_details(text: str) -> tuple[bool, float, str]:
     if not _wake_word_norms:
-        return False
+        return False, 0.0, "no_wake_words"
     normalized = _normalize_text(text)
     compact = normalized.replace(" ", "")
+    best_score = 0.0
+    best_method = "none"
     for wake in _wake_word_norms:
         if wake and wake in normalized:
-            return True
+            return True, 1.0, "substring"
     for wake in _wake_word_compact:
         if wake and wake in compact:
-            return True
+            return True, 1.0, "compact_substring"
+        score = _similarity_ratio(compact, wake)
+        if score > best_score:
+            best_score = score
+            best_method = "similarity_full"
+        wake_tokens = [tok for tok in wake.split() if tok]
+        text_tokens = [tok for tok in normalized.split() if tok]
+        if wake_tokens and len(text_tokens) >= len(wake_tokens):
+            win = len(wake_tokens)
+            for idx in range(0, len(text_tokens) - win + 1):
+                window = "".join(text_tokens[idx : idx + win])
+                score = _similarity_ratio(window, wake)
+                if score > best_score:
+                    best_score = score
+                    best_method = "similarity_window"
     tokens = normalized.split()
+    has_y_prefix = any(tok.startswith("y") for tok in tokens)
+    if best_score >= ASR_WAKE_SIMILARITY and (has_y_prefix or compact.startswith("y")):
+        return True, best_score, best_method
     has_yo = any(tok.startswith("yo") for tok in tokens)
     has_did = any(tok.startswith("didi") or tok.startswith("didie") for tok in tokens)
     if has_yo and has_did:
-        return True
+        return True, max(best_score, 0.72), "heuristic_yo_didier"
     has_y = any(tok.startswith("y") for tok in tokens)
     di_letters = sum(1 for tok in tokens if tok in {"d", "i"})
     if has_y and di_letters >= 3:
-        return True
+        return True, max(best_score, 0.65), "heuristic_spelling"
     if compact.startswith("ya") and "ddii" in compact:
-        return True
-    return False
+        return True, max(best_score, 0.66), "heuristic_alias"
+    return False, best_score, best_method
 
 
 def _extract_after_wake(text: str) -> str | None:
@@ -159,10 +237,14 @@ def _extract_after_wake(text: str) -> str | None:
 
 
 async def _run_command(cmd: list[str], timeout_s: float) -> tuple[int, str, str]:
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    timeout_s = max(0.1, min(float(timeout_s), DEFAULT_SUBPROCESS_TIMEOUT_S))
+    proc = await asyncio.wait_for(
+        asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        ),
+        timeout=DEFAULT_SUBPROCESS_TIMEOUT_S,
     )
     try:
         out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
@@ -178,6 +260,7 @@ async def _run_command(cmd: list[str], timeout_s: float) -> tuple[int, str, str]
 
 
 async def _api_post(path: str, payload: dict[str, Any], timeout_s: float) -> dict[str, Any]:
+    timeout_s = max(0.1, min(float(timeout_s), DEFAULT_HTTP_TIMEOUT_S))
     response = await ipc_request(
         "POST",
         path,
@@ -222,6 +305,37 @@ async def _downmix_to_mono(src: Path, dst: Path) -> bool:
         return True
     except Exception:
         return False
+
+
+async def _passes_vad(wav_path: Path) -> tuple[bool, float, float]:
+    if not ASR_USE_VAD:
+        return True, 1.0, 0.0
+    try:
+        data, sr = await asyncio.to_thread(sf.read, str(wav_path), dtype="float32")
+    except Exception:
+        return False, 0.0, 0.0
+    if data.ndim > 1:
+        rms_by_channel = np.sqrt(np.mean(np.square(data), axis=0))
+        best_idx = int(np.argmax(rms_by_channel))
+        data = data[:, best_idx]
+    if data.size == 0:
+        return False, 0.0, 0.0
+    peak = float(np.max(np.abs(data)))
+    if peak > 1e-6 and peak < 0.2:
+        gain = min(12.0, 0.2 / peak)
+        data = np.clip(data * gain, -1.0, 1.0)
+    rms = float(np.sqrt(np.mean(np.square(data)))) if data.size else 0.0
+    frame_len = max(1, int((ASR_VAD_FRAME_MS / 1000.0) * float(sr)))
+    if data.size < frame_len * 2:
+        return rms >= ASR_VAD_ABS_MIN, (1.0 if rms >= ASR_VAD_ABS_MIN else 0.0), rms
+    usable = (data.size // frame_len) * frame_len
+    framed = data[:usable].reshape(-1, frame_len)
+    frame_rms = np.sqrt(np.mean(np.square(framed), axis=1))
+    noise_floor = float(np.percentile(frame_rms, 25))
+    threshold = max(ASR_VAD_ABS_MIN, noise_floor * ASR_VAD_ENERGY_FACTOR)
+    speech_ratio = float(np.mean(frame_rms >= threshold))
+    passed = bool(speech_ratio >= ASR_VAD_MIN_SPEECH_RATIO and rms >= ASR_VAD_ABS_MIN)
+    return passed, speech_ratio, rms
 
 
 async def _transcribe_wav(
@@ -329,6 +443,10 @@ async def _handle_command(text: str) -> None:
 async def _capture_loop() -> None:
     retry_delay = 0.8
     while not _stop_event.is_set():
+        if _asr_paused_by_arbitration():
+            asr_state["detail"] = "paused_by_arbitrator"
+            await asyncio.sleep(0.25)
+            continue
         ts = int(time.time() * 1000)
         wav_path = TMP_DIR / f"didier_mic_{ts}.wav"
         chunk_seconds = ASR_COMMAND_CHUNK_SECONDS if asr_state["armed"] else ASR_CHUNK_SECONDS
@@ -380,6 +498,22 @@ async def _process_loop() -> None:
             model_path = ASR_WAKE_MODEL_PATH if use_wake_model else ASR_MODEL_PATH
             label = "wake" if use_wake_model else "command"
             threads = ASR_WAKE_THREADS if use_wake_model else ASR_THREADS
+            vad_ok, speech_ratio, rms = await _passes_vad(wav_path)
+            asr_state["last_vad_speech_ratio"] = round(float(speech_ratio), 3)
+            asr_state["last_vad_rms"] = round(float(rms), 5)
+            if not vad_ok:
+                if use_wake_model:
+                    update_status(state="IDLE", asr_worker=True)
+                _cleanup_path(wav_path)
+                continue
+            # Idle thermodynamics: wake-pass needs a stronger speech gate than command-pass.
+            # This prevents whisper.cpp from running continuously on room noise.
+            if use_wake_model and (
+                speech_ratio < ASR_WAKE_VAD_MIN_SPEECH_RATIO or rms < ASR_WAKE_VAD_ABS_MIN
+            ):
+                update_status(state="IDLE", asr_worker=True)
+                _cleanup_path(wav_path)
+                continue
             text = await _transcribe_wav(
                 wav_path,
                 model_path=model_path,
@@ -396,8 +530,15 @@ async def _process_loop() -> None:
                 asr_worker=True,
             )
             if not asr_state["armed"]:
-                logger.info("Wake candidate transcript: %s", text)
-                if _matches_wake_word(text):
+                matched, score, method = _wake_match_details(text)
+                logger.info(
+                    "Wake candidate transcript: %s (match=%s score=%.2f method=%s)",
+                    text,
+                    matched,
+                    score,
+                    method,
+                )
+                if matched:
                     await _on_wake_word()
                     if ASR_ALLOW_INLINE_COMMAND and ASR_WAKE_MODEL_PATH == ASR_MODEL_PATH:
                         extra = _extract_after_wake(text)
@@ -437,10 +578,11 @@ async def _publish_shared_state_loop() -> None:
             "last_asr_ms": float(asr_state["last_asr_ms"]),
         }
         await asyncio.to_thread(update_worker_metrics, "asr", payload)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(ASR_SHARED_STATE_INTERVAL_S)
 
 
 def _validate_prerequisites() -> tuple[bool, str]:
+    global ASR_WAKE_MODEL_PATH
     if not ASR_ENABLED:
         return False, "asr_disabled"
     if shutil.which("arecord") is None:
@@ -450,14 +592,22 @@ def _validate_prerequisites() -> tuple[bool, str]:
     if not ASR_MODEL_PATH or not Path(ASR_MODEL_PATH).exists():
         return False, f"model_missing:{ASR_MODEL_PATH}"
     if not ASR_WAKE_MODEL_PATH or not Path(ASR_WAKE_MODEL_PATH).exists():
-        return False, f"wake_model_missing:{ASR_WAKE_MODEL_PATH}"
+        logger.warning(
+            "Wake model missing (%s), fallback to main model (%s)",
+            ASR_WAKE_MODEL_PATH,
+            ASR_MODEL_PATH,
+        )
+        ASR_WAKE_MODEL_PATH = ASR_MODEL_PATH
     return True, "ready"
 
 
 @app.on_event("startup")
 async def _startup() -> None:
     global _capture_task, _process_task, _shared_state_task
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(
+        level=os.getenv("DIDIER_LOG_LEVEL", "INFO").upper(),
+        format=LOG_FORMAT,
+    )
     _build_wake_words()
     ok, detail = _validate_prerequisites()
     asr_state["ready"] = ok
@@ -522,6 +672,8 @@ async def metrics() -> dict[str, Any]:
         "armed": bool(asr_state["armed"]),
         "capture_failures": int(asr_state["capture_failures"]),
         "last_asr_ms": float(asr_state["last_asr_ms"]),
+        "last_vad_rms": float(asr_state["last_vad_rms"]),
+        "last_vad_speech_ratio": float(asr_state["last_vad_speech_ratio"]),
         "last_error": asr_state["last_error"],
     }
 
@@ -529,6 +681,48 @@ async def metrics() -> dict[str, Any]:
 @app.post("/wake-test")
 async def wake_test(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     payload = payload or {}
+    sample_payload = payload.get("sample_texts", None)
+    sample_texts: list[str] = []
+    if isinstance(sample_payload, list):
+        sample_texts = [str(item).strip() for item in sample_payload if str(item).strip()]
+    elif isinstance(payload.get("sample_text"), str):
+        text = str(payload.get("sample_text", "")).strip()
+        if text:
+            sample_texts = [text]
+    if sample_texts:
+        probes: list[dict[str, Any]] = []
+        matched = False
+        best_score = 0.0
+        best_method = "none"
+        best_text = ""
+        for text in sample_texts[:16]:
+            probe_ok, probe_score, probe_method = _wake_match_details(text)
+            probes.append(
+                {
+                    "text": text,
+                    "matched": probe_ok,
+                    "score": round(probe_score, 3),
+                    "method": probe_method,
+                }
+            )
+            if probe_score >= best_score:
+                best_score = probe_score
+                best_method = probe_method
+                best_text = text
+            if probe_ok:
+                matched = True
+        return {
+            "status": "ok" if matched else "no_match",
+            "mode": "text_probe",
+            "wake_word": ASR_WAKE_WORD,
+            "wake_words": _wake_words,
+            "matched": matched,
+            "best_score": round(best_score, 3),
+            "best_method": best_method,
+            "best_text": best_text,
+            "threshold": ASR_WAKE_SIMILARITY,
+            "probes": probes,
+        }
     if not asr_state["ready"]:
         raise HTTPException(status_code=503, detail=str(asr_state.get("detail", "asr_not_ready")))
     inject_wake_tts = bool(payload.get("inject_wake_tts", True))
@@ -549,6 +743,8 @@ async def wake_test(payload: dict[str, Any] | None = None) -> dict[str, Any]:
                 await asyncio.sleep(repeat_gap_s)
 
     matched = False
+    match_score = 0.0
+    match_method = "none"
     heard_transcript = ""
     heard_at = 0.0
     while time.time() - started_at <= timeout_s:
@@ -559,8 +755,8 @@ async def wake_test(payload: dict[str, Any] | None = None) -> dict[str, Any]:
         if transcript and ts > baseline_ts:
             heard_transcript = transcript
             heard_at = ts
-            if _matches_wake_word(transcript):
-                matched = True
+            matched, match_score, match_method = _wake_match_details(transcript)
+            if matched:
                 break
 
     wake_reply_queued = False
@@ -584,6 +780,9 @@ async def wake_test(payload: dict[str, Any] | None = None) -> dict[str, Any]:
         "audio_detected": audio_detected,
         "heard_transcript": heard_transcript,
         "heard_at": heard_at or None,
+        "match_score": round(match_score, 3),
+        "match_method": match_method,
+        "threshold": ASR_WAKE_SIMILARITY,
         "wake_reply_queued": wake_reply_queued,
         "wake_reply_text": ASR_WAKE_REPLY_TEXT if wake_reply_queued else "",
         "baseline_transcript": baseline_transcript,

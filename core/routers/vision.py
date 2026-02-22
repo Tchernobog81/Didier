@@ -1,8 +1,15 @@
+import asyncio
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
+from core.routers.guards import circuit_breaker
+from core.resource_arbitrator import get_resource_arbitrator
 
 router = APIRouter()
+DEFAULT_HTTP_TIMEOUT_S = 2.0
+_DETECTIONS_REFRESH_LOCK = asyncio.Lock()
+_DETECTIONS_REFRESH_MIN_INTERVAL_S = 0.8
+_last_detections_refresh_ts = 0.0
 
 
 @router.get("/vision/capture")
@@ -20,9 +27,13 @@ async def capture() -> dict[str, Any]:
 
 
 @router.post("/vision/describe")
+@circuit_breaker("vision.describe")
 async def vision_describe(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     from core import runtime_bridge as api_module
 
+    arbitrator = get_resource_arbitrator()
+    if not arbitrator.request_resource("vision_describe"):
+        raise HTTPException(status_code=503, detail="arbitration_denied:vision_describe")
     orchestrator = api_module._require_orchestrator()
     vision = orchestrator.get_tentacle("vision")
     if not vision:
@@ -63,7 +74,7 @@ async def vision_describe(payload: dict[str, Any] | None = None) -> dict[str, An
     try:
         import httpx
 
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=DEFAULT_HTTP_TIMEOUT_S) as client:
             response = await client.post(f"{base_url}/api/generate", json=payload_data)
             response.raise_for_status()
             data = response.json()
@@ -164,16 +175,23 @@ async def vision_zones() -> dict[str, Any]:
 
 
 @router.post("/vision/detect")
+@circuit_breaker("vision.detect")
 async def vision_detect() -> dict[str, Any]:
     from core import runtime_bridge as api_module
 
+    arbitrator = get_resource_arbitrator()
+    if not arbitrator.request_resource("npu_inference"):
+        raise HTTPException(status_code=503, detail="arbitration_denied:npu_inference")
     orchestrator = api_module._require_orchestrator()
     vision = orchestrator.get_tentacle("vision")
     if not vision:
         raise HTTPException(status_code=503, detail="vision tentacle not loaded")
     if not hasattr(vision, "detect_once"):
         raise HTTPException(status_code=501, detail="vision detect not supported")
-    return await vision.detect_once()
+    try:
+        return await asyncio.wait_for(vision.detect_once(), timeout=2.0)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=503, detail="vision_detect_timeout")
 
 
 @router.get("/vision/detections")
@@ -186,13 +204,52 @@ async def vision_detections() -> dict[str, Any]:
         raise HTTPException(status_code=503, detail="vision tentacle not loaded")
     if not hasattr(vision, "get_latest_detections"):
         raise HTTPException(status_code=501, detail="vision detections not supported")
-    return vision.get_latest_detections()
+    data = vision.get_latest_detections()
+    if not isinstance(data, dict):
+        return {"detections": [], "frame": {"width": None, "height": None}, "ts": 0.0}
+
+    # Passive mode: if background detection is disabled/stale, refresh at low frequency.
+    last_ts = float(data.get("ts", 0.0) or 0.0)
+    now = api_module.time.time()
+    refresh_max_age_s = max(
+        0.5,
+        float(orchestrator.config.get("vision.on_demand_refresh_max_age_seconds", 1.5)),
+    )
+    background_detect_enabled = bool(orchestrator.config.get("vision.background_detect", True))
+    detections = data.get("detections") if isinstance(data.get("detections"), list) else []
+    needs_refresh = (now - last_ts) > refresh_max_age_s
+    if not background_detect_enabled and len(detections) == 0:
+        needs_refresh = True
+    if needs_refresh and hasattr(vision, "detect_once"):
+        global _last_detections_refresh_ts
+        if (
+            not _DETECTIONS_REFRESH_LOCK.locked()
+            and (now - _last_detections_refresh_ts) >= _DETECTIONS_REFRESH_MIN_INTERVAL_S
+        ):
+            async with _DETECTIONS_REFRESH_LOCK:
+                refresh_now = api_module.time.time()
+                if (refresh_now - _last_detections_refresh_ts) >= _DETECTIONS_REFRESH_MIN_INTERVAL_S:
+                    _last_detections_refresh_ts = refresh_now
+                    arbitrator = get_resource_arbitrator()
+                    if arbitrator.request_resource("npu_inference"):
+                        try:
+                            await asyncio.wait_for(vision.detect_once(), timeout=2.0)
+                            refreshed = vision.get_latest_detections()
+                            if isinstance(refreshed, dict):
+                                refreshed["source"] = "on_demand_refresh"
+                                return refreshed
+                        except Exception:
+                            pass
+    return data
 
 
 @router.get("/vision/detections-secondary")
 async def vision_detections_secondary() -> dict[str, Any]:
     from core import runtime_bridge as api_module
 
+    arbitrator = get_resource_arbitrator()
+    if not arbitrator.request_resource("secondary_stream"):
+        raise HTTPException(status_code=503, detail="arbitration_denied:secondary_stream")
     orchestrator = api_module._require_orchestrator()
     vision = orchestrator.get_tentacle("vision")
     if not vision:
@@ -220,7 +277,6 @@ async def vision_detections_secondary() -> dict[str, Any]:
     data = await api_module.asyncio.to_thread(vision.detect_secondary_frame, frame)
     data["stream_ts"] = ts
     return data
-    # --- AJOUTER CE BLOC À LA TOUTE FIN DU FICHIER ---
 
 
 @router.get("/vision/status-secondary")
@@ -258,22 +314,89 @@ async def vision_status_secondary() -> dict[str, Any]:
 
 
 @router.get("/video/stream")
+@circuit_breaker("vision.stream")
 async def video_stream():
     from core import runtime_bridge as api_module
 
+    arbitrator = get_resource_arbitrator()
     orchestrator = api_module._require_orchestrator()
     vision = orchestrator.get_tentacle("vision")
-    if vision and orchestrator.config.get("vision.enable_live", False):
-        if hasattr(vision, "get_latest_jpeg"):
-            return api_module.StreamingResponse(
-                api_module._mjpeg_generator_from_vision(vision),
-                media_type="multipart/x-mixed-replace; boundary=frame",
-            )
+    live_enabled = bool(orchestrator.config.get("vision.enable_live", False))
+    primary_fallback_secondary = bool(
+        orchestrator.config.get("vision.primary_fallback_secondary", False)
+    )
+    if vision and live_enabled and hasattr(vision, "get_latest_jpeg"):
+        primary_stream_stale = False
+        if hasattr(vision, "get_status"):
+            try:
+                status = vision.get_status()
+                last_frame_ts = float(status.get("last_frame_ts", 0.0) or 0.0)
+                if last_frame_ts > 0.0:
+                    age_s = max(0.0, api_module.time.time() - last_frame_ts)
+                    stale_after_s = max(
+                        1.0,
+                        float(
+                            orchestrator.config.get(
+                                "vision.primary_stale_fallback_seconds", 2.5
+                            )
+                        ),
+                    )
+                    primary_stream_stale = age_s > stale_after_s
+            except Exception:
+                primary_stream_stale = False
+
+        if primary_stream_stale and primary_fallback_secondary:
+            cfg = orchestrator.config.get("vision.remote_stream", {}) or {}
+            if cfg.get("enabled", True) and cfg.get("input_url"):
+                fps = arbitrator.get_target_fps(default=int(cfg.get("fps", 15)))
+                stream = api_module._get_remote_stream(str(cfg.get("input_url")), fps=fps)
+                return api_module.StreamingResponse(
+                    api_module._remote_mjpeg_generator(stream),
+                    media_type="multipart/x-mixed-replace; boundary=frame",
+                )
+        return api_module.StreamingResponse(
+            api_module._mjpeg_generator_from_vision(vision),
+            media_type="multipart/x-mixed-replace; boundary=frame",
+        )
+
+    def _secondary_stream_response():
+        if not arbitrator.request_resource("secondary_stream"):
+            return None
+        cfg = orchestrator.config.get("vision.remote_stream", {}) or {}
+        if not cfg.get("enabled", True):
+            return None
+        input_url = cfg.get("input_url", "udp://0.0.0.0:1234")
+        fps = arbitrator.get_target_fps(default=int(cfg.get("fps", 15)))
+        if not input_url:
+            return None
+        if api_module.shutil.which("ffmpeg") is None:
+            return None
+        stream = api_module._get_remote_stream(str(input_url), fps=fps)
+        return api_module.StreamingResponse(
+            api_module._remote_mjpeg_generator(stream),
+            media_type="multipart/x-mixed-replace; boundary=frame",
+        )
+
+    # Primary stream should target PS3 by default (no implicit fallback to Surface).
+    # If needed, fallback can be explicitly re-enabled via config.
+    api_local_capture_enabled = bool(
+        orchestrator.config.get("vision.api_local_capture_enabled", True)
+    )
+    if not api_local_capture_enabled:
+        if primary_fallback_secondary:
+            fallback = _secondary_stream_response()
+            if fallback is not None:
+                return fallback
+        raise HTTPException(
+            status_code=423,
+            detail="Primary PS3 stream disabled (vision.api_local_capture_enabled=false)",
+        )
     camera_index = int(orchestrator.config.get("vision.camera_index", 0))
     camera_device = orchestrator.config.get("vision.camera_device", None)
     width = orchestrator.config.get("vision.width", None)
     height = orchestrator.config.get("vision.height", None)
-    fps = orchestrator.config.get("vision.fps", None)
+    configured_fps = orchestrator.config.get("vision.fps", None)
+    fps = arbitrator.get_target_fps(default=int(configured_fps or 20))
     fourcc = orchestrator.config.get("vision.fourcc", None)
     kill_on_open = bool(orchestrator.config.get("vision.kill_on_open", False))
     if api_module._VIDEO_LOCK.locked():
@@ -283,6 +406,10 @@ async def video_stream():
             camera_device, camera_index, width, height, fps, fourcc, kill_on_open
         ).release()
     except Exception:
+        if primary_fallback_secondary:
+            fallback = _secondary_stream_response()
+            if fallback is not None:
+                return fallback
         raise HTTPException(status_code=503, detail="Camera not available")
     return api_module.StreamingResponse(
         api_module._mjpeg_generator(
@@ -293,15 +420,19 @@ async def video_stream():
 
 
 @router.get("/video/stream-secondary")
+@circuit_breaker("vision.stream_secondary")
 async def video_stream_secondary():
     from core import runtime_bridge as api_module
 
+    arbitrator = get_resource_arbitrator()
+    if not arbitrator.request_resource("secondary_stream"):
+        raise HTTPException(status_code=503, detail="arbitration_denied:secondary_stream")
     orchestrator = api_module._require_orchestrator()
     cfg = orchestrator.config.get("vision.remote_stream", {}) or {}
     if not cfg.get("enabled", True):
         raise HTTPException(status_code=404, detail="secondary stream disabled")
     input_url = cfg.get("input_url", "udp://0.0.0.0:1234")
-    fps = int(cfg.get("fps", 15))
+    fps = arbitrator.get_target_fps(default=int(cfg.get("fps", 15)))
     if not input_url:
         raise HTTPException(status_code=400, detail="input_url required")
     if api_module.shutil.which("ffmpeg") is None:

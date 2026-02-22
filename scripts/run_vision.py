@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import multiprocessing as mp
 import os
 import time
@@ -22,12 +23,36 @@ if str(ROOT) not in sys.path:
 from core.hailo.monitor import detect_hailo
 from core.hailo.tappas_pipeline import TappasPipeline
 from core.shared_state import update_worker_metrics
+from shared.ipc import request as ipc_request
 
 VISION_HOST = os.getenv("DIDIER_VISION_HOST", "127.0.0.1")
 VISION_PORT = int(os.getenv("DIDIER_VISION_PORT", "5011"))
 TARGET_FPS = float(os.getenv("DIDIER_VISION_FPS", "30"))
+VISION_SOCKET_PATH = os.getenv("DIDIER_VISION_SOCK", "/tmp/didier_vision.sock").strip()
 METRICS_MIN_INTERVAL_S = float(os.getenv("DIDIER_VISION_METRICS_MIN_INTERVAL_S", "0.5"))
+VISION_SHARED_STATE_INTERVAL_S = max(
+    0.5, min(float(os.getenv("DIDIER_VISION_SHARED_STATE_INTERVAL_S", "1.0")), 5.0)
+)
+VISION_TAPPAS_RESTART_INTERVAL_S = max(
+    2.0, min(float(os.getenv("DIDIER_VISION_TAPPAS_RESTART_INTERVAL_S", "6.0")), 30.0)
+)
+VISION_ENABLE_TAPPAS = os.getenv("DIDIER_VISION_ENABLE_TAPPAS", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+VISION_SEE_MAX_AGE_S = float(os.getenv("DIDIER_VISION_SEE_MAX_AGE_S", "2.5"))
+VISION_SEE_OWNER_CHECK = os.getenv("DIDIER_VISION_SEE_OWNER_CHECK", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+VISION_SEE_OWNER_TIMEOUT_S = max(0.2, min(float(os.getenv("DIDIER_VISION_SEE_OWNER_TIMEOUT_S", "0.8")), 2.5))
+VISION_ROOM_HINT = os.getenv("DIDIER_VISION_ROOM_HINT", "").strip()
 APP_STARTED_AT = time.time()
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
 app = FastAPI(title="Didier MVP Vision", version="0.1.0")
 
@@ -42,6 +67,7 @@ _metrics_last_payload: dict[str, Any] | None = None
 _tappas: TappasPipeline | None = None
 _tappas_task: asyncio.Task[None] | None = None
 _shared_state_task: asyncio.Task[None] | None = None
+_last_tappas_restart_ts = 0.0
 
 
 def _vision_loop(shared: Any, stop_event: Any, fps: float, initial_mode: str) -> None:
@@ -64,9 +90,17 @@ def _vision_loop(shared: Any, stop_event: Any, fps: float, initial_mode: str) ->
 
 
 async def _poll_tappas_status() -> None:
+    global _last_tappas_restart_ts
     while True:
         if _shared is not None and _tappas is not None:
-            _shared["tappas"] = _tappas.status()
+            status = _tappas.status()
+            _shared["tappas"] = status
+            if _tappas.enabled and not bool(status.get("started", False)):
+                now = time.time()
+                if (now - _last_tappas_restart_ts) >= VISION_TAPPAS_RESTART_INTERVAL_S:
+                    _last_tappas_restart_ts = now
+                    _tappas.start()
+                    _shared["tappas"] = _tappas.status()
         await asyncio.sleep(1.0)
 
 
@@ -86,12 +120,27 @@ async def _publish_shared_state_loop() -> None:
             "last_frame_age_s": age_s,
         }
         await asyncio.to_thread(update_worker_metrics, "vision", payload)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(VISION_SHARED_STATE_INTERVAL_S)
+
+
+def _cleanup_socket(socket_path: str) -> None:
+    if not socket_path:
+        return
+    try:
+        path = Path(socket_path)
+        if path.exists():
+            path.unlink()
+    except Exception:
+        pass
 
 
 @app.on_event("startup")
 async def _startup() -> None:
     global _worker, _manager, _shared, _stop_event, _tappas, _tappas_task, _shared_state_task
+    logging.basicConfig(
+        level=os.getenv("DIDIER_LOG_LEVEL", "INFO").upper(),
+        format=LOG_FORMAT,
+    )
     _manager = _ctx.Manager()
     _shared = _manager.dict(
         {
@@ -105,8 +154,8 @@ async def _startup() -> None:
     )
     _stop_event = _ctx.Event()
     _stop_event.clear()
-    _tappas = TappasPipeline()
-    _tappas_started = _tappas.start()
+    _tappas = TappasPipeline() if VISION_ENABLE_TAPPAS else None
+    _tappas_started = bool(_tappas and _tappas.start())
     worker_mode = "hailo_mode" if _tappas_started else "cpu_mode"
     _shared["mode"] = worker_mode
     _worker = _ctx.Process(
@@ -116,8 +165,19 @@ async def _startup() -> None:
         name="didier-vision-worker",
     )
     _worker.start()
-    _shared["tappas"] = _tappas.status()
-    _tappas_task = asyncio.create_task(_poll_tappas_status())
+    if _tappas is not None:
+        _shared["tappas"] = _tappas.status()
+        _tappas_task = asyncio.create_task(_poll_tappas_status())
+    else:
+        _shared["tappas"] = {
+            "backend": "disabled",
+            "enabled": False,
+            "started": False,
+            "frames_seen": 0,
+            "command": None,
+            "uptime_s": 0.0,
+            "last_error": "disabled_by_config",
+        }
     _shared_state_task = asyncio.create_task(_publish_shared_state_loop())
 
 
@@ -144,6 +204,7 @@ async def _shutdown() -> None:
         _shared_state_task = None
     if _tappas is not None:
         _tappas.stop()
+    _cleanup_socket(VISION_SOCKET_PATH)
 
 
 @app.get("/health")
@@ -206,6 +267,60 @@ async def status_secondary() -> dict[str, Any]:
     }
 
 
+@app.get("/vision/see_user")
+async def see_user() -> dict[str, Any]:
+    alive = bool(_worker and _worker.is_alive())
+    now = time.time()
+    last_ts = float(_shared.get("last_frame_ts", 0.0) or 0.0) if _shared is not None else 0.0
+    age_s = None if last_ts <= 0 else round(max(now - last_ts, 0.0), 3)
+    seen = bool(alive and age_s is not None and age_s <= max(VISION_SEE_MAX_AGE_S, 0.3))
+
+    owner_check: dict[str, Any] | None = None
+    if seen and VISION_SEE_OWNER_CHECK:
+        try:
+            response = await ipc_request(
+                "GET",
+                "/vision/owner",
+                service="api",
+                timeout=VISION_SEE_OWNER_TIMEOUT_S,
+            )
+            if response.is_success:
+                data = response.json()
+                if isinstance(data, dict):
+                    owner_check = {
+                        "ok": bool(data.get("ok", False)),
+                        "enrolled": bool(data.get("enrolled", False)),
+                        "match": data.get("match"),
+                        "method": data.get("method"),
+                    }
+        except Exception:
+            owner_check = None
+
+    location = VISION_ROOM_HINT or "inconnue"
+    if not seen:
+        summary = "Je ne te vois pas clairement pour l'instant."
+    elif owner_check and owner_check.get("ok") and owner_check.get("enrolled"):
+        if owner_check.get("match") is True:
+            summary = f"Je te vois bien dans {location}." if VISION_ROOM_HINT else "Je te vois bien devant la camera."
+        else:
+            summary = "Je vois quelqu'un devant la camera."
+    else:
+        summary = f"Je te vois dans {location}." if VISION_ROOM_HINT else "Je te vois bien devant la camera."
+
+    return {
+        "status": "ok" if alive else "degraded",
+        "service": "didier-vision",
+        "uptime_s": round(now - APP_STARTED_AT, 3),
+        "ts": now,
+        "detail": "user_visible" if seen else "user_not_visible",
+        "seen": seen,
+        "location": location,
+        "last_frame_age_s": age_s,
+        "owner_check": owner_check,
+        "summary": summary,
+    }
+
+
 @app.get("/infer")
 async def infer() -> dict[str, Any]:
     return {
@@ -217,13 +332,12 @@ async def infer() -> dict[str, Any]:
 
 
 def main() -> int:
-    socket_path = os.getenv("DIDIER_VISION_SOCK", "/tmp/didier_vision.sock").strip()
-    if socket_path:
+    if VISION_SOCKET_PATH:
         try:
-            Path(socket_path).unlink(missing_ok=True)
+            Path(VISION_SOCKET_PATH).unlink(missing_ok=True)
         except Exception:
             pass
-        uvicorn.run(app, uds=socket_path, log_level="info")
+        uvicorn.run(app, uds=VISION_SOCKET_PATH, log_level="info")
     else:
         uvicorn.run(app, host=VISION_HOST, port=VISION_PORT, log_level="info")
     return 0

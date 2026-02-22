@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sys
 import time
@@ -24,6 +25,7 @@ from shared.ipc import request as ipc_request
 
 BRAIN_HOST = os.getenv("DIDIER_BRAIN_HOST", "127.0.0.1")
 BRAIN_PORT = int(os.getenv("DIDIER_BRAIN_PORT", "5012"))
+BRAIN_SOCKET_PATH = os.getenv("DIDIER_BRAIN_SOCK", "/tmp/didier_brain.sock").strip()
 OLLAMA_BASE_URL = os.getenv("DIDIER_OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 OLLAMA_UNIX_SOCKET = os.getenv("DIDIER_OLLAMA_UNIX_SOCKET", "").strip()
 DEFAULT_MODEL = os.getenv("DIDIER_BRAIN_MODEL", "llama3.2:3b")
@@ -34,7 +36,12 @@ MICRO_BRAIN_ENABLED = os.getenv("DIDIER_MICRO_BRAIN_ENABLED", "1").strip().lower
     "off",
 }
 MICRO_POLL_S = float(os.getenv("DIDIER_MICRO_POLL_S", "1.0"))
+BRAIN_SHARED_STATE_INTERVAL_S = max(
+    0.5, min(float(os.getenv("DIDIER_BRAIN_SHARED_STATE_INTERVAL_S", "1.0")), 5.0)
+)
+DEFAULT_HTTP_TIMEOUT_S = 2.0
 APP_STARTED_AT = time.time()
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
 brain_state: dict[str, Any] = {
     "ollama_up": False,
@@ -47,6 +54,10 @@ brain_state: dict[str, Any] = {
     "micro": {"enabled": MICRO_BRAIN_ENABLED},
     "last_generate_ms": 0.0,
     "response_p95_ms": 0.0,
+    "requests_total": 0,
+    "micro_shortcuts": 0,
+    "ollama_calls": 0,
+    "stub_calls": 0,
 }
 
 app = FastAPI(title="Didier MVP Brain", version="0.1.0")
@@ -57,7 +68,7 @@ _shared_state_task: asyncio.Task[None] | None = None
 
 async def _fetch_worker_ok(service: str, path: str = "/health") -> bool:
     try:
-        res = await ipc_request("GET", path, service=service, timeout=1.0)
+        res = await ipc_request("GET", path, service=service, timeout=DEFAULT_HTTP_TIMEOUT_S)
         if not res.is_success:
             return False
         try:
@@ -96,8 +107,9 @@ async def _ollama_request(
     path: str,
     *,
     payload: dict[str, Any] | None = None,
-    timeout: float = 20.0,
+    timeout: float = DEFAULT_HTTP_TIMEOUT_S,
 ) -> httpx.Response:
+    timeout = max(0.1, min(float(timeout), DEFAULT_HTTP_TIMEOUT_S))
     socket_path = _resolve_ollama_socket()
     if socket_path:
         transport = httpx.AsyncHTTPTransport(uds=socket_path)
@@ -185,14 +197,38 @@ async def _publish_shared_state_loop() -> None:
             "ollama_up": bool(brain_state["ollama_up"]),
             "workers": dict(brain_state.get("workers", {})),
             "last_generate_ms": float(brain_state.get("last_generate_ms", 0.0) or 0.0),
+            "micro_bypass_ratio": float(
+                round(
+                    (
+                        (float(brain_state.get("micro_shortcuts", 0) or 0.0) * 100.0)
+                        / max(1.0, float(brain_state.get("requests_total", 0) or 0.0))
+                    ),
+                    2,
+                )
+            ),
         }
         await asyncio.to_thread(update_worker_metrics, "brain", payload)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(BRAIN_SHARED_STATE_INTERVAL_S)
+
+
+def _cleanup_socket(socket_path: str) -> None:
+    if not socket_path:
+        return
+    try:
+        path = Path(socket_path)
+        if path.exists():
+            path.unlink()
+    except Exception:
+        pass
 
 
 @app.on_event("startup")
 async def _startup() -> None:
     global _shared_state_task
+    logging.basicConfig(
+        level=os.getenv("DIDIER_LOG_LEVEL", "INFO").upper(),
+        format=LOG_FORMAT,
+    )
     asyncio.create_task(_poll_ollama_loop())
     if MICRO_BRAIN_ENABLED:
         asyncio.create_task(_poll_micro_loop())
@@ -209,6 +245,7 @@ async def _shutdown() -> None:
         except asyncio.CancelledError:
             pass
         _shared_state_task = None
+    _cleanup_socket(BRAIN_SOCKET_PATH)
 
 
 @app.get("/health")
@@ -234,6 +271,9 @@ async def health() -> dict[str, Any]:
 
 @app.get("/metrics")
 async def metrics() -> dict[str, Any]:
+    total_requests = int(brain_state.get("requests_total", 0) or 0)
+    micro_shortcuts = int(brain_state.get("micro_shortcuts", 0) or 0)
+    micro_bypass_ratio = round((micro_shortcuts * 100.0) / max(1, total_requests), 2)
     return {
         "service": "didier-brain",
         "uptime_s": round(time.time() - APP_STARTED_AT, 3),
@@ -248,6 +288,11 @@ async def metrics() -> dict[str, Any]:
         "micro": brain_state["micro"],
         "last_generate_ms": brain_state["last_generate_ms"],
         "response_p95_ms": brain_state["response_p95_ms"],
+        "requests_total": total_requests,
+        "micro_shortcuts": micro_shortcuts,
+        "ollama_calls": int(brain_state.get("ollama_calls", 0) or 0),
+        "stub_calls": int(brain_state.get("stub_calls", 0) or 0),
+        "micro_bypass_ratio": micro_bypass_ratio,
     }
 
 
@@ -264,13 +309,21 @@ async def generate(payload: dict[str, Any]) -> dict[str, Any]:
     prompt = str(payload.get("prompt", "")).strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt required")
+    brain_state["requests_total"] = int(brain_state.get("requests_total", 0) or 0) + 1
 
     model = str(payload.get("model", DEFAULT_MODEL)).strip() or DEFAULT_MODEL
     if MICRO_BRAIN_ENABLED and _micro_brain is not None:
-        decision = _micro_brain.decide(prompt, {"workers": brain_state.get("workers", {})})
+        decision = _micro_brain.decide(
+            prompt,
+            {
+                "workers": brain_state.get("workers", {}),
+                "response_p95_ms": brain_state.get("response_p95_ms", 0.0),
+            },
+        )
         if not decision.wake_ollama and decision.quick_response:
             elapsed_ms = (time.time() - started) * 1000.0
             brain_state["last_generate_ms"] = round(elapsed_ms, 2)
+            brain_state["micro_shortcuts"] = int(brain_state.get("micro_shortcuts", 0) or 0) + 1
             _update_latency_stats(elapsed_ms)
             return {
                 "status": "micro",
@@ -282,6 +335,7 @@ async def generate(payload: dict[str, Any]) -> dict[str, Any]:
     if not brain_state["ollama_up"]:
         elapsed_ms = (time.time() - started) * 1000.0
         brain_state["last_generate_ms"] = round(elapsed_ms, 2)
+        brain_state["stub_calls"] = int(brain_state.get("stub_calls", 0) or 0) + 1
         _update_latency_stats(elapsed_ms)
         return {
             "status": "stub",
@@ -300,13 +354,14 @@ async def generate(payload: dict[str, Any]) -> dict[str, Any]:
             "POST",
             "/api/generate",
             payload=req_payload,
-            timeout=20.0,
+            timeout=DEFAULT_HTTP_TIMEOUT_S,
         )
         res.raise_for_status()
         data = res.json()
     except Exception as exc:
         elapsed_ms = (time.time() - started) * 1000.0
         brain_state["last_generate_ms"] = round(elapsed_ms, 2)
+        brain_state["stub_calls"] = int(brain_state.get("stub_calls", 0) or 0) + 1
         _update_latency_stats(elapsed_ms)
         return {
             "status": "stub",
@@ -316,6 +371,7 @@ async def generate(payload: dict[str, Any]) -> dict[str, Any]:
         }
     elapsed_ms = (time.time() - started) * 1000.0
     brain_state["last_generate_ms"] = round(elapsed_ms, 2)
+    brain_state["ollama_calls"] = int(brain_state.get("ollama_calls", 0) or 0) + 1
     _update_latency_stats(elapsed_ms)
     return {
         "status": "ok",
@@ -325,13 +381,12 @@ async def generate(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def main() -> int:
-    socket_path = os.getenv("DIDIER_BRAIN_SOCK", "/tmp/didier_brain.sock").strip()
-    if socket_path:
+    if BRAIN_SOCKET_PATH:
         try:
-            Path(socket_path).unlink(missing_ok=True)
+            Path(BRAIN_SOCKET_PATH).unlink(missing_ok=True)
         except Exception:
             pass
-        uvicorn.run(app, uds=socket_path, log_level="info")
+        uvicorn.run(app, uds=BRAIN_SOCKET_PATH, log_level="info")
     else:
         uvicorn.run(app, host=BRAIN_HOST, port=BRAIN_PORT, log_level="info")
     return 0

@@ -2,14 +2,13 @@
 fastapi
 uvicorn[standard]
 
-# Communication & Utilitaires
-requests
+# IPC / monitoring
 psutil
 httpx
-huggingface_hub
 
-# Synthèse vocale (Text-to-Speech)
+# Audio / vision runtime
 kokoro-onnx
 onnxruntime
 soundfile
 numpy==2.2.4
+opencv-python-headless

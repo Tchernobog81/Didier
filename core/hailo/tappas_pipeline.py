@@ -11,6 +11,8 @@ import subprocess
 import time
 from typing import Any
 
+from core.hardware_gatekeeper import HardwareLease, get_hardware_gatekeeper
+
 from .monitor import detect_hailo
 
 
@@ -25,6 +27,7 @@ class TappasPipeline:
     last_error: str | None = None
     _proc: subprocess.Popen[str] | None = None
     _started_at: float | None = None
+    _npu_lease: HardwareLease | None = None
 
     @property
     def is_available(self) -> bool:
@@ -77,6 +80,14 @@ class TappasPipeline:
         if not self.enabled:
             self.started = False
             return False
+        if self._npu_lease is None:
+            self._npu_lease = get_hardware_gatekeeper().acquire(
+                "npu", timeout_s=0.8, blocking=False
+            )
+            if self._npu_lease is None:
+                self.last_error = "npu_gate_locked"
+                self.started = False
+                return False
 
         for cmd in self._build_commands():
             try:
@@ -104,6 +115,9 @@ class TappasPipeline:
 
         if self.last_error is None:
             self.last_error = "no_tappas_command"
+        if self._npu_lease is not None:
+            self._npu_lease.release()
+            self._npu_lease = None
         self.started = False
         return False
 
@@ -118,6 +132,9 @@ class TappasPipeline:
                 except Exception:
                     pass
         self._proc = None
+        if self._npu_lease is not None:
+            self._npu_lease.release()
+            self._npu_lease = None
         self.started = False
 
     def process_frame(self, frame: Any) -> list[dict[str, Any]]:

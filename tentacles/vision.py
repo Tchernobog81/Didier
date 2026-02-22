@@ -16,12 +16,23 @@ import numpy as np
 
 from tentacles.base import BaseTentacle
 from core.config import DidierConfig
+from core.hardware_gatekeeper import HardwareLease, get_hardware_gatekeeper
+
+DEFAULT_SUBPROCESS_TIMEOUT_S = 2.0
 
 
 class HailoDetector:
     name = "hailo"
 
-    def __init__(self, model_path: Path, logger: logging.Logger) -> None:
+    def __init__(
+        self,
+        model_path: Path,
+        logger: logging.Logger,
+        *,
+        score_threshold: float = 0.35,
+        nms_threshold: float = 0.45,
+        max_detections: int = 64,
+    ) -> None:
         self._logger = logger
         self._model_path = model_path
         self._ready = False
@@ -37,7 +48,29 @@ class HailoDetector:
         self._input_name = None
         self._output_shapes_logged = False
         self._last_npu_load = None
+        self._score_threshold = max(0.05, min(float(score_threshold), 0.95))
+        self._nms_threshold = max(0.1, min(float(nms_threshold), 0.95))
+        self._max_detections = max(1, int(max_detections))
         self._init_detector()
+
+    def _ensure_hailo_pythonpath(self) -> None:
+        """Allow venv runtime to load distro-provided hailo_platform."""
+        candidates = [
+            "/usr/lib/python3/dist-packages",
+            f"/usr/lib/python{sys.version_info.major}.{sys.version_info.minor}/dist-packages",
+            "/usr/local/lib/python3/dist-packages",
+            f"/usr/local/lib/python{sys.version_info.major}.{sys.version_info.minor}/dist-packages",
+        ]
+        for raw in candidates:
+            try:
+                path = Path(raw)
+                if not path.exists():
+                    continue
+                resolved = str(path.resolve())
+                if resolved not in sys.path:
+                    sys.path.append(resolved)
+            except Exception:
+                continue
 
     @property
     def ready(self) -> bool:
@@ -49,17 +82,31 @@ class HailoDetector:
             return
         try:
             os.environ.setdefault("HAILO_MONITOR", "1")
-            from hailo_platform import (  # type: ignore
-                HEF,
-                VDevice,
-                HailoStreamInterface,
-                ConfigureParams,
-                InputVStreamParams,
-                OutputVStreamParams,
-                InferVStreams,
-                FormatType,
-                HailoSchedulingAlgorithm,
-            )
+            try:
+                from hailo_platform import (  # type: ignore
+                    HEF,
+                    VDevice,
+                    HailoStreamInterface,
+                    ConfigureParams,
+                    InputVStreamParams,
+                    OutputVStreamParams,
+                    InferVStreams,
+                    FormatType,
+                    HailoSchedulingAlgorithm,
+                )
+            except ModuleNotFoundError:
+                self._ensure_hailo_pythonpath()
+                from hailo_platform import (  # type: ignore
+                    HEF,
+                    VDevice,
+                    HailoStreamInterface,
+                    ConfigureParams,
+                    InputVStreamParams,
+                    OutputVStreamParams,
+                    InferVStreams,
+                    FormatType,
+                    HailoSchedulingAlgorithm,
+                )
 
             self._hef = HEF(str(self._model_path))
             params = VDevice.create_params()
@@ -113,8 +160,13 @@ class HailoDetector:
             infer_pipeline = self._infer_vstreams_cls(
                 self._network_group, self._input_vstreams_params, self._output_vstreams_params
             )
-            with infer_pipeline as infer:
-                outputs = infer.infer(inputs)
+            if self._network_group_params is not None:
+                with self._network_group.activate(self._network_group_params):
+                    with infer_pipeline as infer:
+                        outputs = infer.infer(inputs)
+            else:
+                with infer_pipeline as infer:
+                    outputs = infer.infer(inputs)
             if not self._output_shapes_logged:
                 self._log_output_shapes(outputs)
                 self._output_shapes_logged = True
@@ -132,7 +184,7 @@ class HailoDetector:
                 ["hailortcli", "monitor"],
                 capture_output=True,
                 text=True,
-                timeout=1.2,
+                timeout=DEFAULT_SUBPROCESS_TIMEOUT_S,
                 env=os.environ.copy(),
                 check=False,
             )
@@ -208,38 +260,180 @@ class HailoDetector:
         detections: List[dict] = []
         if not isinstance(outputs, dict):
             return detections
-        threshold = 0.25
         frame_h, frame_w = (frame_shape if frame_shape else (None, None))
         for _, tensor in outputs.items():
             if not hasattr(tensor, "shape"):
                 continue
-            shape = tensor.shape
-            if len(shape) < 2:
-                continue
-            last_dim = shape[-1]
-            if last_dim not in (6, 7):
-                continue
-            flat = tensor.reshape(-1, last_dim)
-            for row in flat:
-                score = float(row[4])
-                if score < threshold:
-                    continue
-                class_id = int(row[5]) if last_dim >= 6 else -1
-                bbox = None
+            rows = self._flatten_rows(np.asarray(tensor))
+            for row in rows:
+                det = self._row_to_detection(row, frame_w, frame_h)
+                if det is not None:
+                    detections.append(det)
+        detections = self._apply_nms(detections)
+        detections.sort(key=lambda item: float(item.get("confidence", 0.0)), reverse=True)
+        return detections[: self._max_detections]
+
+    def _flatten_rows(self, tensor: np.ndarray) -> List[np.ndarray]:
+        if tensor.size == 0:
+            return []
+        arr = np.asarray(tensor)
+
+        def _to_rows(candidate: np.ndarray | None) -> np.ndarray | None:
+            if candidate is None or candidate.ndim < 1:
+                return None
+            last_dim = int(candidate.shape[-1])
+            if last_dim < 5:
+                return None
+            try:
+                return candidate.reshape(-1, last_dim)
+            except Exception:
+                return None
+
+        if arr.ndim == 1:
+            return [arr] if arr.size >= 5 else []
+
+        direct = _to_rows(arr)
+        swapped = _to_rows(np.swapaxes(arr, -1, -2)) if arr.ndim >= 2 else None
+
+        def _score(rows: np.ndarray | None) -> tuple[int, int]:
+            if rows is None:
+                return (-1, 10_000)
+            dim = int(rows.shape[1])
+            if 5 <= dim <= 512:
+                return (2, dim)
+            if dim > 512:
+                return (0, dim)
+            return (-1, dim)
+
+        score_direct = _score(direct)
+        score_swapped = _score(swapped)
+        if score_swapped > score_direct:
+            return list(swapped) if swapped is not None else []
+        if direct is not None:
+            return list(direct)
+        if swapped is not None:
+            return list(swapped)
+        return []
+
+    def _row_to_detection(
+        self,
+        row: np.ndarray,
+        frame_w: int | None,
+        frame_h: int | None,
+    ) -> dict | None:
+        if row is None:
+            return None
+        values = np.asarray(row).reshape(-1)
+        if values.size < 5:
+            return None
+        try:
+            x = float(values[0])
+            y = float(values[1])
+            w = float(values[2])
+            h = float(values[3])
+        except Exception:
+            return None
+
+        class_id = -1
+        score = 0.0
+        if values.size > 6:
+            objectness = float(values[4])
+            class_scores = values[5:]
+            if (
+                0.0 <= objectness <= 1.0
+                and class_scores.size > 0
+                and float(np.max(class_scores)) <= 1.0
+            ):
+                class_idx = int(np.argmax(class_scores))
+                class_prob = float(class_scores[class_idx])
+                score = objectness * class_prob
+                class_id = class_idx
+            else:
+                raw_scores = values[4:]
+                if raw_scores.size > 0:
+                    class_idx = int(np.argmax(raw_scores))
+                    class_prob = float(raw_scores[class_idx])
+                    if class_prob > 1.0 or float(np.min(raw_scores)) < 0.0:
+                        class_prob = float(
+                            1.0 / (1.0 + np.exp(-np.clip(class_prob, -30.0, 30.0)))
+                        )
+                    score = class_prob
+                    class_id = class_idx
+                else:
+                    score = max(0.0, objectness)
+        else:
+            score = float(values[4])
+            if values.size >= 6:
                 try:
-                    x, y, w, h = (float(row[0]), float(row[1]), float(row[2]), float(row[3]))
-                    bbox = self._decode_bbox(x, y, w, h, frame_w, frame_h)
+                    class_id = int(values[5])
                 except Exception:
-                    bbox = None
-                detections.append(
-                    {
-                        "label": f"class_{class_id}",
-                        "confidence": score,
-                        "bbox": bbox,
-                        "class_id": class_id,
-                    }
-                )
-        return detections
+                    class_id = -1
+
+        if score < self._score_threshold:
+            return None
+        bbox = self._decode_bbox(x, y, w, h, frame_w, frame_h)
+        if not bbox:
+            return None
+        bw = int(bbox[2])
+        bh = int(bbox[3])
+        if bw <= 1 or bh <= 1:
+            return None
+        return {
+            "label": f"class_{class_id}" if class_id >= 0 else "objet",
+            "confidence": float(score),
+            "bbox": bbox,
+            "class_id": class_id if class_id >= 0 else None,
+        }
+
+    def _apply_nms(self, detections: List[dict]) -> List[dict]:
+        if len(detections) <= 1:
+            return detections
+        boxes: list[list[int]] = []
+        scores: list[float] = []
+        valid_positions: list[int] = []
+        for pos, det in enumerate(detections):
+            bbox = det.get("bbox")
+            if not bbox or len(bbox) < 4:
+                continue
+            try:
+                x, y, w, h = (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))
+                score = float(det.get("confidence", 0.0))
+            except Exception:
+                continue
+            if w <= 0 or h <= 0:
+                continue
+            boxes.append([x, y, w, h])
+            scores.append(score)
+            valid_positions.append(pos)
+        if not boxes:
+            return detections
+        try:
+            selected = cv2.dnn.NMSBoxes(
+                boxes,
+                scores,
+                self._score_threshold,
+                self._nms_threshold,
+            )
+        except Exception:
+            return detections
+        if selected is None:
+            return detections
+        keep_boxes_idx: set[int] = set()
+        for item in selected:
+            if isinstance(item, (list, tuple, np.ndarray)):
+                if len(item) > 0:
+                    keep_boxes_idx.add(int(item[0]))
+            else:
+                keep_boxes_idx.add(int(item))
+        if not keep_boxes_idx:
+            return detections
+        keep_positions = {
+            valid_positions[idx]
+            for idx in keep_boxes_idx
+            if 0 <= idx < len(valid_positions)
+        }
+        filtered = [det for pos, det in enumerate(detections) if pos in keep_positions]
+        return filtered or detections
 
     def _decode_bbox(
         self,
@@ -252,23 +446,33 @@ class HailoDetector:
     ) -> list[int] | None:
         if not frame_w or not frame_h:
             return None
+        # Normalized outputs: accept either xyxy or xywh-center variants.
         if 0 <= x <= 1 and 0 <= y <= 1 and 0 <= w <= 1 and 0 <= h <= 1:
+            if w > x and h > y and ((x + w) > 1.05 or (y + h) > 1.05):
+                x0 = int(x * frame_w)
+                y0 = int(y * frame_h)
+                x1 = int(w * frame_w)
+                y1 = int(h * frame_h)
+                return [max(0, x0), max(0, y0), max(1, x1 - x0), max(1, y1 - y0)]
             cx = x * frame_w
             cy = y * frame_h
             bw = w * frame_w
             bh = h * frame_h
             x0 = int(cx - bw / 2)
             y0 = int(cy - bh / 2)
-            return [max(0, x0), max(0, y0), int(bw), int(bh)]
-        # Heuristic: if w/h are positive and fit, assume x,y,w,h absolute
+            return [max(0, x0), max(0, y0), max(1, int(bw)), max(1, int(bh))]
+        # Heuristic: x,y,w,h absolute.
         if w > 0 and h > 0 and x >= 0 and y >= 0 and x + w <= frame_w and y + h <= frame_h:
-            return [int(x), int(y), int(w), int(h)]
-        # Fallback: treat w/h as x2/y2
+            return [int(x), int(y), max(1, int(w)), max(1, int(h))]
+        # Heuristic: x,y,x2,y2 absolute.
+        if x >= 0 and y >= 0 and w > x and h > y and w <= frame_w and h <= frame_h:
+            return [int(x), int(y), max(1, int(w - x)), max(1, int(h - y))]
+        # Fallback: mixed ordering.
         x0 = int(min(x, w))
         y0 = int(min(y, h))
         x1 = int(max(x, w))
         y1 = int(max(y, h))
-        return [max(0, x0), max(0, y0), max(0, x1 - x0), max(0, y1 - y0)]
+        return [max(0, x0), max(0, y0), max(1, x1 - x0), max(1, y1 - y0)]
 
 
 class OpenCVFaceDetector:
@@ -341,20 +545,57 @@ class OpenCVShapeDetector:
     def detect(self, frame: Any) -> List[dict]:
         try:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            frame_h, frame_w = gray.shape[:2]
+            min_area = max(140, int(frame_h * frame_w * 0.001))
             blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-            edged = cv2.Canny(blurred, 50, 150)
-            contours, _ = cv2.findContours(
+            edged = cv2.Canny(blurred, 35, 120)
+            thresh = cv2.adaptiveThreshold(
+                blurred,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY_INV,
+                11,
+                2,
+            )
+            kernel = np.ones((3, 3), np.uint8)
+            closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
+            contours_a, _ = cv2.findContours(
                 edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
+            contours_b, _ = cv2.findContours(
+                closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            contours = sorted(
+                list(contours_a) + list(contours_b),
+                key=cv2.contourArea,
+                reverse=True,
+            )
             results = []
+            seen_boxes: list[tuple[int, int, int, int]] = []
             for cnt in contours:
                 area = cv2.contourArea(cnt)
-                if area < 600:
+                if area < min_area:
                     continue
                 peri = cv2.arcLength(cnt, True)
+                if peri <= 1.0:
+                    continue
                 approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
                 x, y, w, h = cv2.boundingRect(approx)
                 if w <= 0 or h <= 0:
+                    continue
+                # Skip near-duplicates generated by merged contour sources.
+                duplicate = False
+                for (sx, sy, sw, sh) in seen_boxes:
+                    inter_w = max(0, min(x + w, sx + sw) - max(x, sx))
+                    inter_h = max(0, min(y + h, sy + sh) - max(y, sy))
+                    inter = inter_w * inter_h
+                    if inter <= 0:
+                        continue
+                    union = (w * h) + (sw * sh) - inter
+                    if union > 0 and (inter / union) > 0.7:
+                        duplicate = True
+                        break
+                if duplicate:
                     continue
                 shape = "forme"
                 sides = len(approx)
@@ -380,6 +621,9 @@ class OpenCVShapeDetector:
                         "class_id": None,
                     }
                 )
+                seen_boxes.append((x, y, w, h))
+                if len(results) >= 12:
+                    break
             return results
         except Exception:
             self._logger.exception("OpenCV shape detection failed.")
@@ -402,14 +646,43 @@ class Tentacle(BaseTentacle):
         self._loop_sleep_s = max(
             0.02, float(self.config.get("vision.loop_sleep_seconds", 0.08))
         )
+        self._reopen_fail_threshold = max(
+            4, int(self.config.get("vision.reopen_fail_threshold", 8))
+        )
+        self._reopen_cooldown_s = max(
+            0.5, float(self.config.get("vision.reopen_cooldown_seconds", 2.0))
+        )
+        self._fallback_min_sleep_s = max(
+            self._loop_sleep_s,
+            float(self.config.get("vision.fallback_min_sleep_seconds", 0.25)),
+        )
+        self._fallback_max_sleep_s = max(
+            self._fallback_min_sleep_s,
+            float(self.config.get("vision.fallback_max_sleep_seconds", 1.5)),
+        )
+        self._fallback_backoff_s = self._fallback_min_sleep_s
+        self._last_reopen_ts = 0.0
         self._background_detect = bool(
             self.config.get("vision.background_detect", True)
         )
-        self._model_path = Path(
+        self._model_path = self._resolve_model_path(
             self.config.get("vision.model_path", "config/hailo_model.hef")
         )
         self._detector_mode = self.config.get("vision.detector", "auto")
         self._model_name = self.config.get("vision.model_name", None)
+        self._npu_score_threshold = float(
+            self.config.get("vision.npu_score_threshold", 0.35)
+        )
+        self._npu_nms_threshold = float(
+            self.config.get("vision.npu_nms_threshold", 0.45)
+        )
+        self._npu_max_detections = int(
+            self.config.get("vision.npu_max_detections", 64)
+        )
+        self._safe_hailo_detect = bool(
+            self.config.get("vision.safe_hailo_detect", True)
+        )
+        self._shape_fallback_detector = OpenCVShapeDetector(self._logger)
         self._detector = self._build_detector()
         self._last_detections: List[dict] = []
         self._last_secondary_detections: List[dict] = []
@@ -420,9 +693,28 @@ class Tentacle(BaseTentacle):
         self._last_monitor_ts = 0.0
         self._jpeg_lock = threading.Lock()
         self._last_jpeg: bytes | None = None
+        self._frame_lock = threading.Lock()
+        self._last_frame: Any | None = None
         self._last_frame_ts = 0.0
         self._last_frame_shape: tuple[int, int] | None = None
         self._last_secondary_frame_shape: tuple[int, int] | None = None
+        self._frame_cache_max_age_s = max(
+            0.05, float(self.config.get("vision.frame_cache_max_age_seconds", 0.7))
+        )
+        try:
+            jpeg_fps_default = float(self._fps) if self._fps else 10.0
+        except Exception:
+            jpeg_fps_default = 10.0
+        try:
+            self._jpeg_target_fps = max(
+                1.0,
+                float(self.config.get("vision.stream_jpeg_fps", jpeg_fps_default)),
+            )
+        except Exception:
+            self._jpeg_target_fps = max(1.0, jpeg_fps_default)
+        self._jpeg_interval_s = 1.0 / self._jpeg_target_fps
+        self._last_jpeg_encode_ts = 0.0
+        self._stream_running = False
         self._interaction_zone = self.config.get("vision.interaction_zone", "zone-centre")
         self._require_person_roi = bool(self.config.get("vision.require_person_roi", False))
         person_ids = self.config.get("vision.person_class_ids", [0])
@@ -472,16 +764,70 @@ class Tentacle(BaseTentacle):
         self._face_cascade = None
         self._v4l2_lock = threading.Lock()
         self._detect_lock = threading.Lock()
+        self._camera_io_lock = threading.Lock()
+        self._gatekeeper = get_hardware_gatekeeper()
+        self._camera_lease: HardwareLease | None = None
+
+    def _resolve_model_path(self, raw_model_path: Any) -> Path:
+        raw = str(raw_model_path or "").strip()
+        if not raw:
+            return Path("config/hailo_model.hef")
+        candidate = Path(raw)
+        if candidate.is_absolute() and candidate.exists():
+            return candidate
+
+        repo_root = Path(__file__).resolve().parents[1]
+        host_root = repo_root.parent.parent
+        search_roots = [
+            repo_root,
+            host_root,
+            Path("/mnt/didier_ssd/didier"),
+        ]
+        candidates: list[Path] = []
+        if candidate.is_absolute():
+            candidates.append(candidate)
+        else:
+            for root in search_roots:
+                candidates.append((root / candidate).resolve())
+            if candidate.suffix.lower() == ".hef":
+                for root in search_roots:
+                    candidates.extend(
+                        sorted((root / "models" / "hailo").glob("*.hef"))
+                    )
+        for path in candidates:
+            try:
+                if path.exists():
+                    if str(path) != raw:
+                        self._logger.info("Resolved Hailo model path: %s", path)
+                    return path
+            except Exception:
+                continue
+        return candidate
 
     def _build_detector(self):
         mode = str(self._detector_mode or "auto").lower()
+        def _hailo() -> HailoDetector:
+            return HailoDetector(
+                self._model_path,
+                self._logger,
+                score_threshold=self._npu_score_threshold,
+                nms_threshold=self._npu_nms_threshold,
+                max_detections=self._npu_max_detections,
+            )
         if mode == "hailo":
-            return HailoDetector(self._model_path, self._logger)
+            detector = _hailo()
+            if detector.ready:
+                return detector
+            self._logger.warning(
+                "Hailo detector requested but unavailable (model=%s). Fallback to OpenCV shape detector.",
+                self._model_path,
+            )
+            return OpenCVShapeDetector(self._logger)
         if mode in {"opencv", "opencv_haar", "haar", "face"}:
             return OpenCVFaceDetector(self._logger)
         if mode in {"shape", "opencv-shape", "contour"}:
             return OpenCVShapeDetector(self._logger)
-        detector = HailoDetector(self._model_path, self._logger)
+        detector = _hailo()
         if detector.ready:
             return detector
         return OpenCVShapeDetector(self._logger)
@@ -650,7 +996,7 @@ class Tentacle(BaseTentacle):
             result = subprocess.run(
                 cmd,
                 capture_output=True,
-                timeout=1.5,
+                timeout=DEFAULT_SUBPROCESS_TIMEOUT_S,
                 check=False,
             )
             data = result.stdout
@@ -878,8 +1224,22 @@ class Tentacle(BaseTentacle):
         return tagged
 
     def _detect_with_lock(self, frame: Any) -> List[dict]:
-        with self._detect_lock:
+        if not self._detect_lock.acquire(timeout=0.4):
+            self._last_error = "detect_lock_timeout"
+            return []
+        npu_lease: HardwareLease | None = None
+        if getattr(self._detector, "name", "") == "hailo":
+            npu_lease = self._gatekeeper.acquire("npu", timeout_s=0.3, blocking=False)
+            if npu_lease is None:
+                self._detect_lock.release()
+                self._last_error = "npu_gate_locked"
+                return []
+        try:
             return self._detector.detect(frame)
+        finally:
+            if npu_lease is not None:
+                npu_lease.release()
+            self._detect_lock.release()
 
     def _ensure_polygon(self, det: dict) -> None:
         if det.get("poly"):
@@ -949,19 +1309,88 @@ class Tentacle(BaseTentacle):
             return False
 
     def _update_stream_frame(self, frame: Any) -> None:
+        now = time.time()
+        try:
+            frame_copy = frame.copy()
+        except Exception:
+            frame_copy = frame
+        with self._frame_lock:
+            self._last_frame = frame_copy
+        self._last_frame_ts = now
+
+        # Avoid JPEG encoding every raw frame; over-encoding increases capture latency.
+        if (now - self._last_jpeg_encode_ts) < self._jpeg_interval_s:
+            return
         try:
             ok, buffer = cv2.imencode(".jpg", frame)
             if not ok:
                 return
             with self._jpeg_lock:
                 self._last_jpeg = buffer.tobytes()
-                self._last_frame_ts = time.time()
+            self._last_jpeg_encode_ts = now
         except Exception:
             return
 
     def get_latest_jpeg(self) -> bytes | None:
         with self._jpeg_lock:
             return self._last_jpeg
+
+    def _get_recent_frame(self, max_age_s: float | None = None) -> Any | None:
+        limit = self._frame_cache_max_age_s if max_age_s is None else max(0.01, float(max_age_s))
+        now = time.time()
+        with self._frame_lock:
+            frame = self._last_frame
+        if frame is None:
+            return None
+        if self._last_frame_ts <= 0 or (now - self._last_frame_ts) > limit:
+            return None
+        try:
+            return frame.copy()
+        except Exception:
+            return frame
+
+    def _ensure_bgr_frame(self, frame: Any) -> Any:
+        if frame is None or not hasattr(frame, "shape"):
+            return frame
+        try:
+            if len(frame.shape) == 2:
+                try:
+                    return cv2.cvtColor(frame, cv2.COLOR_BayerGR2BGR)
+                except Exception:
+                    return cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+            if len(frame.shape) == 3 and int(frame.shape[2]) == 1:
+                return cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        except Exception:
+            return frame
+        return frame
+
+    def _capture_single_frame(self) -> Any | None:
+        lease = self._gatekeeper.acquire("camera", timeout_s=0.4, blocking=False)
+        if lease is None:
+            self._last_error = "camera_gate_locked"
+            return None
+        try:
+            with self._camera_io_lock:
+                cap = None
+                use_fallback = self._capture_backend == "v4l2"
+                if not use_fallback:
+                    cap = self._open_camera()
+                    if not cap.isOpened():
+                        cap.release()
+                        cap = None
+                        use_fallback = True
+                try:
+                    if use_fallback:
+                        return self._capture_frame_v4l2()
+                    ret, frame = cap.read()
+                    if not ret:
+                        return None
+                    return self._ensure_bgr_frame(frame)
+                finally:
+                    if cap is not None:
+                        cap.release()
+        finally:
+            lease.release()
 
     def _build_gstreamer_pipeline(self) -> str | None:
         if not self._camera_device and self._camera_index is None:
@@ -981,32 +1410,55 @@ class Tentacle(BaseTentacle):
 
     def _open_camera(self) -> cv2.VideoCapture:
         source = self._camera_device if self._camera_device else self._camera_index
-        if self._capture_backend == "gstreamer":
-            gst = self._build_gstreamer_pipeline()
-            if gst:
-                cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
-            else:
-                cap = cv2.VideoCapture(source, cv2.CAP_V4L2)
-        else:
-            cap = cv2.VideoCapture(source, cv2.CAP_V4L2)
-        if not cap.isOpened() and self._camera_device:
-            cap.release()
-            cap = cv2.VideoCapture(self._camera_index, cv2.CAP_V4L2)
-        if not cap.isOpened():
-            cap.release()
-            gst = self._build_gstreamer_pipeline()
-            if gst:
-                self._logger.warning("OpenCV V4L2 failed; trying GStreamer pipeline.")
-                cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
-        if self._fourcc:
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*self._fourcc))
-        if self._width:
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
-        if self._height:
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
-        if self._fps:
-            cap.set(cv2.CAP_PROP_FPS, self._fps)
-        return cap
+        gst = self._build_gstreamer_pipeline()
+
+        def _apply_settings(cap: cv2.VideoCapture) -> None:
+            if self._fourcc:
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*self._fourcc))
+            if self._width:
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
+            if self._height:
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
+            if self._fps:
+                cap.set(cv2.CAP_PROP_FPS, self._fps)
+            # Keep camera buffer short to avoid stale frames and PS3 backlog.
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+
+        open_attempts: list[tuple[str, Any, int | None]] = []
+        if self._capture_backend == "gstreamer" and gst:
+            open_attempts.append(("gstreamer", gst, cv2.CAP_GSTREAMER))
+        open_attempts.append(("v4l2", source, cv2.CAP_V4L2))
+        open_attempts.append(("opencv", source, None))
+        if self._camera_device:
+            open_attempts.append(("index-v4l2", self._camera_index, cv2.CAP_V4L2))
+            open_attempts.append(("index-opencv", self._camera_index, None))
+        if gst and self._capture_backend != "gstreamer":
+            open_attempts.append(("gstreamer", gst, cv2.CAP_GSTREAMER))
+
+        for backend_name, src, api_pref in open_attempts:
+            cap = (
+                cv2.VideoCapture(src, api_pref)
+                if api_pref is not None
+                else cv2.VideoCapture(src)
+            )
+            if not cap.isOpened():
+                cap.release()
+                continue
+            _apply_settings(cap)
+            # Drop startup garbage frames from USB PS3 devices.
+            for _ in range(2):
+                try:
+                    cap.grab()
+                except Exception:
+                    break
+            return cap
+        fallback = cv2.VideoCapture(source, cv2.CAP_V4L2)
+        if fallback.isOpened():
+            _apply_settings(fallback)
+        return fallback
 
     def get_status(self) -> dict[str, Any]:
         detector_name = getattr(self._detector, "name", "unknown")
@@ -1035,6 +1487,21 @@ class Tentacle(BaseTentacle):
             await self.stop_event.wait()
             return
         self._logger.info("Vision tentacle starting (camera=%s).", self._camera_index)
+        while not self.stop_event.is_set():
+            lease = await asyncio.to_thread(
+                self._gatekeeper.acquire,
+                "camera",
+                timeout_s=0.5,
+                blocking=False,
+            )
+            if lease is not None:
+                self._camera_lease = lease
+                break
+            self._last_error = "camera_gate_locked"
+            await asyncio.sleep(0.3)
+        if self._camera_lease is None:
+            return
+        self._stream_running = True
         cap = None
         use_fallback = self._capture_backend == "v4l2"
         if not use_fallback:
@@ -1053,25 +1520,53 @@ class Tentacle(BaseTentacle):
                     frame = await asyncio.to_thread(self._capture_frame_v4l2)
                     if frame is None:
                         fallback_failures += 1
-                        if fallback_failures >= 8:
+                        now = time.monotonic()
+                        if (
+                            fallback_failures >= self._reopen_fail_threshold
+                            and now - self._last_reopen_ts >= self._reopen_cooldown_s
+                        ):
+                            self._last_reopen_ts = now
+                            fallback_failures = 0
                             self._logger.warning(
                                 "v4l2 capture failing; trying to reopen camera."
                             )
-                            fallback_failures = 0
                             try:
                                 cap = self._open_camera()
                                 if cap.isOpened():
                                     use_fallback = False
+                                    self._fallback_backoff_s = self._fallback_min_sleep_s
+                                else:
+                                    self._fallback_backoff_s = min(
+                                        self._fallback_max_sleep_s,
+                                        max(
+                                            self._fallback_min_sleep_s,
+                                            self._fallback_backoff_s * 1.5,
+                                        ),
+                                    )
                             except Exception:
                                 cap = None
-                        await asyncio.sleep(0.08)
+                                self._fallback_backoff_s = min(
+                                    self._fallback_max_sleep_s,
+                                    max(
+                                        self._fallback_min_sleep_s,
+                                        self._fallback_backoff_s * 1.5,
+                                    ),
+                                )
+                        await asyncio.sleep(self._fallback_backoff_s)
                         continue
+                    frame = self._ensure_bgr_frame(frame)
                     fallback_failures = 0
+                    self._fallback_backoff_s = self._fallback_min_sleep_s
                 else:
                     ret, frame = await asyncio.to_thread(cap.read)
                     if not ret:
                         failures += 1
-                        if failures >= 8:
+                        now = time.monotonic()
+                        if (
+                            failures >= self._reopen_fail_threshold
+                            and now - self._last_reopen_ts >= self._reopen_cooldown_s
+                        ):
+                            self._last_reopen_ts = now
                             self._logger.warning("Camera read failed; reopening stream.")
                             failures = 0
                             try:
@@ -1088,11 +1583,17 @@ class Tentacle(BaseTentacle):
                                 use_fallback = True
                         await asyncio.sleep(0.05)
                         continue
+                    frame = self._ensure_bgr_frame(frame)
                     failures = 0
                 self._last_frame_shape = frame.shape[:2]
                 await asyncio.to_thread(self._update_stream_frame, frame)
                 if self._background_detect:
-                    detections = await asyncio.to_thread(self._detect_with_lock, frame)
+                    if self._safe_hailo_detect and getattr(self._detector, "name", "") == "hailo":
+                        detections = await asyncio.to_thread(
+                            self._shape_fallback_detector.detect, frame
+                        )
+                    else:
+                        detections = await asyncio.to_thread(self._detect_with_lock, frame)
                     detections = self._tag_detections(detections, frame)
                     self._store_detections(detections)
                 else:
@@ -1112,66 +1613,74 @@ class Tentacle(BaseTentacle):
                             self._logger.info("NPU load: %s%%", load)
                     except Exception:
                         pass
-                await asyncio.sleep(max(0.05, self._loop_sleep_s) if use_fallback else self._loop_sleep_s)
+                if use_fallback:
+                    await asyncio.sleep(max(0.05, self._loop_sleep_s))
+                else:
+                    # cap.read() already blocks on frame cadence; only yield cooperatively.
+                    await asyncio.sleep(min(max(self._loop_sleep_s, 0.0), 0.01))
         finally:
+            self._stream_running = False
             if cap is not None:
                 cap.release()
+            if self._camera_lease is not None:
+                self._camera_lease.release()
+                self._camera_lease = None
 
     async def detect_once(self) -> dict[str, Any]:
-        cap = None
-        use_fallback = self._capture_backend == "v4l2"
-        if not use_fallback:
-            cap = self._open_camera()
-            if not cap.isOpened():
-                cap.release()
-                cap = None
-                use_fallback = True
-        try:
-            if use_fallback:
-                frame = await asyncio.to_thread(self._capture_frame_v4l2)
-                if frame is None:
-                    raise RuntimeError("Failed to capture frame")
-            else:
-                ret, frame = await asyncio.to_thread(cap.read)
-                if not ret:
-                    raise RuntimeError("Failed to capture frame")
-            self._last_frame_shape = frame.shape[:2]
-            detections = await asyncio.to_thread(self._detect_with_lock, frame)
-            detections = self._tag_detections(detections, frame)
-            self._store_detections(detections)
-            return {
-                "detections": detections,
-                "status": self.get_status(),
-            }
-        finally:
-            if cap is not None:
-                cap.release()
+        frame = self._get_recent_frame(max_age_s=1.0)
+        if frame is None and self._stream_running:
+            for _ in range(8):
+                await asyncio.sleep(0.06)
+                frame = self._get_recent_frame(max_age_s=1.2)
+                if frame is not None:
+                    break
+        if frame is None:
+            frame = await asyncio.to_thread(self._capture_single_frame)
+        if frame is None:
+            raise RuntimeError("Failed to capture frame")
+        frame = self._ensure_bgr_frame(frame)
+        self._last_frame_shape = frame.shape[:2]
+        await asyncio.to_thread(self._update_stream_frame, frame)
+        if self._safe_hailo_detect and getattr(self._detector, "name", "") == "hailo":
+            self._last_error = "hailo_bypassed_safe_mode"
+            detections = await asyncio.to_thread(self._shape_fallback_detector.detect, frame)
+        else:
+            detect_timeout_s = max(
+                0.5, float(self.config.get("vision.detect_timeout_seconds", 2.0))
+            )
+            try:
+                detections = await asyncio.wait_for(
+                    asyncio.to_thread(self._detect_with_lock, frame),
+                    timeout=detect_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                self._last_error = f"detect_timeout:{detect_timeout_s:.1f}s"
+                detections = []
+        detections = self._tag_detections(detections, frame)
+        self._store_detections(detections)
+        return {
+            "detections": detections,
+            "status": self.get_status(),
+        }
 
     async def capture_once(self) -> str:
         image_path = Path(self.config.get("vision.capture_path", "data/capture.jpg"))
-        cap = None
-        use_fallback = self._capture_backend == "v4l2"
-        if not use_fallback:
-            cap = self._open_camera()
-            if not cap.isOpened():
-                cap.release()
-                cap = None
-                use_fallback = True
-        try:
-            if use_fallback:
-                frame = await asyncio.to_thread(self._capture_frame_v4l2)
-                if frame is None:
-                    raise RuntimeError("Failed to capture frame")
-            else:
-                ret, frame = await asyncio.to_thread(cap.read)
-                if not ret:
-                    raise RuntimeError("Failed to capture frame")
-            self._last_frame_shape = frame.shape[:2]
-            image_path.parent.mkdir(parents=True, exist_ok=True)
-            await asyncio.to_thread(cv2.imwrite, str(image_path), frame)
-        finally:
-            if cap is not None:
-                cap.release()
+        frame = self._get_recent_frame(max_age_s=1.0)
+        if frame is None and self._stream_running:
+            for _ in range(8):
+                await asyncio.sleep(0.06)
+                frame = self._get_recent_frame(max_age_s=1.2)
+                if frame is not None:
+                    break
+        if frame is None:
+            frame = await asyncio.to_thread(self._capture_single_frame)
+        if frame is None:
+            raise RuntimeError("Failed to capture frame")
+        frame = self._ensure_bgr_frame(frame)
+        self._last_frame_shape = frame.shape[:2]
+        await asyncio.to_thread(self._update_stream_frame, frame)
+        image_path.parent.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(cv2.imwrite, str(image_path), frame)
         return str(image_path)
 
     def get_latest_detections(self) -> dict[str, Any]:
