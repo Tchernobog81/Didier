@@ -1284,6 +1284,132 @@ function workerTypeClass(value) {
     .replace(/[^a-z0-9_-]/g, "-");
 }
 
+const EDGE_WORKER_ORDER = [
+  "didier-api",
+  "didier-vision",
+  "didier-brain",
+  "didier-audio",
+  "didier-asr",
+  "didier-openclaw",
+];
+
+const EDGE_LINK_LABEL_NOISE = new Set([
+  "http",
+  "rpc",
+  "queue",
+  "stream",
+  "i/o",
+  "pcie",
+  "dev",
+  "unix",
+  "ipc",
+]);
+
+const EDGE_LINK_LABEL_SIGNAL = new Set([
+  "llm",
+  "react",
+  "proxy",
+  "transcript",
+  "tts",
+  "wake",
+  "asr",
+  "vision",
+  "audio",
+  "capture",
+  "infer",
+  "pcie",
+]);
+
+const EDGE_MAX_FLOW_ANIMATIONS = 18;
+
+function canonicalWorkerName(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw) return "";
+  const base = raw.endsWith(".service") ? raw.slice(0, -8) : raw;
+  if (base.startsWith("didier-")) return base;
+  if (base === "api") return "didier-api";
+  if (base === "vision") return "didier-vision";
+  if (base === "brain") return "didier-brain";
+  if (base === "audio") return "didier-audio";
+  if (base === "asr") return "didier-asr";
+  if (
+    base === "openclaw" ||
+    base === "openclaw-bridge" ||
+    base === "openclaw_bridge" ||
+    base === "didier-openclaw-bridge"
+  ) {
+    return "didier-openclaw";
+  }
+  return base;
+}
+
+function normalizeEdgeLabel(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase();
+}
+
+function isWorkerNodeId(nodeId) {
+  return String(nodeId || "").startsWith("edge-worker-");
+}
+
+function isWorkerCommunicationEdge(edge) {
+  const from = edge && edge.from ? String(edge.from) : "";
+  const to = edge && edge.to ? String(edge.to) : "";
+  if (!from || !to) return false;
+  return isWorkerNodeId(from) || isWorkerNodeId(to);
+}
+
+function shouldDisplayEdgeLabel(edge) {
+  const labelRaw = edge && edge.label ? String(edge.label) : "";
+  const label = normalizeEdgeLabel(labelRaw);
+  if (!label) return false;
+  if (EDGE_LINK_LABEL_SIGNAL.has(label)) return true;
+  if (EDGE_LINK_LABEL_NOISE.has(label)) return false;
+  if (isWorkerCommunicationEdge(edge)) return label.length <= 14;
+  return false;
+}
+
+function workerDefaultLink(workerType) {
+  const key = String(workerType || "edge").toLowerCase();
+  if (key === "audio") return { mode: "async", label: "queue" };
+  if (key === "speech") return { mode: "async", label: "stream" };
+  if (key === "agentic") return { mode: "async", label: "proxy" };
+  return { mode: "sync", label: "RPC" };
+}
+
+function ensureWorkerLinks(edges, workerNodes) {
+  const next = Array.isArray(edges)
+    ? edges
+        .filter(Boolean)
+        .map((edge) => ({
+          from: edge && edge.from ? String(edge.from) : "",
+          to: edge && edge.to ? String(edge.to) : "",
+          mode:
+            edge && String(edge.mode || "sync").toLowerCase() === "async"
+              ? "async"
+              : "sync",
+          label: edge && edge.label ? String(edge.label) : "",
+        }))
+        .filter((edge) => edge.from && edge.to)
+    : [];
+  const hasRoute = (from, to) =>
+    next.some((edge) => edge.from === from && edge.to === to);
+  workerNodes.forEach((worker) => {
+    const nodeId = worker && worker.id ? String(worker.id) : "";
+    if (!nodeId || nodeId === "edge-worker-didier-api") return;
+    if (hasRoute("edge-api", nodeId)) return;
+    const fallback = workerDefaultLink(worker && worker.type ? worker.type : "edge");
+    next.push({
+      from: "edge-api",
+      to: nodeId,
+      mode: fallback.mode,
+      label: fallback.label,
+    });
+  });
+  return next;
+}
+
 function shortImageName(image) {
   if (!image) return "";
   const value = String(image);
@@ -1321,15 +1447,18 @@ function buildDockerLayout(payload) {
   addNode(0, "edge-dashboard", "Dashboard", healthOk ? "ok" : "inconnu", "HTTP 5010", "entry");
   addNode(0, "edge-vscode", "VSCode", "ok", "/vscode", "entry");
   addNode(1, "edge-api", healthName, healthOk ? "running" : "inconnu", "API gateway 5010", "gateway");
-  const workerNodeIds = [];
+  const workerNodes = [];
   workers.forEach((worker, idx) => {
-    const rawName = worker && worker.name ? String(worker.name) : `worker-${idx + 1}`;
+    const canonicalName = canonicalWorkerName(
+      worker && worker.name ? String(worker.name) : `worker-${idx + 1}`
+    );
+    const rawName = canonicalName || `worker-${idx + 1}`;
     const nodeId = `edge-worker-${rawName.replace(/[^a-zA-Z0-9_-]/g, "_")}`;
-    workerNodeIds.push(nodeId);
     const typeValue = worker && worker.worker_type ? String(worker.worker_type) : "edge";
     const ipcValue = worker && worker.ipc ? String(worker.ipc) : "unix";
     const metaParts = [workerTypeLabel(typeValue), ipcValue];
     if (worker && worker.meta) metaParts.push(String(worker.meta));
+    workerNodes.push({ id: nodeId, type: typeValue });
     addNode(
       2,
       nodeId,
@@ -1482,7 +1611,17 @@ function buildDockerLayout(payload) {
     dockerEdges = [
       { from: "edge-dashboard", to: "edge-api", mode: "sync", label: "HTTP" },
       { from: "edge-vscode", to: "edge-api", mode: "sync", label: "HTTP" },
-      ...workerNodeIds.map((nodeId) => ({ from: "edge-api", to: nodeId, mode: "sync", label: "RPC" })),
+      ...workerNodes
+        .filter((worker) => worker.id !== "edge-worker-didier-api")
+        .map((worker) => {
+          const fallback = workerDefaultLink(worker.type);
+          return {
+            from: "edge-api",
+            to: worker.id,
+            mode: fallback.mode,
+            label: fallback.label,
+          };
+        }),
       { from: "edge-api", to: "edge-didier-model", mode: "sync", label: "LLM" },
       { from: "edge-api", to: "edge-camera", mode: "sync", label: "I/O" },
       { from: "edge-api", to: "edge-camera-secondary", mode: "sync", label: "I/O" },
@@ -1498,6 +1637,7 @@ function buildDockerLayout(payload) {
       })),
     ];
   }
+  dockerEdges = ensureWorkerLinks(dockerEdges, workerNodes);
   return columns;
 }
 
@@ -1505,36 +1645,38 @@ function drawDockerLinks(svg) {
   if (!dockerGraph || !svg) return;
   const rect = dockerGraph.getBoundingClientRect();
   if (rect.width < 8 || rect.height < 8) return;
+  const svgNs = "http://www.w3.org/2000/svg";
   svg.setAttribute("viewBox", `0 0 ${rect.width} ${rect.height}`);
   svg.setAttribute("width", rect.width);
   svg.setAttribute("height", rect.height);
   svg.innerHTML = "";
-  const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
-  const marker = document.createElementNS("http://www.w3.org/2000/svg", "marker");
+  const defs = document.createElementNS(svgNs, "defs");
+  const marker = document.createElementNS(svgNs, "marker");
   marker.setAttribute("id", "arrow-sync");
   marker.setAttribute("markerWidth", "8");
   marker.setAttribute("markerHeight", "8");
   marker.setAttribute("refX", "6");
   marker.setAttribute("refY", "3");
   marker.setAttribute("orient", "auto");
-  const markerPath = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  const markerPath = document.createElementNS(svgNs, "path");
   markerPath.setAttribute("d", "M0,0 L6,3 L0,6 Z");
   marker.appendChild(markerPath);
   defs.appendChild(marker);
-  const markerAsync = document.createElementNS("http://www.w3.org/2000/svg", "marker");
+  const markerAsync = document.createElementNS(svgNs, "marker");
   markerAsync.setAttribute("id", "arrow-async");
   markerAsync.setAttribute("markerWidth", "8");
   markerAsync.setAttribute("markerHeight", "8");
   markerAsync.setAttribute("refX", "6");
   markerAsync.setAttribute("refY", "3");
   markerAsync.setAttribute("orient", "auto");
-  const markerPathAsync = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  const markerPathAsync = document.createElementNS(svgNs, "path");
   markerPathAsync.setAttribute("d", "M0,0 L6,3 L0,6 Z");
   markerAsync.appendChild(markerPathAsync);
   defs.appendChild(markerAsync);
   svg.appendChild(defs);
 
-  dockerEdges.forEach((edge) => {
+  let flowCount = 0;
+  dockerEdges.forEach((edge, idx) => {
     const fromId = edge && edge.from ? String(edge.from) : "";
     const toId = edge && edge.to ? String(edge.to) : "";
     const mode = edge && String(edge.mode || "sync").toLowerCase() === "async" ? "async" : "sync";
@@ -1548,18 +1690,39 @@ function drawDockerLinks(svg) {
     const endX = toRect.left - rect.left;
     const endY = toRect.top - rect.top + toRect.height / 2;
     const midX = (startX + endX) / 2;
-    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    const path = document.createElementNS(svgNs, "path");
+    const pathId = `docker-link-path-${idx}`;
+    const workerEdge = isWorkerCommunicationEdge(edge);
     path.setAttribute(
       "d",
       `M ${startX} ${startY} C ${midX} ${startY}, ${midX} ${endY}, ${endX} ${endY}`
     );
+    path.setAttribute("id", pathId);
     path.setAttribute("class", `docker-link docker-link-${mode}`);
+    path.classList.add(workerEdge ? "docker-link-worker" : "docker-link-muted");
     path.setAttribute("marker-end", mode === "async" ? "url(#arrow-async)" : "url(#arrow-sync)");
     svg.appendChild(path);
 
+    if (workerEdge && flowCount < EDGE_MAX_FLOW_ANIMATIONS) {
+      const flowDot = document.createElementNS(svgNs, "circle");
+      flowDot.setAttribute("r", mode === "async" ? "2.4" : "2.1");
+      flowDot.setAttribute("class", `docker-link-flow docker-link-flow-${mode}`);
+      const animateMotion = document.createElementNS(svgNs, "animateMotion");
+      animateMotion.setAttribute("dur", mode === "async" ? "1.45s" : "1.95s");
+      animateMotion.setAttribute("repeatCount", "indefinite");
+      animateMotion.setAttribute("rotate", "auto");
+      const mpath = document.createElementNS(svgNs, "mpath");
+      mpath.setAttribute("href", `#${pathId}`);
+      mpath.setAttributeNS("http://www.w3.org/1999/xlink", "xlink:href", `#${pathId}`);
+      animateMotion.appendChild(mpath);
+      flowDot.appendChild(animateMotion);
+      svg.appendChild(flowDot);
+      flowCount += 1;
+    }
+
     const label = edge && edge.label ? String(edge.label) : "";
-    if (label) {
-      const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    if (label && shouldDisplayEdgeLabel(edge)) {
+      const text = document.createElementNS(svgNs, "text");
       text.setAttribute("class", `docker-link-label docker-link-label-${mode}`);
       text.setAttribute("x", String(midX));
       text.setAttribute("y", String((startY + endY) / 2 - 4));
@@ -1667,35 +1830,36 @@ async function fetchDockerDiagram() {
     const diagramWorkers = diagramData && Array.isArray(diagramData.workers) ? diagramData.workers : [];
     const workerMap = new Map();
     diagramWorkers.forEach((worker) => {
-      const key = worker && worker.name ? String(worker.name) : "";
+      const key = canonicalWorkerName(worker && worker.name ? String(worker.name) : "");
       if (!key) return;
-      workerMap.set(key, worker);
-    });
-    workersFromMetrics.forEach((worker) => {
-      const key = worker && worker.name ? String(worker.name) : "";
-      if (!key) return;
-      const previous = workerMap.get(key) || {};
       workerMap.set(key, {
         ...worker,
-        ...previous,
         name: key,
-        label:
-          previous && previous.label ? String(previous.label) : worker.label ? String(worker.label) : `Worker ${key}`,
-        worker_type:
-          previous && previous.worker_type
-            ? String(previous.worker_type)
-            : worker.worker_type
-            ? String(worker.worker_type)
-            : "edge",
-        ipc:
-          previous && previous.ipc
-            ? String(previous.ipc)
-            : worker.ipc
-            ? String(worker.ipc)
-            : "unix",
       });
     });
-    const mergedWorkers = Array.from(workerMap.values());
+    workersFromMetrics.forEach((worker) => {
+      const key = canonicalWorkerName(worker && worker.name ? String(worker.name) : "");
+      if (!key) return;
+      const previous = workerMap.get(key);
+      if (!previous) return;
+      workerMap.set(key, {
+        ...previous,
+        status: worker && worker.status ? String(worker.status) : previous.status,
+        detail: worker && worker.detail ? String(worker.detail) : previous.detail,
+      });
+    });
+    const mergedWorkers = Array.from(workerMap.values()).sort((a, b) => {
+      const aKey = canonicalWorkerName(a && a.name ? String(a.name) : "");
+      const bKey = canonicalWorkerName(b && b.name ? String(b.name) : "");
+      const aPos = EDGE_WORKER_ORDER.indexOf(aKey);
+      const bPos = EDGE_WORKER_ORDER.indexOf(bKey);
+      const aRank = aPos >= 0 ? aPos : Number.MAX_SAFE_INTEGER;
+      const bRank = bPos >= 0 ? bPos : Number.MAX_SAFE_INTEGER;
+      if (aRank !== bRank) return aRank - bRank;
+      return String(a && a.name ? a.name : "").localeCompare(
+        String(b && b.name ? b.name : "")
+      );
+    });
 
     const payload = {
       ts: diagramData && diagramData.ts ? diagramData.ts : Date.now() / 1000,
