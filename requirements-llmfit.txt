@@ -1,0 +1,8 @@
+# Optional dependency set for hardware-aware routing.
+# llmfit is a Rust CLI binary, not a Python package.
+#
+# Install command (Linux/macOS, user-local):
+#   curl -fsSL https://llmfit.axjns.dev/install.sh | sh -s -- --local
+#
+# Verification:
+#   llmfit --version

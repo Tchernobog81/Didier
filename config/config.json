@@ -71,7 +71,19 @@
     "llm_provider": "openai",
     "llm_endpoint": "http://192.168.1.50:8080/v1",
     "llm_model": "qwen-2.5-3b",
-    "system_prompt": "Tu es Didier, une IA domotique de pointe. Ton corps est un Raspberry Pi 5 et ton cerveau un smartphone Pixel. Tu es direct, technique, et tu interagis avec tes capteurs materiels. Ne fais pas de longues phrases."
+    "system_prompt": "Tu es Didier, une IA domotique de pointe. Ton corps est un Raspberry Pi 5 et ton cerveau un smartphone Pixel. Tu es direct, technique, et tu interagis avec tes capteurs materiels. Ne fais pas de longues phrases.",
+    "gemini": {
+      "enabled": false,
+      "base_url": "https://generativelanguage.googleapis.com/v1beta",
+      "model": "gemini-2.0-flash",
+      "api_key": "",
+      "timeout_s": 3.2,
+      "max_tokens": 220,
+      "memory_enabled": true,
+      "memory_items": 6,
+      "memory_path": "data/gemini_boost_memory.jsonl",
+      "memory_max_bytes": 262144
+    }
   },
   "llmfit": {
     "enabled": true,
@@ -324,8 +336,8 @@
       0
     ],
     "labels_path": "models/vision/coco.names",
-    "polygon_refine": false,
-    "polygon_refine_max": 3,
+    "polygon_refine": true,
+    "polygon_refine_max": 4,
     "polygon_refine_epsilon": 0.02,
     "polygon_refine_min_area": 120,
     "owner_mode": "embedding",
@@ -337,6 +349,7 @@
     "detector": "auto",
     "model_path": "/mnt/didier_ssd/didier/models/hailo/hailo_model.hef",
     "safe_hailo_detect": true,
+    "safe_hailo_empty_streak": 2,
     "capture_path": "data/capture.jpg",
     "describe_model": "moondream:1.8b",
     "describe_prompt": "Décris l'image en français, en une phrase utile.",
@@ -346,7 +359,7 @@
       "input_url": "udp://0.0.0.0:1234?overrun_nonfatal=1&fifo_size=5000000",
       "fps": 15
     },
-    "background_detect": false,
+    "background_detect": true,
     "detect_timeout_seconds": 1.2,
     "loop_sleep_seconds": 0.12
   }

@@ -160,13 +160,9 @@ class HailoDetector:
             infer_pipeline = self._infer_vstreams_cls(
                 self._network_group, self._input_vstreams_params, self._output_vstreams_params
             )
-            if self._network_group_params is not None:
-                with self._network_group.activate(self._network_group_params):
-                    with infer_pipeline as infer:
-                        outputs = infer.infer(inputs)
-            else:
-                with infer_pipeline as infer:
-                    outputs = infer.infer(inputs)
+            # With scheduler mode enabled, explicit network_group.activate() is deprecated.
+            with infer_pipeline as infer:
+                outputs = infer.infer(inputs)
             if not self._output_shapes_logged:
                 self._log_output_shapes(outputs)
                 self._output_shapes_logged = True
@@ -261,7 +257,13 @@ class HailoDetector:
         if not isinstance(outputs, dict):
             return detections
         frame_h, frame_w = (frame_shape if frame_shape else (None, None))
+        hailo_nms_handled = False
         for _, tensor in outputs.items():
+            nms_detections = self._parse_hailo_nms_by_class(tensor, frame_w, frame_h)
+            if nms_detections is not None:
+                hailo_nms_handled = True
+                detections.extend(nms_detections)
+                continue
             if not hasattr(tensor, "shape"):
                 continue
             rows = self._flatten_rows(np.asarray(tensor))
@@ -269,9 +271,156 @@ class HailoDetector:
                 det = self._row_to_detection(row, frame_w, frame_h)
                 if det is not None:
                     detections.append(det)
+        if hailo_nms_handled:
+            detections = self._apply_nms(detections)
+            detections.sort(key=lambda item: float(item.get("confidence", 0.0)), reverse=True)
+            return detections[: self._max_detections]
         detections = self._apply_nms(detections)
         detections.sort(key=lambda item: float(item.get("confidence", 0.0)), reverse=True)
         return detections[: self._max_detections]
+
+    def _parse_hailo_nms_by_class(
+        self,
+        tensor: Any,
+        frame_w: int | None,
+        frame_h: int | None,
+    ) -> List[dict] | None:
+        classes_block: Any | None = None
+        if isinstance(tensor, (list, tuple)):
+            if len(tensor) == 0:
+                return []
+            first = tensor[0]
+            if self._looks_like_hailo_classes_block(first):
+                classes_block = first
+            elif self._looks_like_hailo_classes_block(tensor):
+                classes_block = tensor
+        elif isinstance(tensor, np.ndarray):
+            if tensor.ndim == 3 and int(tensor.shape[-1]) >= 5:
+                classes_block = [tensor[idx] for idx in range(int(tensor.shape[0]))]
+            else:
+                return None
+        else:
+            return None
+
+        if classes_block is None:
+            return None
+
+        detections: List[dict] = []
+        for class_id, raw_rows in enumerate(classes_block):
+            rows = self._extract_nms_rows(raw_rows)
+            if not rows:
+                continue
+            for row in rows:
+                det = self._nms_row_to_detection(row, class_id, frame_w, frame_h)
+                if det is not None:
+                    detections.append(det)
+        return detections
+
+    def _looks_like_hailo_classes_block(self, value: Any) -> bool:
+        if isinstance(value, np.ndarray):
+            return value.ndim == 3 and int(value.shape[-1]) >= 5
+        if not isinstance(value, (list, tuple)):
+            return False
+        if len(value) < 2:
+            return False
+        sample = None
+        for item in value:
+            if isinstance(item, np.ndarray):
+                if item.ndim == 0:
+                    continue
+                if item.size == 0 and item.ndim >= 2 and int(item.shape[-1]) >= 5:
+                    continue
+                sample = item
+                break
+            if isinstance(item, (list, tuple)) and len(item) > 0:
+                sample = item
+                break
+        if sample is None:
+            # Accept all-empty class arrays.
+            return all(isinstance(item, np.ndarray) for item in value)
+        if isinstance(sample, np.ndarray):
+            return sample.ndim >= 2 and int(sample.shape[-1]) >= 5
+        if isinstance(sample, (list, tuple)):
+            first = sample[0]
+            if isinstance(first, (list, tuple, np.ndarray)):
+                arr = np.asarray(first)
+                return arr.ndim >= 1 and arr.size >= 5
+        return False
+
+    def _extract_nms_rows(self, raw_rows: Any) -> List[np.ndarray]:
+        rows: List[np.ndarray] = []
+        if isinstance(raw_rows, np.ndarray):
+            if raw_rows.size == 0:
+                return rows
+            if raw_rows.ndim == 1:
+                row = np.asarray(raw_rows).reshape(-1)
+                if row.size >= 5:
+                    rows.append(row)
+                return rows
+            arr = raw_rows.reshape(-1, int(raw_rows.shape[-1]))
+            for row in arr:
+                flat = np.asarray(row).reshape(-1)
+                if flat.size >= 5:
+                    rows.append(flat)
+            return rows
+        if isinstance(raw_rows, (list, tuple)):
+            for item in raw_rows:
+                arr = np.asarray(item)
+                if arr.size == 0:
+                    continue
+                flat = arr.reshape(-1)
+                if flat.size >= 5:
+                    rows.append(flat)
+        return rows
+
+    def _nms_row_to_detection(
+        self,
+        row: np.ndarray,
+        class_id: int,
+        frame_w: int | None,
+        frame_h: int | None,
+    ) -> dict | None:
+        values = np.asarray(row).reshape(-1)
+        if values.size < 5:
+            return None
+        try:
+            y0 = float(values[0])
+            x0 = float(values[1])
+            y1 = float(values[2])
+            x1 = float(values[3])
+            score = float(values[4])
+        except Exception:
+            return None
+        if score < self._score_threshold:
+            return None
+
+        # HAILO NMS BY CLASS exports boxes as [ymin, xmin, ymax, xmax, score].
+        if frame_w and frame_h and max(abs(x0), abs(y0), abs(x1), abs(y1)) <= 2.0:
+            x0 *= float(frame_w)
+            x1 *= float(frame_w)
+            y0 *= float(frame_h)
+            y1 *= float(frame_h)
+
+        left = min(x0, x1)
+        right = max(x0, x1)
+        top = min(y0, y1)
+        bottom = max(y0, y1)
+
+        if frame_w:
+            left = max(0.0, min(left, float(frame_w - 1)))
+            right = max(0.0, min(right, float(frame_w)))
+        if frame_h:
+            top = max(0.0, min(top, float(frame_h - 1)))
+            bottom = max(0.0, min(bottom, float(frame_h)))
+
+        width = max(1, int(round(right - left)))
+        height = max(1, int(round(bottom - top)))
+        return {
+            "label": f"class_{int(class_id)}",
+            "confidence": float(score),
+            "bbox": [int(round(left)), int(round(top)), width, height],
+            "class_id": int(class_id),
+        }
 
     def _flatten_rows(self, tensor: np.ndarray) -> List[np.ndarray]:
         if tensor.size == 0:
@@ -682,6 +831,17 @@ class Tentacle(BaseTentacle):
         self._safe_hailo_detect = bool(
             self.config.get("vision.safe_hailo_detect", True)
         )
+        try:
+            self._safe_hailo_empty_streak = max(
+                1, min(int(self.config.get("vision.safe_hailo_empty_streak", 4)), 30)
+            )
+        except Exception:
+            self._safe_hailo_empty_streak = 4
+        self._empty_hailo_streak = 0
+        self._secondary_empty_hailo_streak = 0
+        self._detect_timeout_s = max(
+            0.4, float(self.config.get("vision.detect_timeout_seconds", 2.0))
+        )
         self._shape_fallback_detector = OpenCVShapeDetector(self._logger)
         self._detector = self._build_detector()
         self._last_detections: List[dict] = []
@@ -691,6 +851,10 @@ class Tentacle(BaseTentacle):
         self._last_error: str | None = None
         self._last_npu_load: int | None = None
         self._last_monitor_ts = 0.0
+        self._last_primary_infer_ts = 0.0
+        self._last_secondary_infer_ts = 0.0
+        self._primary_infer_fps = 0.0
+        self._secondary_infer_fps = 0.0
         self._jpeg_lock = threading.Lock()
         self._last_jpeg: bytes | None = None
         self._frame_lock = threading.Lock()
@@ -1241,6 +1405,75 @@ class Tentacle(BaseTentacle):
                 npu_lease.release()
             self._detect_lock.release()
 
+    def _is_hailo_detector(self) -> bool:
+        return getattr(self._detector, "name", "") == "hailo"
+
+    def _update_infer_fps(self, *, secondary: bool) -> None:
+        now = time.time()
+        if secondary:
+            last_ts = self._last_secondary_infer_ts
+            prev_fps = self._secondary_infer_fps
+        else:
+            last_ts = self._last_primary_infer_ts
+            prev_fps = self._primary_infer_fps
+        if last_ts > 0.0:
+            delta = max(0.001, now - last_ts)
+            instant = 1.0 / delta
+            ema = instant if prev_fps <= 0.0 else ((0.35 * instant) + (0.65 * prev_fps))
+        else:
+            ema = prev_fps
+        if secondary:
+            self._last_secondary_infer_ts = now
+            if ema > 0.0:
+                self._secondary_infer_fps = ema
+        else:
+            self._last_primary_infer_ts = now
+            if ema > 0.0:
+                self._primary_infer_fps = ema
+
+    async def _detect_frame(self, frame: Any) -> List[dict]:
+        timeout_s = max(0.4, float(self._detect_timeout_s))
+        is_hailo = self._is_hailo_detector()
+        try:
+            try:
+                detections = await asyncio.wait_for(
+                    asyncio.to_thread(self._detect_with_lock, frame),
+                    timeout=timeout_s,
+                )
+            except asyncio.TimeoutError:
+                self._last_error = f"detect_timeout:{timeout_s:.1f}s"
+                if self._safe_hailo_detect and is_hailo:
+                    self._empty_hailo_streak = 0
+                    self._logger.warning(
+                        "Hailo detect timeout after %.1fs, fallback to shape detector.",
+                        timeout_s,
+                    )
+                    return await asyncio.to_thread(self._shape_fallback_detector.detect, frame)
+                return []
+
+            if detections:
+                self._last_error = None
+                self._empty_hailo_streak = 0
+                return detections
+
+            if not (self._safe_hailo_detect and is_hailo):
+                self._empty_hailo_streak = 0
+                return detections
+
+            if self._last_error in {"npu_gate_locked", "detect_lock_timeout"}:
+                self._empty_hailo_streak = 0
+                return await asyncio.to_thread(self._shape_fallback_detector.detect, frame)
+
+            self._empty_hailo_streak += 1
+            if self._empty_hailo_streak >= self._safe_hailo_empty_streak:
+                self._empty_hailo_streak = 0
+                fallback = await asyncio.to_thread(self._shape_fallback_detector.detect, frame)
+                if fallback:
+                    return fallback
+            return detections
+        finally:
+            self._update_infer_fps(secondary=False)
+
     def _ensure_polygon(self, det: dict) -> None:
         if det.get("poly"):
             return
@@ -1477,6 +1710,8 @@ class Tentacle(BaseTentacle):
             "last_ts": self._last_ts,
             "last_frame_ts": self._last_frame_ts,
             "last_count": len(self._last_detections),
+            "infer_fps": round(float(self._primary_infer_fps), 2),
+            "secondary_infer_fps": round(float(self._secondary_infer_fps), 2),
             "last_error": self._last_error,
             "npu_load": self._last_npu_load,
         }
@@ -1588,12 +1823,7 @@ class Tentacle(BaseTentacle):
                 self._last_frame_shape = frame.shape[:2]
                 await asyncio.to_thread(self._update_stream_frame, frame)
                 if self._background_detect:
-                    if self._safe_hailo_detect and getattr(self._detector, "name", "") == "hailo":
-                        detections = await asyncio.to_thread(
-                            self._shape_fallback_detector.detect, frame
-                        )
-                    else:
-                        detections = await asyncio.to_thread(self._detect_with_lock, frame)
+                    detections = await self._detect_frame(frame)
                     detections = self._tag_detections(detections, frame)
                     self._store_detections(detections)
                 else:
@@ -1641,21 +1871,7 @@ class Tentacle(BaseTentacle):
         frame = self._ensure_bgr_frame(frame)
         self._last_frame_shape = frame.shape[:2]
         await asyncio.to_thread(self._update_stream_frame, frame)
-        if self._safe_hailo_detect and getattr(self._detector, "name", "") == "hailo":
-            self._last_error = "hailo_bypassed_safe_mode"
-            detections = await asyncio.to_thread(self._shape_fallback_detector.detect, frame)
-        else:
-            detect_timeout_s = max(
-                0.5, float(self.config.get("vision.detect_timeout_seconds", 2.0))
-            )
-            try:
-                detections = await asyncio.wait_for(
-                    asyncio.to_thread(self._detect_with_lock, frame),
-                    timeout=detect_timeout_s,
-                )
-            except asyncio.TimeoutError:
-                self._last_error = f"detect_timeout:{detect_timeout_s:.1f}s"
-                detections = []
+        detections = await self._detect_frame(frame)
         detections = self._tag_detections(detections, frame)
         self._store_detections(detections)
         return {
@@ -1697,20 +1913,58 @@ class Tentacle(BaseTentacle):
             "status": self.get_status(),
         }
 
+    def _detect_secondary_with_fallback(self, frame: Any) -> List[dict]:
+        detections = self._detect_with_lock(frame)
+        if detections:
+            self._secondary_empty_hailo_streak = 0
+            return detections
+        is_hailo = self._is_hailo_detector()
+        # Secondary stream should tolerate brief lock contention from primary loop.
+        if self._last_error in {"npu_gate_locked", "detect_lock_timeout"}:
+            self._secondary_empty_hailo_streak = 0
+            time.sleep(0.06)
+            detections = self._detect_with_lock(frame)
+            if detections:
+                return detections
+            try:
+                fallback = self._shape_fallback_detector.detect(frame)
+                if fallback:
+                    return fallback
+            except Exception:
+                pass
+            return detections
+
+        if self._safe_hailo_detect and is_hailo:
+            self._secondary_empty_hailo_streak += 1
+            if self._secondary_empty_hailo_streak >= 2:
+                self._secondary_empty_hailo_streak = 0
+                try:
+                    fallback = self._shape_fallback_detector.detect(frame)
+                    if fallback:
+                        return fallback
+                except Exception:
+                    pass
+        else:
+            self._secondary_empty_hailo_streak = 0
+        return detections
+
     def detect_secondary_frame(self, frame: Any) -> dict[str, Any]:
         if frame is None or not hasattr(frame, "shape"):
             raise RuntimeError("Invalid frame")
-        self._last_secondary_frame_shape = frame.shape[:2]
-        detections = self._detect_with_lock(frame)
-        detections = self._tag_detections(detections, frame)
-        self._store_secondary_detections(detections)
-        height, width = self._last_secondary_frame_shape
-        return {
-            "detections": detections,
-            "frame": {"width": width, "height": height},
-            "ts": self._last_secondary_ts,
-            "status": self.get_status(),
-        }
+        try:
+            self._last_secondary_frame_shape = frame.shape[:2]
+            detections = self._detect_secondary_with_fallback(frame)
+            detections = self._tag_detections(detections, frame)
+            self._store_secondary_detections(detections)
+            height, width = self._last_secondary_frame_shape
+            return {
+                "detections": detections,
+                "frame": {"width": width, "height": height},
+                "ts": self._last_secondary_ts,
+                "status": self.get_status(),
+            }
+        finally:
+            self._update_infer_fps(secondary=True)
 
     def get_latest_secondary_detections(self) -> dict[str, Any]:
         width = None

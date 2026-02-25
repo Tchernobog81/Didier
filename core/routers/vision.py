@@ -8,8 +8,91 @@ from core.resource_arbitrator import get_resource_arbitrator
 router = APIRouter()
 DEFAULT_HTTP_TIMEOUT_S = 2.0
 _DETECTIONS_REFRESH_LOCK = asyncio.Lock()
-_DETECTIONS_REFRESH_MIN_INTERVAL_S = 0.8
-_last_detections_refresh_ts = 0.0
+_PRIMARY_DETECTIONS_CACHE_TTL_S = 0.7
+_last_primary_payload_ts = 0.0
+_last_primary_payload: dict[str, Any] | None = None
+_SECONDARY_DETECTIONS_LOCK = asyncio.Lock()
+_SECONDARY_DETECTIONS_MIN_INTERVAL_NOMINAL_S = 1.2
+_SECONDARY_DETECTIONS_MIN_INTERVAL_TENDU_S = 2.0
+_SECONDARY_DETECTIONS_MIN_INTERVAL_SURVIE_S = 3.5
+_SECONDARY_NON_EMPTY_HOLD_TTL_S = 4.0
+_last_secondary_refresh_ts = 0.0
+_last_secondary_payload: dict[str, Any] | None = None
+_last_secondary_non_empty_ts = 0.0
+_last_secondary_non_empty_payload: dict[str, Any] | None = None
+
+
+def _shape_from_poly(poly: list[Any]) -> str:
+    points = [pt for pt in poly if isinstance(pt, (list, tuple)) and len(pt) >= 2]
+    count = len(points)
+    if count <= 2:
+        return "segment"
+    if count == 3:
+        return "triangle"
+    if count == 4:
+        return "quadrilatere"
+    if count <= 7:
+        return "polygone"
+    return "arrondi"
+
+
+def _enrich_detection_shapes(payload: dict[str, Any]) -> dict[str, Any]:
+    data = dict(payload or {})
+    detections = data.get("detections", [])
+    if not isinstance(detections, list):
+        data["detections"] = []
+        return data
+    enriched: list[dict[str, Any]] = []
+    for item in detections:
+        if not isinstance(item, dict):
+            continue
+        det = dict(item)
+        poly = det.get("poly", [])
+        if isinstance(poly, list) and len(poly) >= 3 and not det.get("shape"):
+            det["shape"] = _shape_from_poly(poly)
+        enriched.append(det)
+    data["detections"] = enriched
+    return data
+
+
+def _secondary_empty_payload(reason: str, stream_ts: float = 0.0) -> dict[str, Any]:
+    return {
+        "detections": [],
+        "frame": {"width": None, "height": None},
+        "ts": 0.0,
+        "stream_ts": float(stream_ts or 0.0),
+        "status": {"state": str(reason)},
+        "source": "secondary_empty",
+    }
+
+
+def _secondary_hold_last_non_empty(now: float, stream_ts: float = 0.0) -> dict[str, Any] | None:
+    if _last_secondary_non_empty_payload is None:
+        return None
+    if (now - _last_secondary_non_empty_ts) > _SECONDARY_NON_EMPTY_HOLD_TTL_S:
+        return None
+    held = _enrich_detection_shapes(dict(_last_secondary_non_empty_payload))
+    held["stream_ts"] = float(stream_ts or held.get("stream_ts", 0.0) or 0.0)
+    status = held.get("status")
+    if not isinstance(status, dict):
+        status = {}
+    status["state"] = "hold_last_non_empty"
+    held["status"] = status
+    held["source"] = "secondary_hold_non_empty"
+    return held
+
+
+def _secondary_min_interval_s(arbitrator: Any) -> float:
+    try:
+        snap = arbitrator.snapshot()
+    except Exception:
+        snap = {}
+    mode = str((snap or {}).get("mode", "NOMINAL")).upper()
+    if mode == "SURVIE":
+        return _SECONDARY_DETECTIONS_MIN_INTERVAL_SURVIE_S
+    if mode == "TENDU":
+        return _SECONDARY_DETECTIONS_MIN_INTERVAL_TENDU_S
+    return _SECONDARY_DETECTIONS_MIN_INTERVAL_NOMINAL_S
 
 
 @router.get("/vision/capture")
@@ -198,85 +281,200 @@ async def vision_detect() -> dict[str, Any]:
 async def vision_detections() -> dict[str, Any]:
     from core import runtime_bridge as api_module
 
+    global _last_primary_payload_ts, _last_primary_payload
+    now = api_module.time.time()
+    if (
+        _last_primary_payload is not None
+        and (now - _last_primary_payload_ts) < _PRIMARY_DETECTIONS_CACHE_TTL_S
+    ):
+        cached = _enrich_detection_shapes(dict(_last_primary_payload))
+        cached["source"] = "primary_cache"
+        return cached
+
     orchestrator = api_module._require_orchestrator()
     vision = orchestrator.get_tentacle("vision")
     if not vision:
         raise HTTPException(status_code=503, detail="vision tentacle not loaded")
     if not hasattr(vision, "get_latest_detections"):
         raise HTTPException(status_code=501, detail="vision detections not supported")
-    data = vision.get_latest_detections()
-    if not isinstance(data, dict):
+    if _DETECTIONS_REFRESH_LOCK.locked():
+        if _last_primary_payload is not None:
+            cached = _enrich_detection_shapes(dict(_last_primary_payload))
+            cached["source"] = "primary_cache_locked"
+            return cached
         return {"detections": [], "frame": {"width": None, "height": None}, "ts": 0.0}
 
-    # Passive mode: if background detection is disabled/stale, refresh at low frequency.
-    last_ts = float(data.get("ts", 0.0) or 0.0)
-    now = api_module.time.time()
-    refresh_max_age_s = max(
-        0.5,
-        float(orchestrator.config.get("vision.on_demand_refresh_max_age_seconds", 1.5)),
-    )
-    background_detect_enabled = bool(orchestrator.config.get("vision.background_detect", True))
-    detections = data.get("detections") if isinstance(data.get("detections"), list) else []
-    needs_refresh = (now - last_ts) > refresh_max_age_s
-    if not background_detect_enabled and len(detections) == 0:
-        needs_refresh = True
-    if needs_refresh and hasattr(vision, "detect_once"):
-        global _last_detections_refresh_ts
+    async with _DETECTIONS_REFRESH_LOCK:
+        now = api_module.time.time()
         if (
-            not _DETECTIONS_REFRESH_LOCK.locked()
-            and (now - _last_detections_refresh_ts) >= _DETECTIONS_REFRESH_MIN_INTERVAL_S
+            _last_primary_payload is not None
+            and (now - _last_primary_payload_ts) < _PRIMARY_DETECTIONS_CACHE_TTL_S
         ):
-            async with _DETECTIONS_REFRESH_LOCK:
-                refresh_now = api_module.time.time()
-                if (refresh_now - _last_detections_refresh_ts) >= _DETECTIONS_REFRESH_MIN_INTERVAL_S:
-                    _last_detections_refresh_ts = refresh_now
-                    arbitrator = get_resource_arbitrator()
-                    if arbitrator.request_resource("npu_inference"):
-                        try:
-                            await asyncio.wait_for(vision.detect_once(), timeout=2.0)
-                            refreshed = vision.get_latest_detections()
-                            if isinstance(refreshed, dict):
-                                refreshed["source"] = "on_demand_refresh"
-                                return refreshed
-                        except Exception:
-                            pass
-    return data
+            cached = _enrich_detection_shapes(dict(_last_primary_payload))
+            cached["source"] = "primary_cache"
+            return cached
+        try:
+            data = await asyncio.wait_for(
+                api_module.asyncio.to_thread(vision.get_latest_detections),
+                timeout=0.15,
+            )
+        except asyncio.TimeoutError:
+            if _last_primary_payload is not None:
+                cached = _enrich_detection_shapes(dict(_last_primary_payload))
+                cached["source"] = "primary_timeout_cache"
+                return cached
+            return {
+                "detections": [],
+                "frame": {"width": None, "height": None},
+                "ts": 0.0,
+                "source": "primary_timeout",
+            }
+        except Exception:
+            if _last_primary_payload is not None:
+                cached = _enrich_detection_shapes(dict(_last_primary_payload))
+                cached["source"] = "primary_error_cache"
+                return cached
+            return {
+                "detections": [],
+                "frame": {"width": None, "height": None},
+                "ts": 0.0,
+                "source": "primary_error",
+            }
+        if not isinstance(data, dict):
+            data = {"detections": [], "frame": {"width": None, "height": None}, "ts": 0.0}
+        data = _enrich_detection_shapes(data)
+        _last_primary_payload = dict(data)
+        _last_primary_payload_ts = api_module.time.time()
+        return data
 
 
 @router.get("/vision/detections-secondary")
 async def vision_detections_secondary() -> dict[str, Any]:
     from core import runtime_bridge as api_module
 
+    global _last_secondary_refresh_ts, _last_secondary_payload
+    global _last_secondary_non_empty_ts, _last_secondary_non_empty_payload
     arbitrator = get_resource_arbitrator()
+    min_interval_s = _secondary_min_interval_s(arbitrator)
+    now = api_module.time.time()
+    if (
+        _last_secondary_payload is not None
+        and (now - _last_secondary_refresh_ts) < min_interval_s
+    ):
+        cached_detections = _last_secondary_payload.get("detections", [])
+        if isinstance(cached_detections, list) and not cached_detections:
+            held = _secondary_hold_last_non_empty(now)
+            if held is not None:
+                return held
+        cached = _enrich_detection_shapes(dict(_last_secondary_payload))
+        cached["source"] = "secondary_cache"
+        return cached
+
     if not arbitrator.request_resource("secondary_stream"):
-        raise HTTPException(status_code=503, detail="arbitration_denied:secondary_stream")
+        held = _secondary_hold_last_non_empty(now)
+        if held is not None:
+            status = held.get("status")
+            if not isinstance(status, dict):
+                status = {}
+            status["state"] = "hold_last_non_empty:arbitration_denied:secondary_stream"
+            held["status"] = status
+            held["source"] = "secondary_hold_non_empty"
+            return held
+        return _secondary_empty_payload("arbitration_denied:secondary_stream")
     orchestrator = api_module._require_orchestrator()
     vision = orchestrator.get_tentacle("vision")
     if not vision:
-        raise HTTPException(status_code=503, detail="vision tentacle not loaded")
+        return _secondary_empty_payload("vision tentacle not loaded")
     if not hasattr(vision, "detect_secondary_frame"):
-        raise HTTPException(status_code=501, detail="secondary detections not supported")
+        return _secondary_empty_payload("secondary detections not supported")
     cfg = orchestrator.config.get("vision.remote_stream", {}) or {}
     if not cfg.get("enabled", True):
-        raise HTTPException(status_code=404, detail="secondary stream disabled")
+        return _secondary_empty_payload("secondary stream disabled")
     input_url = cfg.get("input_url", "udp://0.0.0.0:1234")
     fps = int(cfg.get("fps", 15))
     if not input_url:
-        raise HTTPException(status_code=400, detail="input_url required")
+        return _secondary_empty_payload("input_url required")
     stream = api_module._get_remote_stream(str(input_url), fps=fps)
-    frame_bytes, ts = stream.get_last()
-    if not frame_bytes:
-        raise HTTPException(status_code=503, detail="secondary stream not ready")
-    frame = await api_module.asyncio.to_thread(
-        api_module.cv2.imdecode,
-        api_module.np.frombuffer(frame_bytes, api_module.np.uint8),
-        api_module.cv2.IMREAD_COLOR,
-    )
-    if frame is None:
-        raise HTTPException(status_code=503, detail="secondary frame decode failed")
-    data = await api_module.asyncio.to_thread(vision.detect_secondary_frame, frame)
-    data["stream_ts"] = ts
-    return data
+    if _SECONDARY_DETECTIONS_LOCK.locked():
+        if _last_secondary_payload is not None:
+            cached_detections = _last_secondary_payload.get("detections", [])
+            if isinstance(cached_detections, list) and not cached_detections:
+                held = _secondary_hold_last_non_empty(now)
+                if held is not None:
+                    return held
+            cached = _enrich_detection_shapes(dict(_last_secondary_payload))
+            cached["source"] = "secondary_cache_locked"
+            return cached
+        return _secondary_empty_payload("secondary detection busy")
+
+    async with _SECONDARY_DETECTIONS_LOCK:
+        now = api_module.time.time()
+        min_interval_s = _secondary_min_interval_s(arbitrator)
+        if (
+            _last_secondary_payload is not None
+            and (now - _last_secondary_refresh_ts) < min_interval_s
+        ):
+            cached_detections = _last_secondary_payload.get("detections", [])
+            if isinstance(cached_detections, list) and not cached_detections:
+                held = _secondary_hold_last_non_empty(now)
+                if held is not None:
+                    return held
+            cached = _enrich_detection_shapes(dict(_last_secondary_payload))
+            cached["source"] = "secondary_cache"
+            return cached
+
+        frame_bytes, ts = stream.get_last()
+        if not frame_bytes:
+            if _last_secondary_payload is not None:
+                cached = _enrich_detection_shapes(dict(_last_secondary_payload))
+                cached["source"] = "secondary_stale_cache"
+                return cached
+            return _secondary_empty_payload("secondary stream not ready", stream_ts=ts)
+        frame = await api_module.asyncio.to_thread(
+            api_module.cv2.imdecode,
+            api_module.np.frombuffer(frame_bytes, api_module.np.uint8),
+            api_module.cv2.IMREAD_COLOR,
+        )
+        if frame is None:
+            if _last_secondary_payload is not None:
+                cached = _enrich_detection_shapes(dict(_last_secondary_payload))
+                cached["source"] = "secondary_decode_cache"
+                return cached
+            return _secondary_empty_payload("secondary frame decode failed", stream_ts=ts)
+        try:
+            timeout_s = 1.0 if min_interval_s <= 1.3 else 0.85
+            data = await asyncio.wait_for(
+                api_module.asyncio.to_thread(vision.detect_secondary_frame, frame),
+                timeout=timeout_s,
+            )
+        except asyncio.TimeoutError:
+            if _last_secondary_payload is not None:
+                cached = _enrich_detection_shapes(dict(_last_secondary_payload))
+                cached["source"] = "secondary_timeout_cache"
+                return cached
+            return _secondary_empty_payload("secondary detection timeout", stream_ts=ts)
+        except Exception:
+            if _last_secondary_payload is not None:
+                cached = _enrich_detection_shapes(dict(_last_secondary_payload))
+                cached["source"] = "secondary_error_cache"
+                return cached
+            return _secondary_empty_payload("secondary detection failed", stream_ts=ts)
+        data["stream_ts"] = ts
+        data = _enrich_detection_shapes(data)
+        _last_secondary_payload = dict(data)
+        _last_secondary_refresh_ts = api_module.time.time()
+        detections = data.get("detections", [])
+        if isinstance(detections, list) and detections:
+            _last_secondary_non_empty_payload = dict(data)
+            _last_secondary_non_empty_ts = _last_secondary_refresh_ts
+        else:
+            held = _secondary_hold_last_non_empty(
+                now=_last_secondary_refresh_ts,
+                stream_ts=ts,
+            )
+            if held is not None:
+                return held
+        return data
 
 
 @router.get("/vision/status-secondary")
@@ -325,39 +523,6 @@ async def video_stream():
     primary_fallback_secondary = bool(
         orchestrator.config.get("vision.primary_fallback_secondary", False)
     )
-    if vision and live_enabled and hasattr(vision, "get_latest_jpeg"):
-        primary_stream_stale = False
-        if hasattr(vision, "get_status"):
-            try:
-                status = vision.get_status()
-                last_frame_ts = float(status.get("last_frame_ts", 0.0) or 0.0)
-                if last_frame_ts > 0.0:
-                    age_s = max(0.0, api_module.time.time() - last_frame_ts)
-                    stale_after_s = max(
-                        1.0,
-                        float(
-                            orchestrator.config.get(
-                                "vision.primary_stale_fallback_seconds", 2.5
-                            )
-                        ),
-                    )
-                    primary_stream_stale = age_s > stale_after_s
-            except Exception:
-                primary_stream_stale = False
-
-        if primary_stream_stale and primary_fallback_secondary:
-            cfg = orchestrator.config.get("vision.remote_stream", {}) or {}
-            if cfg.get("enabled", True) and cfg.get("input_url"):
-                fps = arbitrator.get_target_fps(default=int(cfg.get("fps", 15)))
-                stream = api_module._get_remote_stream(str(cfg.get("input_url")), fps=fps)
-                return api_module.StreamingResponse(
-                    api_module._remote_mjpeg_generator(stream),
-                    media_type="multipart/x-mixed-replace; boundary=frame",
-                )
-        return api_module.StreamingResponse(
-            api_module._mjpeg_generator_from_vision(vision),
-            media_type="multipart/x-mixed-replace; boundary=frame",
-        )
 
     def _secondary_stream_response():
         if not arbitrator.request_resource("secondary_stream"):
@@ -376,6 +541,43 @@ async def video_stream():
             api_module._remote_mjpeg_generator(stream),
             media_type="multipart/x-mixed-replace; boundary=frame",
         )
+
+    if vision and live_enabled and hasattr(vision, "get_latest_jpeg"):
+        cached_jpeg = None
+        primary_stream_stale = True
+        stale_after_s = max(
+            1.0,
+            float(
+                orchestrator.config.get("vision.primary_stale_fallback_seconds", 2.5)
+            ),
+        )
+        try:
+            cached_jpeg = vision.get_latest_jpeg()
+            primary_stream_stale = not bool(cached_jpeg)
+        except Exception:
+            cached_jpeg = None
+            primary_stream_stale = True
+        if hasattr(vision, "get_status"):
+            try:
+                status = vision.get_status()
+                last_frame_ts = float(status.get("last_frame_ts", 0.0) or 0.0)
+                if last_frame_ts > 0.0:
+                    age_s = max(0.0, api_module.time.time() - last_frame_ts)
+                    primary_stream_stale = (age_s > stale_after_s) or (not bool(cached_jpeg))
+                elif cached_jpeg:
+                    primary_stream_stale = False
+            except Exception:
+                primary_stream_stale = not bool(cached_jpeg)
+
+        if not primary_stream_stale:
+            return api_module.StreamingResponse(
+                api_module._mjpeg_generator_from_vision(vision),
+                media_type="multipart/x-mixed-replace; boundary=frame",
+            )
+        if primary_fallback_secondary:
+            fallback = _secondary_stream_response()
+            if fallback is not None:
+                return fallback
 
     # Primary stream should target PS3 by default (no implicit fallback to Surface).
     # If needed, fallback can be explicitly re-enabled via config.

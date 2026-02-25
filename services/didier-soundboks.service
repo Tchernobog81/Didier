@@ -17,10 +17,10 @@ RestartSec=2s
 TimeoutStartSec=20s
 TimeoutStopSec=10s
 KillSignal=SIGTERM
+CPUQuota=20%
 Nice=8
 StandardOutput=journal
 StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
-

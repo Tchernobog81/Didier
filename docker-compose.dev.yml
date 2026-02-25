@@ -97,6 +97,25 @@ services:
         max-size: "50m"
         max-file: "5"
 
+  # Service 3: Picobot (agent Go léger) en mode Doctrine Speedy.
+  picobot:
+    image: louisho5/picobot:latest
+    container_name: didier-picobot
+    restart: unless-stopped
+    network_mode: "host"
+    user: "1000:1000"
+    environment:
+      - OPENAI_API_BASE=http://127.0.0.1:11434/v1
+      - OPENAI_API_KEY=ollama
+      - PICOBOT_MODEL=qwen2.5:1.5b
+    volumes:
+      - ./picobot_data:/home/picobot/.picobot
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
   reverse-proxy:
     image: nginx:alpine
     container_name: didier-proxy

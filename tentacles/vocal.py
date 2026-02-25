@@ -35,10 +35,15 @@ class Tentacle(BaseTentacle):
         )
         self._voice = self.config.get("tts.voice", "af_bella")
         self._lang = self.config.get("tts.lang", "fr-fr")
+        self._subprocess_timeout_s = max(
+            0.1,
+            min(float(self.config.get("tts.subprocess_timeout_seconds", 2.0)), 2.0),
+        )
+        self._queue_maxsize = max(1, int(self.config.get("tts.queue_maxsize", 8)))
         self._output_path = Path(
             self.config.get("tts.output_path", "data/didier_speaks.wav")
         )
-        self._queue: asyncio.Queue[str] = asyncio.Queue()
+        self._queue: asyncio.Queue[str] = asyncio.Queue(maxsize=self._queue_maxsize)
         self._kokoro: Optional[Kokoro] = None
         self._enabled = True
 
@@ -64,7 +69,10 @@ class Tentacle(BaseTentacle):
         if not self._enabled:
             self._logger.warning("Vocal tentacle disabled; dropping speech.")
             return
-        await self._queue.put(text)
+        try:
+            self._queue.put_nowait(text)
+        except asyncio.QueueFull:
+            self._logger.warning("Vocal queue saturated, dropping speech request.")
 
     async def beep(self) -> None:
         if not self._enabled:
@@ -161,12 +169,20 @@ class Tentacle(BaseTentacle):
             self._logger.error("paplay is not available in PATH.")
             return
         try:
-            subprocess.run(["paplay", "-d", self._sink, str(path)], check=True)
+            subprocess.run(
+                ["paplay", "-d", self._sink, str(path)],
+                check=True,
+                timeout=self._subprocess_timeout_s,
+            )
         except subprocess.CalledProcessError:
             self._logger.warning("paplay failed, attempting Bluetooth reconnect.")
             if self._reconnect_bluetooth():
                 try:
-                    subprocess.run(["paplay", "-d", self._sink, str(path)], check=True)
+                    subprocess.run(
+                        ["paplay", "-d", self._sink, str(path)],
+                        check=True,
+                        timeout=self._subprocess_timeout_s,
+                    )
                     return
                 except subprocess.CalledProcessError:
                     self._logger.exception("paplay failed after reconnect.")
@@ -188,6 +204,7 @@ class Tentacle(BaseTentacle):
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=self._subprocess_timeout_s,
             )
             if result.returncode != 0:
                 self._logger.warning(

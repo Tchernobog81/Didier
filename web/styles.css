@@ -682,6 +682,28 @@ body {
   white-space: pre-wrap;
 }
 
+.didier-tech {
+  margin-top: 10px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: rgba(10, 15, 24, 0.45);
+  overflow: hidden;
+}
+
+.didier-tech summary {
+  cursor: pointer;
+  padding: 8px 10px;
+  font-size: 11px;
+  color: var(--muted);
+  user-select: text;
+}
+
+.didier-tech-output {
+  margin: 0 10px 10px;
+  height: 140px;
+  font-size: 11px;
+}
+
 .terminal-compact {
   height: 160px;
 }
@@ -1545,6 +1567,114 @@ body {
   gap: 12px;
 }
 
+.picobot-tools {
+  margin-top: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgba(15, 23, 42, 0.62), rgba(15, 23, 42, 0.44));
+  padding: 12px;
+  display: grid;
+  gap: 10px;
+}
+
+.picobot-tools-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+
+.picobot-tools-head h3 {
+  margin: 0;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #fca5a5;
+}
+
+.picobot-tools-meta {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.picobot-tools-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.picobot-tools-column {
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.54);
+  padding: 10px;
+  display: grid;
+  gap: 8px;
+}
+
+.picobot-tools-column h4 {
+  margin: 0;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #cbd5e1;
+}
+
+.picobot-tools-list {
+  display: grid;
+  gap: 8px;
+}
+
+.picobot-tool-item {
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.7);
+  padding: 8px 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.picobot-tool-item.is-disabled {
+  border-color: rgba(245, 158, 11, 0.5);
+  background: rgba(245, 158, 11, 0.12);
+}
+
+.picobot-tool-item.is-missing {
+  border-color: rgba(239, 68, 68, 0.55);
+  background: rgba(239, 68, 68, 0.15);
+}
+
+.picobot-tool-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: #e2e8f0;
+  word-break: break-word;
+}
+
+.picobot-tool-left {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.picobot-tool-meta {
+  font-size: 11px;
+  color: var(--muted);
+  word-break: break-word;
+}
+
+.picobot-tool-pill {
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  color: #cbd5e1;
+}
+
 .picobot-lane {
   border: 1px solid rgba(148, 163, 184, 0.22);
   border-radius: 14px;
@@ -1932,6 +2062,39 @@ form {
   margin-top: 12px;
 }
 
+#didier-form {
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.didier-boost-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.65);
+  color: var(--muted);
+  padding: 10px 12px;
+  line-height: 1;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.didier-boost-toggle input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  cursor: pointer;
+}
+
+.didier-boost-toggle span {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
 input[type="text"] {
   flex: 1;
   padding: 12px 14px;
@@ -2038,6 +2201,9 @@ button {
     grid-template-columns: 1fr;
   }
   .picobot-board {
+    grid-template-columns: 1fr;
+  }
+  .picobot-tools-grid {
     grid-template-columns: 1fr;
   }
   .actuator-rename {

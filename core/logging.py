@@ -91,6 +91,26 @@ def setup_logging(log_dir: str | None = None, level: str | None = None) -> None:
                     "level": level,
                     "propagate": False,
                 },
+                "pyhailort": {
+                    "handlers": ["console", "file"],
+                    "level": "ERROR",
+                    "propagate": False,
+                },
+                "hailo_platform": {
+                    "handlers": ["console", "file"],
+                    "level": "ERROR",
+                    "propagate": False,
+                },
+                "httpx": {
+                    "handlers": ["console", "file"],
+                    "level": "WARNING",
+                    "propagate": False,
+                },
+                "httpcore": {
+                    "handlers": ["console", "file"],
+                    "level": "WARNING",
+                    "propagate": False,
+                },
             },
             "root": {
                 "handlers": ["console", "file"],

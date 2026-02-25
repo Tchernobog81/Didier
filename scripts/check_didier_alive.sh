@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -u
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$("${SCRIPT_DIR}/preflight_repo_root.sh")"
+cd "${REPO_ROOT}"
+
 BASE_URL="${BASE_URL:-http://127.0.0.1:5010}"
 CURL_TIMEOUT="${CURL_TIMEOUT:-20}"
 READY_WAIT_S="${READY_WAIT_S:-45}"
@@ -75,15 +79,15 @@ printf '%s\n' "${health}"
 check_contains "API health endpoint reachable" "${health}" "\"status\""
 
 print_sep
-printf '2) Scenario task voice-like -> OpenClaw\n'
+printf '2) Scenario task voice-like -> Picobot\n'
 s1_payload='{"prompt":"Yo Didier, allume la lumiere de la cuisine","force_task":true}'
 s1="$(post_json "/ask-and-speak" "${s1_payload}" 2>/dev/null || true)"
 printf '%s\n' "${s1}"
 check_contains "Scenario 1 response present" "${s1}" "\"response\""
-if printf '%s' "${s1}" | grep -q "\"route\":\"openclaw\""; then
-  mark_pass "Scenario 1 routed to openclaw"
+if printf '%s' "${s1}" | grep -q "\"route\":\"picobot\""; then
+  mark_pass "Scenario 1 routed to picobot"
 else
-  mark_fail "Scenario 1 route=openclaw missing"
+  mark_fail "Scenario 1 route=picobot missing"
 fi
 
 print_sep
@@ -102,13 +106,13 @@ printf '%s\n' "${s3}"
 check_contains "Scenario 3 response present" "${s3}" "\"response\""
 
 print_sep
-printf '5) OpenClaw tasks snapshot\n'
+printf '5) Picobot tasks snapshot\n'
 tasks="$(get_json "/agent/tasks" 2>/dev/null || true)"
 printf '%s\n' "${tasks}"
 check_contains "/agent/tasks endpoint reachable" "${tasks}" "\"tasks\""
 
 print_sep
-printf '6) OpenClaw metrics snapshot\n'
+printf '6) Picobot metrics snapshot\n'
 metrics="$(get_json "/agent/metrics?timeout_s=2" 2>/dev/null || true)"
 printf '%s\n' "${metrics}"
 check_contains "/agent/metrics endpoint reachable" "${metrics}" "\"ok\""

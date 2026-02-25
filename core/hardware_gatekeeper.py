@@ -50,6 +50,28 @@ class HardwareGatekeeper:
     def __init__(self) -> None:
         self._state_lock = threading.Lock()
         self._held: dict[str, dict[str, object]] = {}
+        try:
+            os.register_at_fork(after_in_child=self._after_fork_in_child)
+        except Exception:
+            pass
+
+    def _after_fork_in_child(self) -> None:
+        """Child process must not inherit parent hardware locks."""
+        with self._state_lock:
+            held = list(self._held.items())
+            self._held = {}
+        for _key, state in held:
+            fd = state.get("fd")
+            if fd is None:
+                continue
+            try:
+                fcntl.flock(int(fd), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                os.close(int(fd))
+            except Exception:
+                pass
 
     def _lock_path(self, resource: str) -> Path:
         safe = "".join(ch for ch in str(resource).strip().lower() if ch.isalnum() or ch in {"_", "-"})

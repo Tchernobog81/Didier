@@ -37,12 +37,12 @@
         "wifi"
       ],
       "last_command": {
-        "ts": 1771405981.6323671,
+        "ts": 1771786721.909482,
         "action": "off",
         "params": {}
       },
       "last_validation": {
-        "ts": 1771087596.6139562,
+        "ts": 1771536325.082699,
         "result": "ok"
       }
     },
@@ -60,7 +60,7 @@
         "wifi"
       ],
       "last_command": {
-        "ts": 1771424464.6932633,
+        "ts": 1771519555.733403,
         "action": "off",
         "params": {}
       },
@@ -106,8 +106,8 @@
         "wifi"
       ],
       "last_command": {
-        "ts": 1771088876.7720592,
-        "action": "off",
+        "ts": 1772041275.491015,
+        "action": "on",
         "params": {}
       },
       "last_validation": {

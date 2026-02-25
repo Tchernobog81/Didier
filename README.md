@@ -113,4 +113,27 @@ Monitoring:
 
 Le guide communautaire est dans `CONTRIBUTING.md` (workflow PR, tests minimum, conventions de config).
 
+## Repo Safety (Mandatory)
+
+Toujours lancer les commandes depuis la racine valide:
+```bash
+bash scripts/preflight_repo_root.sh --assert-cwd
+```
+
+Entrée sécurisée (force le bon dossier avant commande):
+```bash
+bash scripts/codex_entry.sh <commande>
+```
+
+Activer les hooks versionnés (une fois par clone):
+```bash
+bash scripts/install_githooks.sh
+```
+
+Chaque commit qui modifie du code doit aussi mettre à jour:
+- `VERSION`
+- `RELEASE_NOTES.md`
+
+Le hook `pre-commit` bloque automatiquement sinon.
+
 Licence: MIT

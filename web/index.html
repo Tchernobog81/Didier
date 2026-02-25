@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Didier — Console</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260225-v4r4-hardware-models" />
+    <link rel="stylesheet" href="/static/styles.css?v=__ASSET_TAG__" />
   </head>
   <body>
     <div class="bg"></div>
@@ -31,7 +31,7 @@
             <h1>Didier</h1>
             <p>
               Raspberry Pi 5 · Orchestrateur
-              <span class="ui-version">V4r4 · 2026-02-25</span>
+              <span class="ui-version" id="ui-version-text">__UI_VERSION__</span>
             </p>
           </div>
         </div>
@@ -57,12 +57,6 @@
             <span class="pill-status">--</span>
           </span>
         </div>
-      </div>
-      <div class="header-right">
-        <button type="button" class="wake-test-btn" id="wake-loop-test-btn" disabled>
-          Wake en pause
-        </button>
-        <div class="wake-test-result" id="wake-loop-test-result">Suspendu</div>
       </div>
     </header>
 
@@ -186,8 +180,16 @@
             placeholder="Message pour Didier…"
             autocomplete="off"
           />
+          <label class="didier-boost-toggle" for="didier-boost">
+            <input type="checkbox" id="didier-boost" />
+            <span>Boost</span>
+          </label>
           <button type="submit">Envoyer</button>
         </form>
+        <details class="didier-tech" id="didier-tech-panel">
+          <summary>Diagnostic technique</summary>
+          <div class="terminal terminal-compact didier-tech-output" id="didier-tech-output"></div>
+        </details>
       </section>
     </main>
 
@@ -257,6 +259,22 @@
             <div class="picobot-timeline" id="picobot-timeline"></div>
           </section>
         </div>
+        <section class="picobot-tools">
+          <div class="picobot-tools-head">
+            <h3>Outils Picobot</h3>
+            <span class="picobot-tools-meta" id="picobot-tools-meta">--</span>
+          </div>
+          <div class="picobot-tools-grid">
+            <article class="picobot-tools-column">
+              <h4>Built-in</h4>
+              <div class="picobot-tools-list" id="picobot-builtin-tools"></div>
+            </article>
+            <article class="picobot-tools-column">
+              <h4>Configurés</h4>
+              <div class="picobot-tools-list" id="picobot-configured-tools"></div>
+            </article>
+          </div>
+        </section>
       </section>
     </main>
 
@@ -313,6 +331,6 @@
       </section>
     </main>
 
-    <script src="/static/app.js?v=20260225-v4r4-hardware-models"></script>
+    <script src="/static/app.js?v=__ASSET_TAG__"></script>
   </body>
 </html>

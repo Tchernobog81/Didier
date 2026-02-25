@@ -44,3 +44,19 @@ Extension modules should expose deterministic health snapshots and degrade safel
 - Keep commits focused by module or feature.
 - Use imperative subject lines (`add routing device gating`, `fix llmfit timeout fallback`).
 - Include affected services/endpoints in the commit body when runtime behavior changes.
+
+## Release Discipline (Hard Rule)
+
+If a commit includes code changes, it must also include:
+1. `VERSION` update
+2. `RELEASE_NOTES.md` update
+
+This rule is enforced by the versioned pre-commit hook:
+```bash
+bash scripts/install_githooks.sh
+```
+
+Quick release bump helper:
+```bash
+bash scripts/bump_release.sh "didier-vXrY-your-suffix" "Short summary"
+```

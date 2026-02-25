@@ -36,6 +36,13 @@ class Orchestrator:
         self._tentacles: List[BaseTentacle] = []
         self._tentacle_map: dict[str, BaseTentacle] = {}
         self._stop_event = asyncio.Event()
+        self._startup_order = {
+            "actuators": 10,
+            "brain": 20,
+            "music": 30,
+            "vocal": 40,
+            "vision": 50,
+        }
 
     @property
     def config(self) -> DidierConfig:
@@ -47,7 +54,11 @@ class Orchestrator:
             return []
 
         modules = []
-        for path in sorted(self._tentacles_path.glob("*.py")):
+        paths = sorted(
+            self._tentacles_path.glob("*.py"),
+            key=lambda p: (self._startup_order.get(p.stem, 100), p.stem),
+        )
+        for path in paths:
             if path.name.startswith("_") or path.name == "base.py":
                 continue
             if self._asr_worker_mode and path.stem == "hearing":
@@ -81,7 +92,11 @@ class Orchestrator:
             if not tentacle_cls:
                 continue
             try:
-                tentacle = tentacle_cls(self._config, orchestrator=self)
+                tentacle = await asyncio.to_thread(
+                    tentacle_cls,
+                    self._config,
+                    orchestrator=self,
+                )
             except Exception:
                 self._logger.exception(
                     "Failed to instantiate tentacle %s", module.__name__

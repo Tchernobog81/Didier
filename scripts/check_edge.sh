@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$("${SCRIPT_DIR}/preflight_repo_root.sh")"
+cd "${REPO_ROOT}"
+
 ENTRY_BASE="${DIDIER_ENTRY_BASE:-http://127.0.0.1:5010}"
 API_BASE="${DIDIER_API_BASE:-${ENTRY_BASE}}"
 VISION_BASE="${DIDIER_VISION_BASE:-http://127.0.0.1:5011}"
@@ -14,6 +18,9 @@ HITS="${DIDIER_CHECK_HITS:-10}"
 CURL_TIMEOUT="${DIDIER_CHECK_TIMEOUT:-2}"
 LLM_TIMEOUT="${DIDIER_CHECK_LLM_TIMEOUT:-12}"
 TTS_TIMEOUT="${DIDIER_CHECK_TTS_TIMEOUT:-5}"
+IDLE_TARGET="${DIDIER_IDLE_TARGET:-0.3}"
+IDLE_WAIT_S="${DIDIER_IDLE_WAIT_S:-20}"
+ASK_TIMEOUT="${DIDIER_CHECK_ASK_TIMEOUT:-25}"
 
 FAILURES=0
 START_TS="$(date +%s.%N)"
@@ -56,6 +63,19 @@ extract_status() {
       sub(/".*$/, "", line)
       print line
       exit
+    }
+  '
+}
+
+extract_json_bool() {
+  local key="$1"
+  awk -v k="\"${key}\"" '
+    index($0, k) {
+      pos = index($0, k)
+      line = substr($0, pos + length(k))
+      sub(/^[[:space:]]*:[[:space:]]*/, "", line)
+      if (line ~ /^true/) { print "true"; exit }
+      if (line ~ /^false/) { print "false"; exit }
     }
   '
 }
@@ -209,6 +229,63 @@ single_speak_stub() {
   fi
 }
 
+check_agent_react() {
+  local body ok
+  body="$(curl -sS --max-time "${CURL_TIMEOUT}" \
+    -X POST -H "Content-Type: application/json" \
+    --data '{"prompt":"edge check react","react_wake_mode":"now","react_timeout_s":2}' \
+    "${ENTRY_BASE}/agent/react" || true)"
+  ok="$(printf "%s" "${body}" | extract_json_bool "ok")"
+  if [[ "${ok}" == "true" ]]; then
+    printf "CHECK /agent/react          => OK\n"
+  else
+    printf "CHECK /agent/react          => FAIL\n"
+    FAILURES=$((FAILURES + 1))
+  fi
+}
+
+check_wake_text_probe() {
+  local body matched
+  body="$(curl -sS --max-time "${LLM_TIMEOUT}" \
+    -X POST -H "Content-Type: application/json" \
+    --data '{"timeout_seconds":5,"sample_texts":["Yo Didier","Yo! Didier!","Yadii","Bonjour Didier"]}' \
+    "${ASR_BASE}/wake-test" || true)"
+  matched="$(printf "%s" "${body}" | extract_json_bool "matched")"
+  if [[ "${matched}" == "true" ]]; then
+    printf "CHECK /asr/wake-test(text)  => OK\n"
+  else
+    printf "CHECK /asr/wake-test(text)  => FAIL\n"
+    FAILURES=$((FAILURES + 1))
+  fi
+}
+
+check_ask_and_speak() {
+  local body response has_response
+  body="$(curl -sS --max-time "${ASK_TIMEOUT}" \
+    -X POST -H "Content-Type: application/json" \
+    --data '{"prompt":"allume la lumiere de la cuisine","is_voice":false,"force_task":true}' \
+    "${ENTRY_BASE}/ask-and-speak" || true)"
+  response="$(printf "%s" "${body}" | awk '
+    /"response"[[:space:]]*:[[:space:]]*"/ {
+      line=$0
+      sub(/^.*"response"[[:space:]]*:[[:space:]]*"/, "", line)
+      sub(/".*$/, "", line)
+      print line
+      exit
+    }
+  ')"
+  has_response="false"
+  if [[ -n "${response}" ]]; then
+    has_response="true"
+  fi
+  if [[ "${has_response}" == "true" ]]; then
+    printf "CHECK /ask-and-speak        => OK\n"
+  else
+    printf "CHECK /ask-and-speak        => FAIL\n"
+    FAILURES=$((FAILURES + 1))
+  fi
+}
+
 print_proc_stats() {
   echo "PROCESS CPU/RAM (workers)"
   ps -eo pid,pcpu,pmem,rss,cmd | awk '
@@ -240,6 +317,21 @@ print_runtime_summary() {
   echo "runtime_temp_c=${temp_c}"
 }
 
+check_idle_target() {
+  local load1
+  if [[ "${IDLE_WAIT_S}" =~ ^[0-9]+$ ]] && (( IDLE_WAIT_S > 0 )); then
+    sleep "${IDLE_WAIT_S}"
+  fi
+  load1="$(awk '{print $1}' /proc/loadavg)"
+  printf "idle_target_load_1m<%s actual=%s\n" "${IDLE_TARGET}" "${load1}"
+  if awk -v x="${load1}" -v t="${IDLE_TARGET}" 'BEGIN { exit !(x <= t) }'; then
+    echo "idle_target=OK"
+  else
+    echo "idle_target=FAIL"
+    FAILURES=$((FAILURES + 1))
+  fi
+}
+
 echo "== Didier Edge Check =="
 echo "-- Ports --"
 check_port_closed 5003
@@ -257,6 +349,9 @@ check_health_socket "didier-vision" "${VISION_SOCK}"
 check_health_socket "didier-brain" "${BRAIN_SOCK}"
 check_health_socket "didier-audio" "${AUDIO_SOCK}"
 
+echo "-- Idle Gate --"
+check_idle_target
+
 echo "-- Bench (${HITS} hits) --"
 bench "5010/metrics" "GET" "${ENTRY_BASE}/metrics"
 bench "5010/device-status" "GET" "${ENTRY_BASE}/device-status"
@@ -268,6 +363,11 @@ bench_socket "audio/speak(sock)" "POST" "${AUDIO_SOCK}" "/speak" '{"text":"check
 
 echo "-- Speak Stub --"
 single_speak_stub
+
+echo "-- End-to-End --"
+check_agent_react
+check_wake_text_probe
+check_ask_and_speak
 
 echo "-- Process --"
 print_proc_stats

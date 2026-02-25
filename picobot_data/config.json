@@ -26,12 +26,32 @@
     },
     {
       "name": "check_camera",
-      "enabled": false,
+      "enabled": true,
       "type": "http",
       "method": "GET",
-      "url": "http://192.168.1.47:5003/vision/status",
+      "endpoint": "http://192.168.1.47:5010/vision/status",
+      "url": "http://192.168.1.47:5010/vision/status",
       "timeout_seconds": 2.0,
       "notes": "Structure reservee pour le controle futur du flux camera/NPU Hailo."
+    },
+    {
+      "name": "get_pixel_status",
+      "enabled": true,
+      "type": "http",
+      "method": "GET",
+      "endpoint": "http://192.168.1.47:5010/metrics",
+      "url": "http://192.168.1.47:5010/metrics",
+      "timeout_seconds": 2.0,
+      "notes": "Expose le profil hardware (presence Pixel TPU et IP detectee)."
+    },
+    {
+      "name": "web_lookup",
+      "enabled": true,
+      "type": "http",
+      "method": "GET",
+      "endpoint": "https://www.bing.com/search?q={query}&format=rss&setlang=fr&cc=fr&mkt=fr-FR",
+      "timeout_seconds": 4.0,
+      "notes": "Recherche web generique pour les questions externes (actualite, meteo, prix, etc.)."
     }
   ],
   "providers": {

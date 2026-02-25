@@ -19,6 +19,8 @@ import soundfile as sf
 from tentacles.base import BaseTentacle
 from core.status import update_status
 
+DEFAULT_SUBPROCESS_TIMEOUT_S = 2.0
+
 
 class Tentacle(BaseTentacle):
     name = "hearing"
@@ -296,6 +298,7 @@ class Tentacle(BaseTentacle):
                 check=False,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                timeout=DEFAULT_SUBPROCESS_TIMEOUT_S,
             )
         except Exception as exc:
             self._logger.warning("Bench run failed: %s", exc)
@@ -414,7 +417,12 @@ class Tentacle(BaseTentacle):
                 str(wav_path),
             ]
             try:
-                result = subprocess.run(cmd, check=False, capture_output=True)
+                result = subprocess.run(
+                    cmd,
+                    check=False,
+                    capture_output=True,
+                    timeout=DEFAULT_SUBPROCESS_TIMEOUT_S,
+                )
             except Exception as exc:
                 self._capture_failures += 1
                 now = time.time()
@@ -547,7 +555,12 @@ class Tentacle(BaseTentacle):
                 whisper_cmd.extend(["-vmsd", str(self._vad_max_speech_s)])
         start_ts = time.time()
         try:
-            await asyncio.to_thread(subprocess.run, whisper_cmd, check=True)
+            await asyncio.to_thread(
+                subprocess.run,
+                whisper_cmd,
+                check=True,
+                timeout=DEFAULT_SUBPROCESS_TIMEOUT_S,
+            )
         except Exception as exc:
             self._logger.warning("whisper.cpp failed: %s", exc)
             self._cleanup_path(wav_path)

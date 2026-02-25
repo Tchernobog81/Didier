@@ -141,6 +141,9 @@ async def _startup() -> None:
         level=os.getenv("DIDIER_LOG_LEVEL", "INFO").upper(),
         format=LOG_FORMAT,
     )
+    # pyHailoRT emits a deprecation warning on every frame activation; keep logs usable.
+    logging.getLogger("pyhailort").setLevel(logging.ERROR)
+    logging.getLogger("hailo_platform").setLevel(logging.ERROR)
     _manager = _ctx.Manager()
     _shared = _manager.dict(
         {

@@ -1,6 +1,4 @@
 const statusPill = document.getElementById("status-pill");
-const wakeLoopTestBtn = document.getElementById("wake-loop-test-btn");
-const wakeLoopTestResult = document.getElementById("wake-loop-test-result");
 const tempEl = document.getElementById("temp");
 const cpuEl = document.getElementById("cpu");
 const cpuCoresEl = document.getElementById("cpu-cores");
@@ -20,8 +18,13 @@ const videoStream = document.getElementById("video-stream");
 const videoFrame = document.getElementById("video-frame");
 const zonesOverlay = document.getElementById("zones-overlay");
 const zonesOverlaySecondary = document.getElementById("zones-overlay-secondary");
+const SHOW_STATIC_VISION_ZONES = false;
+const OVERLAY_MIN_CONFIDENCE_PRIMARY = 0.4;
+const OVERLAY_MIN_CONFIDENCE_SECONDARY = 0.25;
+const OVERLAY_HIDE_BBOX_POLYGONS = true;
 const ollamaModels = document.getElementById("ollama-models");
 const versionBadge = document.getElementById("version-badge");
+const uiVersionText = document.getElementById("ui-version-text");
 const listeningBadge = document.getElementById("listening-badge");
 const thinkingBadge = document.getElementById("thinking-badge");
 const speakingBadge = document.getElementById("speaking-badge");
@@ -40,8 +43,10 @@ const cameraHoldersOutput = document.getElementById("camera-holders-output");
 const cameraFormat = document.getElementById("camera-format");
 const enrollOwner = document.getElementById("enroll-owner");
 const didierOutput = document.getElementById("didier-output");
+const didierTechOutput = document.getElementById("didier-tech-output");
 const didierForm = document.getElementById("didier-form");
 const didierPrompt = document.getElementById("didier-prompt");
+const didierBoost = document.getElementById("didier-boost");
 const didierTitle = document.getElementById("didier-title");
 const detectionTags = document.getElementById("detection-tags");
 const detectionTagsEmpty = document.getElementById("detection-tags-empty");
@@ -71,6 +76,9 @@ const picobotMeta = document.getElementById("picobot-meta");
 const picobotTaskList = document.getElementById("picobot-task-list");
 const picobotTimeline = document.getElementById("picobot-timeline");
 const picobotRefresh = document.getElementById("picobot-refresh");
+const picobotToolsMeta = document.getElementById("picobot-tools-meta");
+const picobotBuiltinTools = document.getElementById("picobot-builtin-tools");
+const picobotConfiguredTools = document.getElementById("picobot-configured-tools");
 const llmfitMeta = document.getElementById("llmfit-meta");
 const llmfitSummary = document.getElementById("llmfit-summary");
 const llmfitCards = document.getElementById("llmfit-cards");
@@ -114,6 +122,7 @@ const surfaceStreamFallbackLogo = document.getElementById(
 const DIDIER_TIMEOUT_MS = 90000;
 const CODING_TIMEOUT_MS = 120000;
 const TERMINAL_TIMEOUT_MS = 10000;
+const DIDIER_BOOST_STORAGE_KEY = "didier:boostEnabled";
 const MAX_FILE_SIZE = 200 * 1024;
 const MAX_INSERT_CHARS = 4000;
 const VIDEO_STALE_S = 8.0;
@@ -126,6 +135,19 @@ const SERVICE_503_BACKOFF_MS = 30000;
 const METRICS_WS_RETRY_MS = 3000;
 const METRICS_WS_PATH = "/ws/metrics";
 const POLL_FETCH_TIMEOUT_MS = 1800;
+const PICOBOT_EXPECTED_BUILTIN_TOOLS = [
+  "CreateSkill",
+  "Cron",
+  "DeleteSkill",
+  "Exec",
+  "Filesystem",
+  "ListSkills",
+  "Message",
+  "ReadSkill",
+  "Spawn",
+  "Web",
+  "WriteMemory",
+];
 
 let lastVideoRefreshAt = 0;
 let lastSecondaryRefreshAt = 0;
@@ -573,6 +595,11 @@ function updateNpuPillFromMetrics(npuData) {
     return;
   }
   const util = npuUtilization(npuData);
+  const realFpsRaw = npuData.real_fps;
+  const realFps =
+    realFpsRaw !== null && realFpsRaw !== undefined && Number.isFinite(Number(realFpsRaw))
+      ? Number(realFpsRaw)
+      : null;
   const cores = Array.isArray(npuData.cores) ? npuData.cores : [];
   const coreCountRaw =
     npuData.core_count !== undefined && npuData.core_count !== null
@@ -586,8 +613,10 @@ function updateNpuPillFromMetrics(npuData) {
 
   if (inferredActive) {
     const utilText = util === null ? "--" : `${Math.round(util)}%`;
+    const fpsText = realFps !== null && realFps > 0.1 ? `${realFps.toFixed(1)}f` : null;
     const suffix = coreCount > 1 ? `/${coreCount}c` : "";
-    setPillState(devicePillNpu, "ok", `${utilText}${suffix}`);
+    const head = util !== null ? utilText : fpsText || utilText;
+    setPillState(devicePillNpu, "ok", `${head}${suffix}`);
     return;
   }
 
@@ -666,12 +695,22 @@ function applyMetricsData(data) {
   latestNpuMetrics = npuData;
   if (npuData && npuData.available) {
     const util = npuUtilization(npuData);
+    const realFpsRaw = npuData.real_fps;
+    const realFps =
+      realFpsRaw !== null && realFpsRaw !== undefined && Number.isFinite(Number(realFpsRaw))
+        ? Number(realFpsRaw)
+        : null;
     const cores = Array.isArray(npuData.cores) ? npuData.cores : [];
     renderNpuCores(cores);
     if (util === null) {
       if (npuData.active) {
-        npuEl.textContent = "ACTIF";
-        setBar(barNpu, 25);
+        if (realFps !== null && realFps > 0.1) {
+          npuEl.textContent = `ACTIF ${realFps.toFixed(1)}fps`;
+          setBar(barNpu, Math.max(10, Math.min(100, Math.round(realFps * 8))));
+        } else {
+          npuEl.textContent = "ACTIF";
+          setBar(barNpu, 25);
+        }
       } else {
         npuEl.textContent = "IDLE";
         setBar(barNpu, 5);
@@ -682,7 +721,11 @@ function applyMetricsData(data) {
         Boolean(npuData.active) ||
         utilRounded > 1 ||
         cores.some((core) => Number(core && core.utilization) > 1);
-      npuEl.textContent = inferredActive ? `${utilRounded}%` : `IDLE ${utilRounded}%`;
+      const fpsSuffix =
+        realFps !== null && realFps > 0.1 ? ` · ${realFps.toFixed(1)}fps` : "";
+      npuEl.textContent = inferredActive
+        ? `${utilRounded}%${fpsSuffix}`
+        : `IDLE ${utilRounded}%`;
       setBar(barNpu, utilRounded);
     }
   } else {
@@ -817,6 +860,7 @@ async function fetchDeviceStatus() {
       const version = data.version.version || "inconnue";
       const git = data.version.git ? ` (${data.version.git})` : "";
       if (versionBadge) versionBadge.textContent = `Version : ${version}${git}`;
+      if (uiVersionText) uiVersionText.textContent = version;
     }
     if (data.camera) {
       const age = data.camera.last_frame_age_s;
@@ -924,8 +968,10 @@ async function fetchVersion() {
     const version = data.version || "inconnue";
     const git = data.git ? ` (${data.git})` : "";
     versionBadge.textContent = `Version : ${version}${git}`;
+    if (uiVersionText) uiVersionText.textContent = version;
   } catch (err) {
     versionBadge.textContent = "Version : inconnue";
+    if (uiVersionText) uiVersionText.textContent = "inconnue";
   } finally {
     versionInFlight = false;
   }
@@ -978,7 +1024,6 @@ function applyAsrStatusData(data) {
   }
   const promptAt = Number(data.last_prompt_at || 0);
   const responseAt = Number(data.last_response_at || 0);
-  const promptText = String(data.last_prompt || "").trim();
   const responseText = String(data.last_response || "").trim();
   if (!asrChatSyncInitialized) {
     asrSeenPromptAt = promptAt;
@@ -987,13 +1032,6 @@ function applyAsrStatusData(data) {
   } else {
     if (promptAt && promptAt > asrSeenPromptAt) {
       asrSeenPromptAt = promptAt;
-      const promptLine = `> ${promptText}`;
-      if (
-        promptText &&
-        !terminalHasRecentLine(didierOutput, promptLine, 10)
-      ) {
-        appendTerminal(didierOutput, promptLine);
-      }
     }
     if (responseAt && responseAt > asrSeenResponseAt) {
       asrSeenResponseAt = responseAt;
@@ -2088,6 +2126,154 @@ function formatAgeSeconds(tsSeconds) {
   return `${Math.floor(delta / 3600)}h`;
 }
 
+function normalizePicobotToolNames(rawValue, fallback = []) {
+  const source = Array.isArray(rawValue) ? rawValue : fallback;
+  const names = source
+    .map((item) => String(item || "").trim())
+    .filter((item) => item.length > 0);
+  return Array.from(new Set(names)).sort((a, b) => a.localeCompare(b));
+}
+
+function normalizeConfiguredPicobotTools(rawValue) {
+  if (!Array.isArray(rawValue)) return [];
+  return rawValue
+    .map((item) => {
+      if (!item || typeof item !== "object") return null;
+      const name = String(item.name || "").trim();
+      if (!name) return null;
+      const method = String(item.method || "GET").trim().toUpperCase() || "GET";
+      const type = String(item.type || "http").trim() || "http";
+      const endpoint = String(item.endpoint || "").trim();
+      return {
+        name,
+        enabled: Boolean(item.enabled),
+        method,
+        type,
+        endpoint: endpoint || null,
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function renderPicobotToolItems(target, items, emptyText) {
+  if (!target) return;
+  target.innerHTML = "";
+  if (!Array.isArray(items) || !items.length) {
+    const empty = document.createElement("div");
+    empty.className = "picobot-empty";
+    empty.textContent = String(emptyText || "Aucun outil.");
+    target.appendChild(empty);
+    return;
+  }
+  items.forEach((item) => {
+    const row = document.createElement("article");
+    row.className = `picobot-tool-item ${item.className || ""}`.trim();
+
+    const left = document.createElement("div");
+    left.className = "picobot-tool-left";
+    const name = document.createElement("div");
+    name.className = "picobot-tool-name";
+    name.textContent = item.name || "--";
+    left.appendChild(name);
+    if (item.meta) {
+      const meta = document.createElement("div");
+      meta.className = "picobot-tool-meta";
+      meta.textContent = item.meta;
+      left.appendChild(meta);
+    }
+
+    const pill = document.createElement("span");
+    pill.className = "picobot-tool-pill";
+    pill.textContent = item.pill || "--";
+
+    row.appendChild(left);
+    row.appendChild(pill);
+    target.appendChild(row);
+  });
+}
+
+function renderPicobotTools(snapshotPayload) {
+  if (!picobotBuiltinTools || !picobotConfiguredTools) return;
+  const snapshot =
+    snapshotPayload && typeof snapshotPayload === "object" ? snapshotPayload : {};
+  const info =
+    snapshot.picobot && typeof snapshot.picobot === "object" ? snapshot.picobot : {};
+
+  const expectedBuiltin = normalizePicobotToolNames(
+    info.expected_builtin_tools,
+    PICOBOT_EXPECTED_BUILTIN_TOOLS
+  );
+  const builtinTools = normalizePicobotToolNames(
+    info.builtin_tools,
+    expectedBuiltin
+  );
+  const missingBuiltin = new Set(
+    normalizePicobotToolNames(info.missing_builtin_tools)
+  );
+  const configuredTools = normalizeConfiguredPicobotTools(info.configured_tools);
+
+  const builtinItems = builtinTools.map((name) => {
+    const isMissing = missingBuiltin.has(name);
+    return {
+      name,
+      pill: isMissing ? "MISSING" : "OK",
+      className: isMissing ? "is-missing" : "",
+      meta: isMissing ? "non détecté dans le runtime Picobot" : "outil natif",
+    };
+  });
+  const configuredItems = configuredTools.map((item) => {
+    const location = item.endpoint ? item.endpoint : item.type;
+    return {
+      name: item.name,
+      pill: item.enabled ? "ON" : "OFF",
+      className: item.enabled ? "" : "is-disabled",
+      meta: `${item.method} · ${location}`,
+    };
+  });
+  renderPicobotToolItems(
+    picobotBuiltinTools,
+    builtinItems,
+    "Aucun outil built-in détecté."
+  );
+  renderPicobotToolItems(
+    picobotConfiguredTools,
+    configuredItems,
+    "Aucun outil configuré dans picobot_data/config.json."
+  );
+
+  if (!picobotToolsMeta) return;
+  const builtinCount = Number.isFinite(Number(info.builtin_tools_count))
+    ? Number(info.builtin_tools_count)
+    : builtinTools.length;
+  const expectedCount = Number.isFinite(Number(info.expected_builtin_tools_count))
+    ? Number(info.expected_builtin_tools_count)
+    : expectedBuiltin.length;
+  const configuredCount = Number.isFinite(Number(info.configured_tools_count))
+    ? Number(info.configured_tools_count)
+    : configuredTools.length;
+  const enabledConfiguredCount = Number.isFinite(
+    Number(info.enabled_configured_tools_count)
+  )
+    ? Number(info.enabled_configured_tools_count)
+    : configuredTools.filter((item) => item.enabled).length;
+  const installRequired = Boolean(info.install_required);
+  const scanError = String(info.tool_scan_error || "").trim();
+  const source = String(info.tools_source || "").trim();
+  const statusLabel = statusToShortLabel(info.status || snapshot.status || "unknown");
+  const parts = [
+    `Built-in ${builtinCount}/${expectedCount || builtinCount || 11}`,
+    `Config ${enabledConfiguredCount}/${configuredCount}`,
+    installRequired ? "install requis" : "runtime OK",
+    source ? `source: ${source}` : null,
+    `statut: ${statusLabel}`,
+  ].filter(Boolean);
+  if (scanError) {
+    parts.push(`scan: ${scanError.slice(0, 80)}`);
+  }
+  picobotToolsMeta.textContent = parts.join(" · ");
+}
+
 function normalizePicobotCards(payload) {
   const snapshot = payload && typeof payload === "object" ? payload : {};
   const ts = normalizeEpochSeconds(snapshot.ts) || Date.now() / 1000;
@@ -2175,12 +2361,27 @@ function renderPicobotKpis(snapshotPayload, tasks, latencyMs) {
       ? snapshot.ollama.model_count
       : 0
   );
+  const builtinToolsCount =
+    snapshot.picobot && Number.isFinite(Number(snapshot.picobot.builtin_tools_count))
+      ? Number(snapshot.picobot.builtin_tools_count)
+      : normalizePicobotToolNames(
+          snapshot.picobot ? snapshot.picobot.builtin_tools : [],
+          PICOBOT_EXPECTED_BUILTIN_TOOLS
+        ).length;
+  const configuredToolsCount =
+    snapshot.picobot && Number.isFinite(Number(snapshot.picobot.configured_tools_count))
+      ? Number(snapshot.picobot.configured_tools_count)
+      : normalizeConfiguredPicobotTools(
+          snapshot.picobot ? snapshot.picobot.configured_tools : []
+        ).length;
   const kpis = [
     { label: "État global", value: statusToShortLabel(globalStatus) },
     { label: "Picobot", value: statusToShortLabel(picobotStatus) },
     { label: "Ollama", value: statusToShortLabel(ollamaStatus) },
     { label: "Signal", value: statusToShortLabel(signalStatus) },
     { label: "Connecteurs OK", value: `${runningCount}/${total}` },
+    { label: "Tools natifs", value: String(builtinToolsCount) },
+    { label: "Tools config", value: String(configuredToolsCount) },
     { label: "Latence check", value: `${Math.max(0, Math.round(latencyMs))} ms` },
     { label: "Modèles Ollama", value: String(modelCount) },
   ];
@@ -2634,6 +2835,7 @@ async function fetchPicobotStatus(force = false) {
     renderPicobotKpis(snapshot, tasks, Date.now() - startedMs);
     renderPicobotTasks(tasks);
     renderPicobotTimeline(tasks);
+    renderPicobotTools(snapshot);
     if (picobotMeta) {
       const ts = normalizeEpochSeconds(snapshot.ts) || Date.now() / 1000;
       picobotMeta.textContent = `Sync ${formatTime(ts)} · ${statusToShortLabel(snapshot.status)}`;
@@ -2642,6 +2844,7 @@ async function fetchPicobotStatus(force = false) {
     renderPicobotKpis(picobotLastSnapshot, picobotCachedTasks, Date.now() - startedMs);
     renderPicobotTasks(picobotCachedTasks);
     renderPicobotTimeline(picobotCachedTasks);
+    renderPicobotTools(picobotLastSnapshot);
     if (picobotMeta) {
       picobotMeta.textContent = "Intégrations indisponibles";
     }
@@ -3070,7 +3273,7 @@ function drawZones() {
   if (!ctx) return;
   syncOverlaySize();
   ctx.clearRect(0, 0, zonesOverlay.width, zonesOverlay.height);
-  if (visionZones.length) {
+  if (SHOW_STATIC_VISION_ZONES && visionZones.length) {
     ctx.save();
     ctx.globalAlpha = 0.35;
     ctx.lineWidth = 2;
@@ -3095,6 +3298,72 @@ function drawZones() {
   drawDetections(ctx);
 }
 
+function _toFiniteNumber(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function isBboxLikePolygon(det) {
+  if (
+    !det ||
+    !Array.isArray(det.poly) ||
+    det.poly.length !== 4 ||
+    !Array.isArray(det.bbox) ||
+    det.bbox.length < 4
+  ) {
+    return false;
+  }
+  const x = _toFiniteNumber(det.bbox[0]);
+  const y = _toFiniteNumber(det.bbox[1]);
+  const w = _toFiniteNumber(det.bbox[2]);
+  const h = _toFiniteNumber(det.bbox[3]);
+  if (x === null || y === null || w === null || h === null) return false;
+  const expected = [
+    [x, y],
+    [x + w, y],
+    [x + w, y + h],
+    [x, y + h],
+  ];
+  const tolerancePx = 4;
+  for (let i = 0; i < 4; i += 1) {
+    const pt = det.poly[i];
+    if (!Array.isArray(pt) || pt.length < 2) return false;
+    const px = _toFiniteNumber(pt[0]);
+    const py = _toFiniteNumber(pt[1]);
+    if (px === null || py === null) return false;
+    if (
+      Math.abs(px - expected[i][0]) > tolerancePx ||
+      Math.abs(py - expected[i][1]) > tolerancePx
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function shouldDrawDetectionOverlay(det, options = {}) {
+  if (!det || !Array.isArray(det.poly) || det.poly.length < 3) return false;
+  const allowBBoxPolygon = Boolean(options.allowBBoxPolygon);
+  if (
+    OVERLAY_HIDE_BBOX_POLYGONS &&
+    !allowBBoxPolygon &&
+    isBboxLikePolygon(det)
+  ) {
+    return false;
+  }
+  const minConfidence =
+    options.minConfidence !== null && options.minConfidence !== undefined
+      ? Number(options.minConfidence)
+      : OVERLAY_MIN_CONFIDENCE_PRIMARY;
+  if (det.confidence !== null && det.confidence !== undefined) {
+    const confidence = Number(det.confidence);
+    if (Number.isFinite(confidence) && confidence < minConfidence) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function drawDetections(ctx) {
   if (!visionDetections || !visionDetections.length) return;
   const frameW =
@@ -3110,10 +3379,14 @@ function drawDetections(ctx) {
   ctx.lineWidth = 2;
   ctx.font = "12px 'IBM Plex Mono', monospace";
   visionDetections.forEach((det) => {
-    const bbox = det.bbox;
+    if (!shouldDrawDetectionOverlay(det, { minConfidence: OVERLAY_MIN_CONFIDENCE_PRIMARY })) return;
     const baseLabel = det.label || "objet";
+    const shapeLabel =
+      det.shape !== null && det.shape !== undefined
+        ? String(det.shape).trim()
+        : "";
     const customLabel = getCustomLabel(det);
-    const label = customLabel || baseLabel;
+    const label = customLabel || (shapeLabel ? `${baseLabel} (${shapeLabel})` : baseLabel);
     const confidence =
       det.confidence !== null && det.confidence !== undefined
         ? Number(det.confidence)
@@ -3123,34 +3396,21 @@ function drawDetections(ctx) {
     ctx.fillStyle = color;
     let labelX = 4;
     let labelY = 14;
-    if (Array.isArray(det.poly) && det.poly.length >= 3) {
-      ctx.beginPath();
-      det.poly.forEach((pt, idx) => {
-        if (!Array.isArray(pt) || pt.length < 2) return;
-        const px = Number(pt[0]) * scaleX;
-        const py = Number(pt[1]) * scaleY;
-        if (idx === 0) {
-          ctx.moveTo(px, py);
-          labelX = px + 4;
-          labelY = py + 12;
-        } else {
-          ctx.lineTo(px, py);
-        }
-      });
-      ctx.closePath();
-      ctx.stroke();
-    } else if (Array.isArray(bbox) && bbox.length >= 4) {
-      const [x, y, w, h] = bbox;
-      const sx = x * scaleX;
-      const sy = y * scaleY;
-      const sw = w * scaleX;
-      const sh = h * scaleY;
-      ctx.strokeRect(sx, sy, sw, sh);
-      labelX = sx + 4;
-      labelY = sy + 14;
-    } else {
-      return;
-    }
+    ctx.beginPath();
+    det.poly.forEach((pt, idx) => {
+      if (!Array.isArray(pt) || pt.length < 2) return;
+      const px = Number(pt[0]) * scaleX;
+      const py = Number(pt[1]) * scaleY;
+      if (idx === 0) {
+        ctx.moveTo(px, py);
+        labelX = px + 4;
+        labelY = py + 12;
+      } else {
+        ctx.lineTo(px, py);
+      }
+    });
+    ctx.closePath();
+    ctx.stroke();
     const text =
       confidence !== null && Number.isFinite(confidence)
         ? `${label} ${(confidence * 100).toFixed(0)}%`
@@ -3185,8 +3445,20 @@ function drawDetectionsSecondary(ctx) {
   ctx.lineWidth = 2;
   ctx.font = "12px 'IBM Plex Mono', monospace";
   visionDetectionsSecondary.forEach((det) => {
-    const bbox = det.bbox;
-    const label = det.label || "objet";
+    if (
+      !shouldDrawDetectionOverlay(det, {
+        allowBBoxPolygon: true,
+        minConfidence: OVERLAY_MIN_CONFIDENCE_SECONDARY,
+      })
+    ) {
+      return;
+    }
+    const shapeLabel =
+      det.shape !== null && det.shape !== undefined
+        ? String(det.shape).trim()
+        : "";
+    const labelBase = det.label || "objet";
+    const label = shapeLabel ? `${labelBase} (${shapeLabel})` : labelBase;
     const confidence =
       det.confidence !== null && det.confidence !== undefined
         ? Number(det.confidence)
@@ -3196,34 +3468,21 @@ function drawDetectionsSecondary(ctx) {
     ctx.fillStyle = color;
     let labelX = 4;
     let labelY = 14;
-    if (Array.isArray(det.poly) && det.poly.length >= 3) {
-      ctx.beginPath();
-      det.poly.forEach((pt, idx) => {
-        if (!Array.isArray(pt) || pt.length < 2) return;
-        const px = Number(pt[0]) * scaleX;
-        const py = Number(pt[1]) * scaleY;
-        if (idx === 0) {
-          ctx.moveTo(px, py);
-          labelX = px + 4;
-          labelY = py + 12;
-        } else {
-          ctx.lineTo(px, py);
-        }
-      });
-      ctx.closePath();
-      ctx.stroke();
-    } else if (Array.isArray(bbox) && bbox.length >= 4) {
-      const [x, y, w, h] = bbox;
-      const sx = x * scaleX;
-      const sy = y * scaleY;
-      const sw = w * scaleX;
-      const sh = h * scaleY;
-      ctx.strokeRect(sx, sy, sw, sh);
-      labelX = sx + 4;
-      labelY = sy + 14;
-    } else {
-      return;
-    }
+    ctx.beginPath();
+    det.poly.forEach((pt, idx) => {
+      if (!Array.isArray(pt) || pt.length < 2) return;
+      const px = Number(pt[0]) * scaleX;
+      const py = Number(pt[1]) * scaleY;
+      if (idx === 0) {
+        ctx.moveTo(px, py);
+        labelX = px + 4;
+        labelY = py + 12;
+      } else {
+        ctx.lineTo(px, py);
+      }
+    });
+    ctx.closePath();
+    ctx.stroke();
     const text =
       confidence !== null && Number.isFinite(confidence)
         ? `${label} ${(confidence * 100).toFixed(0)}%`
@@ -3443,9 +3702,36 @@ if (tabButtons.length && tabPanels.length) {
   }
 }
 
+function loadDidierBoostPreference() {
+  if (!didierBoost) return;
+  try {
+    const raw = localStorage.getItem(DIDIER_BOOST_STORAGE_KEY);
+    didierBoost.checked = raw === "1" || raw === "true";
+  } catch (err) {
+    didierBoost.checked = false;
+  }
+}
+
+function persistDidierBoostPreference() {
+  if (!didierBoost) return;
+  try {
+    localStorage.setItem(DIDIER_BOOST_STORAGE_KEY, didierBoost.checked ? "1" : "0");
+  } catch (err) {
+    // Ignore storage errors; chat flow must stay operational.
+  }
+}
+
 async function sendDidierPrompt(prompt) {
-  appendTerminal(didierOutput, `> ${prompt}`);
-  appendTerminal(didierOutput, "... réflexion ...");
+  const shouldForceTask = false;
+  const boostEnabled = Boolean(didierBoost && didierBoost.checked);
+  appendTerminal(didierOutput, `> ${String(prompt || "").trim()}`);
+  const traceTs = new Date().toISOString();
+  appendTerminal(
+    didierTechOutput,
+    `[${traceTs}] prompt="${String(prompt || "").replace(/\s+/g, " ").trim()}" boost=${
+      boostEnabled ? "on" : "off"
+    }`
+  );
   if (thinkingBadge) {
     thinkingBadge.textContent = "Réflexion : en cours";
     thinkingBadge.classList.add("thinking-active");
@@ -3455,7 +3741,14 @@ async function sendDidierPrompt(prompt) {
     const res = await fetch("/ask-and-speak", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt }),
+      body: JSON.stringify({
+        prompt,
+        source: "didier_chat",
+        is_voice: false,
+        force_task: shouldForceTask,
+        vision_glance: false,
+        boost: boostEnabled,
+      }),
       signal: controller.signal,
     });
     clear();
@@ -3469,9 +3762,22 @@ async function sendDidierPrompt(prompt) {
       thinkingBadge.classList.remove("thinking-active");
     }
     appendTerminal(didierOutput, data.response || "Pas de réponse.");
+    const route = String(data.route || "").trim() || "-";
+    const audioStatus = String(data.audio_status || "").trim() || "-";
+    const reactSource = String(
+      (data.react && data.react.source) || data.source || "-"
+    ).trim();
+    appendTerminal(
+      didierTechOutput,
+      `[${traceTs}] route=${route} source=${reactSource} audio=${audioStatus}`
+    );
     const audioNote = String(data.audio_note || "").trim();
     if (audioNote) {
-      appendTerminal(didierOutput, `[Audio] ${audioNote}`);
+      appendTerminal(didierTechOutput, `[${traceTs}] audio_note=${audioNote}`);
+    }
+    const audioDetail = String(data.audio_detail || "").trim();
+    if (audioDetail) {
+      appendTerminal(didierTechOutput, `[${traceTs}] audio_detail=${audioDetail}`);
     }
   } catch (err) {
     if (thinkingBadge) {
@@ -3482,8 +3788,18 @@ async function sendDidierPrompt(prompt) {
     appendTerminal(
       didierOutput,
       timeout
-        ? "Erreur : délai dépassé. Vérifie Ollama / brain."
-        : `Erreur : ${err && err.message ? err.message : "impossible de joindre Didier."}`
+        ? "Je n'arrive pas a repondre pour le moment."
+        : "Je n'arrive pas a repondre pour le moment."
+    );
+    appendTerminal(
+      didierTechOutput,
+      `[${traceTs}] error=${
+        timeout
+          ? "timeout ask-and-speak"
+          : err && err.message
+            ? String(err.message)
+            : "join failure"
+      }`
     );
   }
 }
@@ -3579,7 +3895,7 @@ setInterval(fetchVisionZones, 20000);
 fetchVisionDetections();
 setInterval(fetchVisionDetections, 1500);
 fetchVisionDetectionsSecondary();
-setInterval(fetchVisionDetectionsSecondary, 3500);
+setInterval(fetchVisionDetectionsSecondary, 2200);
 fetchPicobotStatus();
 setInterval(fetchPicobotStatus, 4000);
 fetchHardwareModels();
@@ -4112,14 +4428,6 @@ async function runEdgeTerminalCommand(command) {
   }
 }
 
-function setWakeLoopResult(message, state = "info") {
-  if (!wakeLoopTestResult) return;
-  wakeLoopTestResult.textContent = message || "--";
-  wakeLoopTestResult.classList.remove("ok", "err");
-  if (state === "ok") wakeLoopTestResult.classList.add("ok");
-  if (state === "err") wakeLoopTestResult.classList.add("err");
-}
-
 if (didierForm) {
   didierForm.addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -4130,6 +4438,13 @@ if (didierForm) {
   });
 }
 
+if (didierBoost) {
+  loadDidierBoostPreference();
+  didierBoost.addEventListener("change", () => {
+    persistDidierBoostPreference();
+  });
+}
+
 if (edgeTerminalForm && edgeTerminalInput) {
   edgeTerminalForm.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -4137,65 +4452,6 @@ if (edgeTerminalForm && edgeTerminalInput) {
     if (!command) return;
     edgeTerminalInput.value = "";
     await runEdgeTerminalCommand(command);
-  });
-}
-
-if (wakeLoopTestBtn) {
-  wakeLoopTestBtn.addEventListener("click", async () => {
-    wakeLoopTestBtn.disabled = true;
-    setWakeLoopResult("Test en cours...", "info");
-    appendTerminal(
-      didierOutput,
-      'Wake-test micro: parle maintenant "Yo Didier" (aucune injection enceinte).'
-    );
-    try {
-      const res = await fetch("/asr/wake-test", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          timeout_seconds: 12,
-          inject_wake_tts: false,
-          loopback_tts_fallback: false,
-          reply_on_wake: true,
-        }),
-      });
-      if (!res.ok) {
-        const detail = await readErrorDetail(res);
-        throw new Error(detail || "test wake indisponible");
-      }
-      const data = await res.json();
-      if (data && data.matched) {
-        const heard = data.heard_transcript || "(transcript vide)";
-        const elapsed = Number(data.elapsed_seconds || 0).toFixed(2);
-        setWakeLoopResult(`OK (${elapsed}s)`, "ok");
-        appendTerminal(
-          didierOutput,
-          `Wake-test OK: entendu "${heard}" en ${elapsed}s`
-        );
-      } else if (data && data.status === "audio_only") {
-        const heard = data.heard_transcript || "(audio detecte)";
-        const elapsed = Number(data.elapsed_seconds || 0).toFixed(2);
-        setWakeLoopResult(`Micro OK, wake KO (${elapsed}s)`, "err");
-        appendTerminal(
-          didierOutput,
-          `Wake-test partiel: micro detecte mais wake non reconnu ("${heard}")`
-        );
-      } else {
-        const heard = data && data.heard_transcript ? data.heard_transcript : "rien";
-        const elapsed = Number((data && data.elapsed_seconds) || 0).toFixed(2);
-        setWakeLoopResult(`KO (${elapsed}s)`, "err");
-        appendTerminal(
-          didierOutput,
-          `Wake-test KO: wake-word non validé (entendu: "${heard}")`
-        );
-      }
-    } catch (err) {
-      const msg = err && err.message ? err.message : "échec";
-      setWakeLoopResult(`Erreur: ${msg}`, "err");
-      appendTerminal(didierOutput, `Wake-test erreur: ${msg}`);
-    } finally {
-      wakeLoopTestBtn.disabled = false;
-    }
   });
 }
 

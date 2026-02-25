@@ -116,6 +116,12 @@ class MicroGPTLite:
         if any(token in p for token in ["ping", "test rapide", "quick test"]):
             return "Ping OK."
 
+        if any(token in p for token in ["merci", "ok", "d accord", "c est bon", "parfait"]):
+            return "Recu."
+
+        if any(token in p for token in ["tu es la", "t es la", "dispo", "pret", "ca va", "ça va"]):
+            return "Oui, je suis pret."
+
         return None
 
     def decide(self, prompt: str, telemetry: dict[str, Any]) -> Decision:
@@ -139,8 +145,18 @@ class MicroGPTLite:
             "optimise",
             "optimiser",
         ]
-        if "?" in p or len(p) >= 80 or any(t in p for t in complex_tokens):
+        if len(p) >= 80 or any(t in p for t in complex_tokens):
             return Decision(wake_ollama=True, reason="complex_prompt")
+
+        short_tokens = len([tok for tok in p.split(" ") if tok])
+        if "?" in p:
+            if short_tokens <= 5 and len(p) <= 40:
+                return Decision(
+                    wake_ollama=False,
+                    reason="short_question",
+                    quick_response="Oui, je suis la. Donne-moi une action precise.",
+                )
+            return Decision(wake_ollama=True, reason="question_prompt")
 
         latest_score = 0
         if self._samples:

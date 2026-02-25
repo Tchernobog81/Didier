@@ -7,6 +7,7 @@ import signal
 import subprocess
 import time
 import threading
+import warnings
 from pathlib import Path
 from typing import Any, Generator
 
@@ -114,6 +115,17 @@ _REQUEST_THROTTLE_FALLBACKS: dict[str, dict[str, Any]] = {
 
 def _http_timeout(seconds: float | int) -> float:
     return max(0.1, min(float(seconds), DEFAULT_HTTP_TIMEOUT_S))
+
+
+def _configure_runtime_noise_guards() -> None:
+    logging.getLogger("pyhailort").setLevel(logging.ERROR)
+    logging.getLogger("hailo_platform").setLevel(logging.ERROR)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*Calls to `activate\(\)` when working with scheduler are deprecated!.*",
+    )
 
 
 def _client_ip(request: Request) -> str:
@@ -366,6 +378,7 @@ async def _shared_state_loop() -> None:
                 "hardware_profile": hardware_profile,
                 "source": "shared_state_v1",
             }
+            _enrich_npu_metrics_from_vision(payload, orchestrator)
             await asyncio.to_thread(update_shared_metrics, payload)
             await asyncio.to_thread(
                 update_worker_metrics,
@@ -441,6 +454,7 @@ def _resolve_expert_prompt(
 @app.on_event("startup")
 async def startup_event() -> None:
     setup_logging()
+    _configure_runtime_noise_guards()
     global _orchestrator, _orchestrator_bootstrap_task, _orchestrator_ready
     _orchestrator = Orchestrator()
     _orchestrator_ready = False
@@ -500,8 +514,21 @@ def _require_orchestrator() -> Orchestrator:
 @app.get("/", response_class=HTMLResponse)
 async def index() -> str:
     if INDEX_PATH.exists():
+        version_info = _read_version()
+        raw_version = str(version_info.get("version") or "").strip()
+        raw_git = str(version_info.get("git") or "").strip()
+        asset_seed = raw_version or raw_git or "dev"
+        asset_tag = "".join(
+            ch if (ch.isalnum() or ch in "._-") else "-" for ch in asset_seed
+        ).strip("-") or "dev"
+        ui_version = raw_version or (f"git-{raw_git}" if raw_git else "inconnue")
+        content = (
+            INDEX_PATH.read_text(encoding="utf-8")
+            .replace("__ASSET_TAG__", asset_tag)
+            .replace("__UI_VERSION__", ui_version)
+        )
         return HTMLResponse(
-            content=INDEX_PATH.read_text(encoding="utf-8"),
+            content=content,
             headers={"Cache-Control": "no-store, max-age=0"},
         )
     return HTMLResponse(
@@ -688,6 +715,63 @@ def _read_npu_usage(device_path: str | None, pcie_address: str | None) -> dict[s
         "core_count": len(cores),
         "cores": cores,
     }
+
+
+def _enrich_npu_metrics_from_vision(payload: dict[str, Any], orchestrator: Orchestrator | None) -> None:
+    if not isinstance(payload, dict) or orchestrator is None:
+        return
+    npu = payload.get("npu")
+    if not isinstance(npu, dict):
+        return
+    if not bool(npu.get("available", False)):
+        return
+    try:
+        vision = orchestrator.get_tentacle("vision")
+        if not vision or not hasattr(vision, "get_status"):
+            return
+        status = vision.get_status()
+    except Exception:
+        return
+    if not isinstance(status, dict):
+        return
+    detector = str(status.get("detector", "")).strip().lower()
+    if detector != "hailo":
+        return
+    if status.get("ready") is not True:
+        return
+    try:
+        infer_fps = float(status.get("infer_fps", 0.0) or 0.0)
+    except Exception:
+        infer_fps = 0.0
+    try:
+        secondary_fps = float(status.get("secondary_infer_fps", 0.0) or 0.0)
+    except Exception:
+        secondary_fps = 0.0
+    if infer_fps > 0.0:
+        npu["real_fps"] = round(infer_fps, 2)
+    if secondary_fps > 0.0:
+        npu["secondary_fps"] = round(secondary_fps, 2)
+    try:
+        last_ts = float(status.get("last_ts", 0.0) or 0.0)
+    except Exception:
+        last_ts = 0.0
+    recent_detection = last_ts > 0.0 and (time.time() - last_ts) <= 3.0
+    if recent_detection or infer_fps >= 0.3 or secondary_fps >= 0.3:
+        npu["active"] = True
+    util = npu.get("utilization")
+    if (
+        bool(npu.get("active", False))
+        and (not isinstance(util, (int, float)) or float(util) <= 0.0)
+    ):
+        npu["utilization"] = None
+    npu["activity_source"] = "vision_status"
+    cores = npu.get("cores")
+    if isinstance(cores, list) and cores and bool(npu.get("active", False)):
+        first = cores[0]
+        if isinstance(first, dict):
+            runtime_status = str(first.get("runtime_status", "")).strip().lower()
+            if not runtime_status or runtime_status == "unsupported":
+                first["runtime_status"] = "active"
 
 
 def _read_asr_status() -> dict[str, Any]:

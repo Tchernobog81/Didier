@@ -1,0 +1,25 @@
+[Unit]
+Description=Didier Picobot Bridge (HTTP 3901)
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+WorkingDirectory=/mnt/didier_ssd/didier/workspace/Didier
+User=tchernobog
+Environment=PATH=/mnt/didier_ssd/didier/workspace/Didier/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=DIDIER_PICOBOT_CONTAINER=didier-picobot
+Environment=DIDIER_PICOBOT_DATA_DIR=/mnt/didier_ssd/didier/workspace/Didier/picobot_data
+Environment=DIDIER_PICOBOT_CLI_MODE=off
+Environment=DIDIER_PICOBOT_RUNTIME_HOME=/home/picobot
+ExecStart=/mnt/didier_ssd/didier/workspace/Didier/venv/bin/python /mnt/didier_ssd/didier/workspace/Didier/scripts/run_picobot_bridge.py
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=20s
+TimeoutStopSec=10s
+CPUQuota=40%
+MemoryMax=512M
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

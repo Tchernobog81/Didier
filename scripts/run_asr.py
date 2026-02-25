@@ -100,6 +100,7 @@ ASR_SHARED_STATE_INTERVAL_S = max(
 )
 DEFAULT_HTTP_TIMEOUT_S = 2.0
 DEFAULT_SUBPROCESS_TIMEOUT_S = 2.0
+MAX_SUBPROCESS_TIMEOUT_S = 30.0
 
 APP_STARTED_AT = time.time()
 TMP_DIR = Path("/tmp")
@@ -237,7 +238,10 @@ def _extract_after_wake(text: str) -> str | None:
 
 
 async def _run_command(cmd: list[str], timeout_s: float) -> tuple[int, str, str]:
-    timeout_s = max(0.1, min(float(timeout_s), DEFAULT_SUBPROCESS_TIMEOUT_S))
+    timeout_s = max(
+        DEFAULT_SUBPROCESS_TIMEOUT_S,
+        min(float(timeout_s), MAX_SUBPROCESS_TIMEOUT_S),
+    )
     proc = await asyncio.wait_for(
         asyncio.create_subprocess_exec(
             *cmd,

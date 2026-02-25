@@ -481,19 +481,50 @@ async def _probe_picobot(orchestrator: Any) -> dict[str, Any]:
     if not config_path.is_absolute():
         config_path = (_TERMINAL_REPO_ROOT / config_path).resolve()
     config_exists = config_path.exists()
-    tools_count = 0
+    configured_tools_count = 0
+    enabled_configured_tools_count = 0
+    configured_tools: list[dict[str, Any]] = []
     model_name = str(cfg.get("llm_model", "")).strip()
     if config_exists:
         try:
             data = json.loads(config_path.read_text(encoding="utf-8"))
             tools = data.get("tools", []) if isinstance(data, dict) else []
             if isinstance(tools, list):
-                tools_count = len(tools)
+                for item in tools:
+                    if not isinstance(item, dict):
+                        continue
+                    name = str(item.get("name", "")).strip()
+                    if not name:
+                        continue
+                    entry = {
+                        "name": name,
+                        "enabled": bool(item.get("enabled", True)),
+                        "type": str(item.get("type", "http")).strip() or "http",
+                        "method": str(item.get("method", "GET")).strip().upper() or "GET",
+                        "endpoint": str(item.get("endpoint") or item.get("url") or "").strip() or None,
+                    }
+                    configured_tools.append(entry)
+                configured_tools_count = len(configured_tools)
+                enabled_configured_tools_count = sum(
+                    1 for item in configured_tools if bool(item.get("enabled", False))
+                )
             llm = data.get("llm", {}) if isinstance(data, dict) else {}
             if not model_name and isinstance(llm, dict):
                 model_name = str(llm.get("model", "")).strip()
         except Exception:
             pass
+
+    builtin_tools: list[str] = []
+    expected_builtin_tools: list[str] = []
+    missing_builtin_tools: list[str] = []
+    builtin_tools_count = 0
+    expected_builtin_tools_count = 0
+    install_required = False
+    tools_source = "config_only"
+    tool_scan_error: str | None = None
+    bridge_base = str(cfg.get("bridge_url", "http://127.0.0.1:3901")).strip().rstrip("/")
+    if not bridge_base:
+        bridge_base = "http://127.0.0.1:3901"
 
     candidates = ("didier-picobot.service", "picobot.service")
     service_states: list[dict[str, Any]] = []
@@ -505,6 +536,89 @@ async def _probe_picobot(orchestrator: Any) -> dict[str, Any]:
             running_service = service
 
     if running_service:
+        tools_probe = await _http_probe(f"{bridge_base}/tools")
+        payload = tools_probe.get("json", None)
+        if (
+            tools_probe.get("ok", False)
+            and int(tools_probe.get("status_code", 0)) < 500
+            and isinstance(payload, dict)
+        ):
+            raw_builtin = payload.get("builtin_tools", [])
+            if isinstance(raw_builtin, list):
+                builtin_tools = sorted(
+                    {
+                        str(item).strip()
+                        for item in raw_builtin
+                        if str(item).strip()
+                    }
+                )
+            raw_expected = payload.get("expected_builtin_tools", [])
+            if isinstance(raw_expected, list):
+                expected_builtin_tools = sorted(
+                    {
+                        str(item).strip()
+                        for item in raw_expected
+                        if str(item).strip()
+                    }
+                )
+            raw_missing = payload.get("missing_builtin_tools", [])
+            if isinstance(raw_missing, list):
+                missing_builtin_tools = sorted(
+                    {
+                        str(item).strip()
+                        for item in raw_missing
+                        if str(item).strip()
+                    }
+                )
+            raw_configured = payload.get("configured_tools", [])
+            if isinstance(raw_configured, list) and raw_configured:
+                configured_tools = []
+                for item in raw_configured:
+                    if not isinstance(item, dict):
+                        continue
+                    name = str(item.get("name", "")).strip()
+                    if not name:
+                        continue
+                    configured_tools.append(
+                        {
+                            "name": name,
+                            "enabled": bool(item.get("enabled", True)),
+                            "type": str(item.get("type", "http")).strip() or "http",
+                            "method": str(item.get("method", "GET")).strip().upper() or "GET",
+                            "endpoint": str(item.get("endpoint", "")).strip() or None,
+                        }
+                    )
+            configured_tools_count = int(payload.get("configured_tools_count", len(configured_tools)) or 0)
+            enabled_configured_tools_count = int(
+                payload.get(
+                    "enabled_configured_tools_count",
+                    sum(1 for item in configured_tools if bool(item.get("enabled", False))),
+                )
+                or 0
+            )
+            builtin_tools_count = int(payload.get("builtin_tools_count", len(builtin_tools)) or 0)
+            expected_builtin_tools_count = int(
+                payload.get("expected_builtin_tools_count", len(expected_builtin_tools) or 0) or 0
+            )
+            install_required = bool(payload.get("install_required", False))
+            tools_source = str(payload.get("source", "bridge")).strip() or "bridge"
+            raw_scan_error = payload.get("scan_error", None)
+            if raw_scan_error in (None, "", "None", "null"):
+                tool_scan_error = None
+            else:
+                tool_scan_error = str(raw_scan_error).strip() or None
+        elif tools_probe.get("ok", False):
+            tool_scan_error = f"invalid /tools payload: http {tools_probe.get('status_code')}"
+        else:
+            tool_scan_error = str(tools_probe.get("error", "tools probe failed"))
+
+    if not builtin_tools_count and builtin_tools:
+        builtin_tools_count = len(builtin_tools)
+    if not expected_builtin_tools_count and expected_builtin_tools:
+        expected_builtin_tools_count = len(expected_builtin_tools)
+    effective_tools_count = builtin_tools_count or configured_tools_count
+
+    if running_service:
         return {
             "status": "running",
             "detail": running_service,
@@ -512,7 +626,19 @@ async def _probe_picobot(orchestrator: Any) -> dict[str, Any]:
             "configured": config_exists,
             "config_path": str(config_path),
             "model": model_name or None,
-            "tools_count": tools_count,
+            "tools_count": effective_tools_count,
+            "configured_tools_count": configured_tools_count,
+            "enabled_configured_tools_count": enabled_configured_tools_count,
+            "configured_tools": configured_tools,
+            "builtin_tools_count": builtin_tools_count,
+            "builtin_tools": builtin_tools,
+            "expected_builtin_tools_count": expected_builtin_tools_count,
+            "expected_builtin_tools": expected_builtin_tools,
+            "missing_builtin_tools": missing_builtin_tools,
+            "install_required": install_required,
+            "tools_source": tools_source,
+            "tool_scan_error": tool_scan_error,
+            "bridge_base_url": bridge_base,
             "service": running_service,
             "service_states": service_states,
         }
@@ -524,7 +650,19 @@ async def _probe_picobot(orchestrator: Any) -> dict[str, Any]:
             "configured": config_exists,
             "config_path": str(config_path),
             "model": model_name or None,
-            "tools_count": tools_count,
+            "tools_count": effective_tools_count,
+            "configured_tools_count": configured_tools_count,
+            "enabled_configured_tools_count": enabled_configured_tools_count,
+            "configured_tools": configured_tools,
+            "builtin_tools_count": builtin_tools_count,
+            "builtin_tools": builtin_tools,
+            "expected_builtin_tools_count": expected_builtin_tools_count,
+            "expected_builtin_tools": expected_builtin_tools,
+            "missing_builtin_tools": missing_builtin_tools,
+            "install_required": install_required,
+            "tools_source": tools_source,
+            "tool_scan_error": tool_scan_error,
+            "bridge_base_url": bridge_base,
             "service": None,
             "service_states": service_states,
         }
@@ -535,7 +673,19 @@ async def _probe_picobot(orchestrator: Any) -> dict[str, Any]:
         "configured": config_exists,
         "config_path": str(config_path),
         "model": model_name or None,
-        "tools_count": tools_count,
+        "tools_count": effective_tools_count,
+        "configured_tools_count": configured_tools_count,
+        "enabled_configured_tools_count": enabled_configured_tools_count,
+        "configured_tools": configured_tools,
+        "builtin_tools_count": builtin_tools_count,
+        "builtin_tools": builtin_tools,
+        "expected_builtin_tools_count": expected_builtin_tools_count,
+        "expected_builtin_tools": expected_builtin_tools,
+        "missing_builtin_tools": missing_builtin_tools,
+        "install_required": install_required,
+        "tools_source": tools_source,
+        "tool_scan_error": tool_scan_error,
+        "bridge_base_url": bridge_base,
         "service": None,
         "service_states": service_states,
     }

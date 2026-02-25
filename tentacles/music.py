@@ -23,7 +23,12 @@ class Tentacle(BaseTentacle):
         self._enabled = bool(self.config.get("music.enabled", False))
         self._model_dir = Path(self.config.get("music.model_dir", "models/musicgen-small-onnx"))
         self._output_path = Path(self.config.get("music.output_path", "data/music.wav"))
-        self._queue: asyncio.Queue[str] = asyncio.Queue()
+        self._subprocess_timeout_s = max(
+            0.1,
+            min(float(self.config.get("music.subprocess_timeout_seconds", 2.0)), 2.0),
+        )
+        self._queue_maxsize = max(1, int(self.config.get("music.queue_maxsize", 8)))
+        self._queue: asyncio.Queue[str] = asyncio.Queue(maxsize=self._queue_maxsize)
 
     async def run(self) -> None:
         if not self._enabled:
@@ -42,7 +47,10 @@ class Tentacle(BaseTentacle):
         if not self._enabled:
             self._logger.warning("Music tentacle disabled; dropping request.")
             return
-        await self._queue.put(prompt)
+        try:
+            self._queue.put_nowait(prompt)
+        except asyncio.QueueFull:
+            self._logger.warning("Music queue saturated, dropping request.")
 
     async def _generate_and_play(self, prompt: str) -> None:
         if self._model_dir.exists():
@@ -78,6 +86,7 @@ class Tentacle(BaseTentacle):
             subprocess.run(
                 ["paplay", "-d", self._sink, str(self._output_path)],
                 check=True,
+                timeout=self._subprocess_timeout_s,
             )
         except subprocess.CalledProcessError:
             self._logger.exception("paplay failed.")

@@ -66,3 +66,69 @@ sudo systemctl restart run_didier.service
 
 curl -sS http://127.0.0.1:5003/health
 ```
+
+## 5) Rollback OpenClaw natif -> wrapper (sans couper l'API 5010)
+
+Objectif: désactiver `openclaw.service` (Node natif) et repasser en mode wrapper Python piloté par `didier-openclaw-bridge.service`.
+
+### a) Désactiver le mode natif dans la config Didier
+
+```bash
+python3 - <<'PY'
+import json, pathlib
+p = pathlib.Path("config/config.json")
+d = json.loads(p.read_text(encoding="utf-8"))
+d.setdefault("openclaw", {})["native_enabled"] = False
+d["openclaw"]["wrapper_heartbeat_enabled"] = True
+p.write_text(json.dumps(d, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+print("updated", p)
+PY
+```
+
+### b) Forcer le bridge en mode wrapper (`DIDIER_OPENCLAW_NATIVE_ONLY=0`)
+
+```bash
+sudo mkdir -p /etc/systemd/system/didier-openclaw-bridge.service.d
+cat <<'EOF' | sudo tee /etc/systemd/system/didier-openclaw-bridge.service.d/wrapper.conf >/dev/null
+[Service]
+Environment=DIDIER_OPENCLAW_NATIVE_ONLY=0
+EOF
+```
+
+### c) Stopper OpenClaw natif et redémarrer bridge + API
+
+```bash
+sudo systemctl disable --now openclaw.service
+sudo systemctl daemon-reload
+sudo systemctl restart didier-openclaw-bridge.service didier-api.service
+```
+
+### d) Validation wrapper
+
+```bash
+curl -sS http://127.0.0.1:5010/agent/metrics?timeout_s=2
+systemctl is-active didier-api.service didier-openclaw-bridge.service openclaw.service
+```
+
+Attendu:
+- `didier-api.service` = `active`
+- `didier-openclaw-bridge.service` = `active`
+- `openclaw.service` = `inactive`
+
+### e) Revenir ensuite au natif
+
+```bash
+sudo rm -f /etc/systemd/system/didier-openclaw-bridge.service.d/wrapper.conf
+python3 - <<'PY'
+import json, pathlib
+p = pathlib.Path("config/config.json")
+d = json.loads(p.read_text(encoding="utf-8"))
+d.setdefault("openclaw", {})["native_enabled"] = True
+d["openclaw"]["wrapper_heartbeat_enabled"] = False
+p.write_text(json.dumps(d, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+print("updated", p)
+PY
+sudo systemctl daemon-reload
+sudo systemctl enable --now openclaw.service
+sudo systemctl restart didier-openclaw-bridge.service didier-api.service
+```

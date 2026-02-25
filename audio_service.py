@@ -9,10 +9,22 @@ import time
 from kokoro_onnx import Kokoro
 
 class AudioService:
+    _instance_lock = threading.Lock()
+    _instance = None
+
+    @classmethod
+    def get_instance(cls, config):
+        with cls._instance_lock:
+            if cls._instance is None:
+                cls._instance = cls(config)
+            return cls._instance
+
     def __init__(self, config):
         self.config = config
-        self.queue = queue.Queue()
+        maxsize = int(config.get("audio_queue_maxsize", 8)) if isinstance(config, dict) else 8
+        self.queue = queue.Queue(maxsize=max(1, maxsize))
         self.sink = config.get("bluetooth", {}).get("sink_name", "bluez_output.00_07_80_E0_3F_F0.1")
+        self.subprocess_timeout_s = 2.0
         
         # Chemins codés en dur pour l'instant, à externaliser plus tard si besoin
         self.voice_model_path = "/app/voices/fr_FR-siwis-low.onnx"
@@ -65,7 +77,11 @@ class AudioService:
             
             # Utilisation de Popen pour pouvoir interrompre la lecture (Stop d'urgence)
             self.current_process = subprocess.Popen(["paplay", "-d", self.sink, self.output_path])
-            self.current_process.wait()
+            try:
+                self.current_process.wait(timeout=self.subprocess_timeout_s)
+            except subprocess.TimeoutExpired:
+                self.current_process.terminate()
+                self.current_process.wait(timeout=0.5)
             self.current_process = None
         except Exception as e:
             logging.error(f"AudioService: Erreur lors de la lecture audio : {e}")
@@ -79,18 +95,36 @@ class AudioService:
             beep_path = "/app/data/beep.wav"
             sf.write(beep_path, tone, sample_rate)
             self.current_process = subprocess.Popen(["paplay", "-d", self.sink, beep_path])
-            self.current_process.wait()
+            try:
+                self.current_process.wait(timeout=self.subprocess_timeout_s)
+            except subprocess.TimeoutExpired:
+                self.current_process.terminate()
+                self.current_process.wait(timeout=0.5)
             self.current_process = None
         except Exception as e:
             logging.error(f"AudioService: Erreur lors du beep : {e}")
 
     def speak(self, text):
         """Ajoute une demande de parole à la file d'attente."""
-        self.queue.put({"type": "speak", "text": text})
+        self._enqueue_task({"type": "speak", "text": text})
 
     def beep(self):
         """Ajoute une demande de beep à la file d'attente."""
-        self.queue.put({"type": "beep"})
+        self._enqueue_task({"type": "beep"})
+
+    def _enqueue_task(self, task):
+        try:
+            self.queue.put_nowait(task)
+        except queue.Full:
+            try:
+                self.queue.get_nowait()
+                self.queue.task_done()
+            except queue.Empty:
+                pass
+            try:
+                self.queue.put_nowait(task)
+            except queue.Full:
+                logging.warning("AudioService: Queue saturée, tâche abandonnée.")
 
     def clear(self):
         """STOP D'URGENCE : Vide la file d'attente et coupe la parole immédiatement."""
