@@ -1,0 +1,16 @@
+venv/
+.deps/
+data/
+models/
+logs/
+.vscode/
+ollama/
+__pycache__/
+*.pyc
+.env
+data/*.db
+*.log
+.DS_Store
+*.pem
+memory.json
+hailort.log

@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Didier — Console</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260225-v4r4-hardware-models" />
+  </head>
+  <body>
+    <div class="bg"></div>
+    <header class="header">
+      <div class="header-top-right">
+        <div class="status" id="status-pill">DÉMARRAGE</div>
+      </div>
+      <div class="header-left">
+        <div class="tabs" role="tablist">
+          <button class="tab tab--wide is-active" type="button" data-tab="dashboard">
+            <span class="tab-label">Didier</span>
+            <span class="tab-meta" id="didier-tab-time">--</span>
+          </button>
+          <button class="tab" type="button" data-tab="vscode">VSCode</button>
+          <button class="tab" type="button" data-tab="terminal">Terminal</button>
+          <button class="tab" type="button" data-tab="docker">Workers Edge</button>
+          <button class="tab" type="button" data-tab="picobot">Picobot & Intégrations</button>
+          <button class="tab" type="button" data-tab="hardware">Hardware & Models</button>
+          <button class="tab" type="button" data-tab="actuators">Actionneurs</button>
+        </div>
+        <div class="title">
+          <span class="logo" id="logo">D</span>
+          <div>
+            <h1>Didier</h1>
+            <p>
+              Raspberry Pi 5 · Orchestrateur
+              <span class="ui-version">V4r4 · 2026-02-25</span>
+            </p>
+          </div>
+        </div>
+        <div class="device-pills" id="device-pills">
+          <span class="device-pill is-unknown" id="pill-ps3-video">
+            <span class="pill-label">PS3 Vidéo</span>
+            <span class="pill-status">--</span>
+          </span>
+          <span class="device-pill is-unknown" id="pill-surface-video">
+            <span class="pill-label">Surface Vidéo</span>
+            <span class="pill-status">--</span>
+          </span>
+          <span class="device-pill is-unknown" id="pill-sound">
+            <span class="pill-label">Son SB</span>
+            <span class="pill-status">--</span>
+          </span>
+          <span class="device-pill is-unknown" id="pill-mic">
+            <span class="pill-label">Micro PS3</span>
+            <span class="pill-status">--</span>
+          </span>
+          <span class="device-pill is-unknown" id="pill-npu">
+            <span class="pill-label">NPU</span>
+            <span class="pill-status">--</span>
+          </span>
+        </div>
+      </div>
+      <div class="header-right">
+        <button type="button" class="wake-test-btn" id="wake-loop-test-btn" disabled>
+          Wake en pause
+        </button>
+        <div class="wake-test-result" id="wake-loop-test-result">Suspendu</div>
+      </div>
+    </header>
+
+    <main class="grid is-active" id="dashboard-panel" data-tab-panel="dashboard">
+      <section class="card metrics">
+        <h2>Santé</h2>
+        <div class="metric-grid" id="metric-grid">
+          <div class="metric">
+            <span class="label">Temp</span>
+            <span class="value" id="temp">--</span>
+            <div class="bar"><div class="bar-fill" id="bar-temp"></div></div>
+          </div>
+          <div class="metric">
+            <span class="label">CPU</span>
+            <span class="value" id="cpu">--</span>
+            <div class="bar"><div class="bar-fill" id="bar-cpu"></div></div>
+            <div class="cpu-cores" id="cpu-cores"></div>
+          </div>
+          <div class="metric">
+            <span class="label">RAM</span>
+            <span class="value" id="mem">--</span>
+            <div class="bar"><div class="bar-fill" id="bar-mem"></div></div>
+          </div>
+          <div class="metric">
+            <span class="label">Disque SYS</span>
+            <span class="value" id="disk-root">--</span>
+            <div class="bar"><div class="bar-fill" id="bar-disk-root"></div></div>
+          </div>
+          <div class="metric">
+            <span class="label">Disque BRAIN</span>
+            <span class="value" id="disk-ssd">--</span>
+            <div class="bar"><div class="bar-fill" id="bar-disk-ssd"></div></div>
+          </div>
+          <div class="metric">
+            <span class="label">NPU</span>
+            <span class="value" id="npu">--</span>
+            <div class="bar"><div class="bar-fill" id="bar-npu"></div></div>
+            <div class="cpu-cores npu-cores" id="npu-cores"></div>
+          </div>
+          <div class="metric">
+            <span class="label">Micro</span>
+            <span class="value" id="audio">--</span>
+            <div class="bar"><div class="bar-fill" id="bar-audio"></div></div>
+          </div>
+        </div>
+        <div class="ollama">
+          <span class="label">Modèles Ollama</span>
+          <ul id="ollama-models"></ul>
+        </div>
+      </section>
+
+      <section class="card video">
+        <h2>Vidéo</h2>
+        <div class="video-stack">
+          <div class="video-frame" id="video-frame">
+            <img id="video-stream" src="/video/stream" alt="Flux PS3 Eye" />
+            <canvas id="zones-overlay"></canvas>
+            <div class="stream-fallback" id="primary-stream-fallback" hidden>
+              <div
+                class="stream-fallback-logo"
+                id="primary-stream-fallback-logo"
+                aria-hidden="true"
+              >
+                D
+              </div>
+              <span class="stream-fallback-title">Flux PS3 indisponible</span>
+              <span class="stream-fallback-text" id="primary-stream-fallback-text"
+                >En attente de /video/stream...</span
+              >
+            </div>
+            <div
+              class="detection-tags-editor"
+              id="detection-tags-editor"
+              aria-hidden="true"
+            >
+              <span
+                class="detection-tags-editor-label"
+                id="detection-tags-editor-label"
+              ></span>
+              <input
+                type="text"
+                id="detection-tags-editor-input"
+                placeholder="Saisir un tag…"
+                autocomplete="off"
+              />
+            </div>
+          </div>
+          <div class="hint">Flux PS3 Eye</div>
+          <div class="video-frame secondary">
+            <img
+              id="video-stream-secondary"
+              src="/video/stream-secondary"
+              alt="Flux Surface"
+            />
+            <canvas id="zones-overlay-secondary"></canvas>
+            <div class="stream-fallback" id="surface-stream-fallback" hidden>
+              <div
+                class="stream-fallback-logo"
+                id="surface-stream-fallback-logo"
+                aria-hidden="true"
+              >
+                D
+              </div>
+              <span class="stream-fallback-title">Flux Surface indisponible</span>
+              <span class="stream-fallback-text" id="surface-stream-fallback-text"
+                >En attente du flux UDP 1234...</span
+              >
+            </div>
+          </div>
+          <div class="hint">Flux Surface (UDP 1234)</div>
+        </div>
+      </section>
+
+      <section class="card coding">
+        <h2 id="didier-title">Parler à Didier</h2>
+        <div class="terminal" id="didier-output"></div>
+        <form id="didier-form">
+          <input
+            type="text"
+            id="didier-prompt"
+            placeholder="Message pour Didier…"
+            autocomplete="off"
+          />
+          <button type="submit">Envoyer</button>
+        </form>
+      </section>
+    </main>
+
+    <main class="vscode-panel" id="vscode-panel" data-tab-panel="vscode" hidden>
+      <section class="card vscode">
+        <h2>VSCode</h2>
+        <p id="vscode-fallback" class="hint" hidden>
+          Proxy `/vscode/` indisponible, bascule en mode direct (`:8080`).
+          <a id="vscode-direct-link" href="#" target="_blank" rel="noopener noreferrer"
+            >Ouvrir VSCode directement</a
+          >
+        </p>
+        <div class="vscode-frame">
+          <iframe
+            id="vscode-frame"
+            title="VSCode"
+            src="/vscode/?folder=/home/coder/project"
+          ></iframe>
+        </div>
+      </section>
+    </main>
+
+    <main class="terminal-panel" id="terminal-panel" data-tab-panel="terminal" hidden>
+      <section class="card terminal-card">
+        <div class="terminal-toolbar">
+          <h2>Terminal</h2>
+          <span class="hint">Mode shell local (type MobaXterm)</span>
+        </div>
+        <div class="terminal-shell" id="edge-terminal-output"></div>
+        <form id="edge-terminal-form" class="terminal-form">
+          <input
+            type="text"
+            id="edge-terminal-input"
+            placeholder="Commande shell (ex: ls -la, df -h, systemctl --failed)"
+            autocomplete="off"
+          />
+          <button type="submit">Exécuter</button>
+        </form>
+      </section>
+    </main>
+
+    <main class="docker-panel" id="docker-panel" data-tab-panel="docker" hidden>
+      <section class="card docker-diagram">
+        <h2>Workers Edge</h2>
+        <div class="docker-meta" id="docker-meta">--</div>
+        <div class="docker-graph" id="docker-graph"></div>
+      </section>
+    </main>
+
+    <main class="picobot-panel" id="picobot-panel" data-tab-panel="picobot" hidden>
+      <section class="card picobot-card">
+        <div class="picobot-header">
+          <h2>Picobot & Intégrations</h2>
+          <div class="picobot-header-right">
+            <button type="button" id="picobot-refresh">Rafraîchir</button>
+            <span class="picobot-meta" id="picobot-meta">--</span>
+          </div>
+        </div>
+        <div class="picobot-kpis" id="picobot-kpis"></div>
+        <div class="picobot-board">
+          <section class="picobot-lane">
+            <h3>État des connecteurs</h3>
+            <div class="picobot-task-list" id="picobot-task-list"></div>
+          </section>
+          <section class="picobot-lane picobot-lane--timeline">
+            <h3>Derniers checks</h3>
+            <div class="picobot-timeline" id="picobot-timeline"></div>
+          </section>
+        </div>
+      </section>
+    </main>
+
+    <main class="hardware-panel" id="hardware-panel" data-tab-panel="hardware" hidden>
+      <section class="card hardware-card">
+        <div class="picobot-header">
+          <h3>Hardware & Models</h3>
+          <div class="picobot-header-right">
+            <button type="button" id="hardware-refresh">Rafraîchir</button>
+            <span class="picobot-meta" id="hardware-meta">--</span>
+          </div>
+        </div>
+        <div class="hardware-current" id="hardware-current"></div>
+        <div class="hardware-message" id="hardware-message">Sélectionne un modèle benchmarké pour le promouvoir.</div>
+        <section class="picobot-lane llmfit-lane">
+          <div class="llmfit-meta" id="llmfit-meta">--</div>
+          <div class="llmfit-summary" id="llmfit-summary"></div>
+          <div class="llmfit-cards" id="llmfit-cards"></div>
+          <div class="llmfit-table-wrap">
+            <table class="llmfit-table">
+              <thead>
+                <tr>
+                  <th>Tâche</th>
+                  <th>Backend</th>
+                  <th>Modèle</th>
+                  <th>Score</th>
+                  <th>Source</th>
+                  <th>Raison</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody id="llmfit-table-body"></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <main
+      class="actuators-panel"
+      id="actuators-panel"
+      data-tab-panel="actuators"
+      hidden
+    >
+      <section class="card actuators-card">
+        <div class="actuators-toolbar">
+          <h2>Actionneurs</h2>
+          <div class="actuators-toolbar-right">
+            <button type="button" id="actuators-refresh">Rafraîchir</button>
+            <span class="actuators-message" id="actuators-message">--</span>
+          </div>
+        </div>
+        <div class="actuators-list" id="actuators-list"></div>
+      </section>
+    </main>
+
+    <script src="/static/app.js?v=20260225-v4r4-hardware-models"></script>
+  </body>
+</html>

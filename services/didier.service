@@ -1,0 +1,12 @@
+[Unit]
+Description=Didier Legacy API 5003 (ARCHIVED - DO NOT USE)
+After=network-online.target
+Wants=network-online.target
+RefuseManualStart=yes
+
+[Service]
+Type=oneshot
+ExecStart=/bin/false
+
+[Install]
+WantedBy=multi-user.target

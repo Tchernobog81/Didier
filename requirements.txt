@@ -1,0 +1,14 @@
+# Framework web
+fastapi
+uvicorn[standard]
+
+# IPC / monitoring
+psutil
+httpx
+
+# Audio / vision runtime
+kokoro-onnx
+onnxruntime
+soundfile
+numpy==2.2.4
+opencv-python-headless

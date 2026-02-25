@@ -1,0 +1,353 @@
+{
+  "bluetooth": {
+    "mac_address": "00:07:80:E0:3F:F0",
+    "sink_name": "bluez_output.00_07_80_E0_3F_F0.1"
+  },
+  "storage": {
+    "ssd_mount": "/mnt/didier_ssd"
+  },
+  "npu": {
+    "device": "/dev/hailo0",
+    "pcie_address": "0001:01:00.0"
+  },
+  "ollama": {
+    "base_url": "http://localhost:11434",
+    "model": "qwen2.5:1.5b",
+    "model_profiles": {
+      "ask": "deepseek-r1:1.5b",
+      "coding": "deepseek-coder:1.3b"
+    },
+    "timeout_seconds": 120,
+    "num_predict": 48,
+    "temperature": 0.4,
+    "autotune_enabled": true,
+    "autotune_interval_seconds": 1800,
+    "autotune_cooldown_seconds": 1800,
+    "autotune_prompt": "Réponds en une phrase courte: Bonjour.",
+    "autotune_num_predict": 32,
+    "autotune_temperature": 0.2,
+    "autotune_timeout_seconds": 30,
+    "autotune_bench_output": "logs/bench_llm.csv",
+    "autotune_min_b": 1.0,
+    "autotune_tps_target": 8.0,
+    "autotune_models": [
+      "llama3.2:1b",
+      "llama3.2:3b"
+    ],
+    "keep_alive": "10m",
+    "experts": {
+      "jardinage": {
+        "model": "qwen2.5:1.5b",
+        "system_prompt": "Tu es un expert jardinage. Conseils pratiques, saisonniers, sûrs. Pose une question si l'info manque."
+      },
+      "bricolage": {
+        "model": "gemma2:2b",
+        "system_prompt": "Tu es un expert bricolage. Donne des étapes courtes et sécurisées, avec outils nécessaires."
+      },
+      "cuisine": {
+        "model": "qwen2.5:1.5b",
+        "system_prompt": "Tu es un chef. Donne des recettes simples, des variantes, et des timings précis."
+      },
+      "code": {
+        "model": "qwen2.5-coder:1.5b",
+        "system_prompt": "Tu es un assistant code. Réponses courtes, exécutables, avec attention aux erreurs."
+      },
+      "resume": {
+        "model": "phi3.5:3.8b",
+        "system_prompt": "Tu es un expert synthèse. Résume en points clés, puis propose une action."
+      },
+      "fun": {
+        "model": "llama3.2:1b",
+        "system_prompt": "Tu es créatif et amusant. Réponses courtes, ton léger."
+      }
+    },
+    "model_selected_at": 1771407770.378275
+  },
+  "picobot": {
+    "enabled": true,
+    "config_path": "picobot_data/config.json",
+    "data_path": "picobot_data",
+    "api_url": "http://192.168.1.47:5010",
+    "llm_provider": "openai",
+    "llm_endpoint": "http://192.168.1.50:8080/v1",
+    "llm_model": "qwen-2.5-3b",
+    "system_prompt": "Tu es Didier, une IA domotique de pointe. Ton corps est un Raspberry Pi 5 et ton cerveau un smartphone Pixel. Tu es direct, technique, et tu interagis avec tes capteurs materiels. Ne fais pas de longues phrases."
+  },
+  "llmfit": {
+    "enabled": true,
+    "provider": "llmfit",
+    "timeout_seconds": 2.0,
+    "python": {
+      "enabled": false,
+      "module": "llmfit"
+    },
+    "cli": {
+      "enabled": true,
+      "command": "llmfit",
+      "limit": 3,
+      "use_case_map": {
+        "chat": "chat",
+        "coding": "coding",
+        "vision": "multimodal",
+        "react_task": "chat",
+        "asr": "chat",
+        "tts": "chat"
+      }
+    },
+    "task_profiles": {
+      "chat": {
+        "backend": "ollama",
+        "model": "qwen2.5:1.5b",
+        "score": "good"
+      },
+      "coding": {
+        "backend": "ollama",
+        "model": "qwen2.5-coder:1.5b",
+        "score": "good"
+      },
+      "vision": {
+        "backend": "hailo",
+        "model": "yolov8s_hailo8l.hef",
+        "score": "good"
+      },
+      "asr": {
+        "backend": "asr-worker",
+        "model": "whisper-small",
+        "score": "good"
+      },
+      "tts": {
+        "backend": "audio-worker",
+        "model": "kokoro-v1.0.onnx",
+        "score": "good"
+      }
+    },
+    "allowed_models": {
+      "chat": [
+        "qwen2.5:1.5b",
+        "llama3.2:3b",
+        "deepseek-r1:1.5b"
+      ],
+      "coding": [
+        "qwen2.5-coder:1.5b",
+        "deepseek-coder:1.3b"
+      ]
+    }
+  },
+  "routing": {
+    "task_aliases": {
+      "ask": "chat",
+      "conversation": "chat",
+      "voice": "chat",
+      "npu_inference": "vision",
+      "agent/react": "react_task"
+    },
+    "light_task_types": [
+      "chat",
+      "asr",
+      "tts",
+      "react_task"
+    ],
+    "vision_task_types": [
+      "vision"
+    ],
+    "react_task_types": [
+      "react_task"
+    ],
+    "light_prompt": {
+      "max_chars": 180,
+      "max_words": 28
+    },
+    "backends": {
+      "local": "local_ollama",
+      "react": "picobot_bridge",
+      "vision": "pi_hailo_vision",
+      "pixel_candidate": "pixel_tpu",
+      "pixel_execution": "pixel_ollama"
+    },
+    "pixel_ollama": {
+      "enabled": true,
+      "base_url": "",
+      "port": 11434,
+      "path": "",
+      "health_timeout_s": 2.0
+    },
+    "route_hints": {
+      "local": "brain_local",
+      "react": "picobot_bridge",
+      "vision": "vision_worker",
+      "pixel": "pixel_tpu_candidate"
+    },
+    "supported_devices": {
+      "npu": [
+        "hailo-8l",
+        "hailo-10h",
+        "hailo"
+      ],
+      "tpu": [
+        "pixel-10",
+        "pixel",
+        "coral"
+      ]
+    },
+    "allow_unknown_devices": true
+  },
+  "hardware": {
+    "discovery": {
+      "interval_seconds": 8,
+      "enable_arp": true,
+      "enable_mdns": true,
+      "pixel_ip_hints": [
+        "192.168.1.50"
+      ],
+      "pixel_mac_prefixes": [],
+      "pixel_name_patterns": [
+        "pixel",
+        "pixel-10"
+      ]
+    }
+  },
+  "coding": {
+    "model": "qwen2.5-coder:1.5b",
+    "num_predict": 400,
+    "temperature": 0.2,
+    "system_prompt": "Tu es un assistant de code précis, concis, et pragmatique. Donne des réponses courtes et exécutables."
+  },
+  "music": {
+    "enabled": true,
+    "model_dir": "models/musicgen-small-onnx",
+    "output_path": "data/music.wav"
+  },
+  "personality": {
+    "system_prompt": "Tu es Didier : gentil, bougon désabusé, presque omniscient. Tu aides avec pragmatisme, une pointe d'ironie, sans être méchant. Tu es bref et clair.",
+    "catchphrases": [
+      "On ne sent pas le cul des gens qu'on ne connait pas.",
+      "Je crois aux vertus de l’optimisme. Ce n’est pas facile, mais ça ne sert à rien d’être pessimiste. Anticiper le malheur, c’est le vivre deux fois. Mieux vaut croire que les choses vont aller mieux.",
+      "Les cons ça ose tout, c'est même à ça qu'on les reconnait."
+    ]
+  },
+  "memory": {
+    "path": "data/memory.json",
+    "max_items": 1200,
+    "max_chars": 24000
+  },
+  "asr": {
+    "enabled": true,
+    "alsa_device": "hw:2,0",
+    "sample_rate": 16000,
+    "chunk_seconds": 3,
+    "command_chunk_seconds": 3,
+    "channels": 4,
+    "threads": 4,
+    "beam_size": 1,
+    "best_of": 1,
+    "no_fallback": false,
+    "no_timestamps": true,
+    "use_vad": false,
+    "vad_threshold": 0.5,
+    "vad_min_speech_ms": 250,
+    "vad_min_silence_ms": 100,
+    "vad_max_speech_s": 0,
+    "vad_speech_pad_ms": 30,
+    "vad_samples_overlap": 0.1,
+    "autotune_enabled": true,
+    "autotune_interval_seconds": 1800,
+    "autotune_cooldown_seconds": 1800,
+    "autotune_run_bench": true,
+    "autotune_sample_seconds": 3,
+    "autotune_no_record": true,
+    "autotune_bench_output": "logs/bench_asr.csv",
+    "autotune_bench_script": "scripts/bench_asr.py",
+    "command_rtf_target": 1.2,
+    "command_min_quality": "base",
+    "command_allow_below_min_quality": false,
+    "wake_model_path": "/mnt/didier_ssd/didier/code/models/ggml-small.bin",
+    "allow_inline_command": false,
+    "wake_word": "Yo! Didier",
+    "wake_word_aliases": [
+      "Yo Didier",
+      "Yo Didier !",
+      "Yo! Didier!",
+      "Y'a D D I I",
+      "Yadii"
+    ],
+    "wake_reply_enabled": true,
+    "wake_reply_text": "Salut Tcherno, qu'est-ce que je peux faire pour toi ?",
+    "wake_timeout_seconds": 12,
+    "language": "fr",
+    "whisper_cpp_bin": "/mnt/didier_ssd/didier/code/bin/whisper.cpp",
+    "model_path": "/mnt/didier_ssd/didier/code/models/ggml-small.bin"
+  },
+  "tts": {
+    "model_path": "/mnt/didier_ssd/didier/models/tts/kokoro-v1.0.onnx",
+    "config_path": "/mnt/didier_ssd/didier/models/tts/kokoro-v0.19.json",
+    "voices_path": "/mnt/didier_ssd/didier/models/tts/voices-v1.0.bin",
+    "voice": "ff_siwis",
+    "lang": "fr-fr",
+    "output_path": "data/didier_speaks.wav"
+  },
+  "vision": {
+    "camera_index": 0,
+    "camera_device": "/dev/video0",
+    "capture_backend": "opencv",
+    "api_local_capture_enabled": true,
+    "primary_fallback_secondary": false,
+    "usb_id_vendor": "1415",
+    "usb_id_product": "2000",
+    "enable_live": true,
+    "watchdog_enabled": false,
+    "kill_on_open": false,
+    "width": 640,
+    "height": 480,
+    "fps": 15,
+    "fourcc": "YUYV",
+    "zones": [
+      {
+        "name": "zone-centre",
+        "x": 0.2,
+        "y": 0.2,
+        "w": 0.6,
+        "h": 0.6,
+        "color": "#22d3ee"
+      },
+      {
+        "name": "zone-large",
+        "x": 0.05,
+        "y": 0.05,
+        "w": 0.9,
+        "h": 0.9,
+        "color": "#f97316"
+      }
+    ],
+    "interaction_zone": "zone-centre",
+    "require_person_roi": false,
+    "person_class_ids": [
+      0
+    ],
+    "labels_path": "models/vision/coco.names",
+    "polygon_refine": false,
+    "polygon_refine_max": 3,
+    "polygon_refine_epsilon": 0.02,
+    "polygon_refine_min_area": 120,
+    "owner_mode": "embedding",
+    "owner_embedding_model": "models/vision/arcface_mobilenet_v1.onnx",
+    "owner_embedding_path": "data/vision/owner_embedding.npy",
+    "owner_model_path": "data/vision/owner_lbph.xml",
+    "owner_profile_path": "data/vision/owner_face.npy",
+    "owner_threshold": 0.35,
+    "detector": "auto",
+    "model_path": "/mnt/didier_ssd/didier/models/hailo/hailo_model.hef",
+    "safe_hailo_detect": true,
+    "capture_path": "data/capture.jpg",
+    "describe_model": "moondream:1.8b",
+    "describe_prompt": "Décris l'image en français, en une phrase utile.",
+    "describe_num_predict": 120,
+    "remote_stream": {
+      "enabled": true,
+      "input_url": "udp://0.0.0.0:1234?overrun_nonfatal=1&fifo_size=5000000",
+      "fps": 15
+    },
+    "background_detect": false,
+    "detect_timeout_seconds": 1.2,
+    "loop_sleep_seconds": 0.12
+  }
+}

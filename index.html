@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- Rafraîchissement automatique pour le monitoring temps réel -->
+    <meta http-equiv="refresh" content="5">
+    <title>Didier Brain</title>
+    <style>
+        body { background-color: #121212; color: #e0e0e0; font-family: monospace; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+        .card { background: #1e1e1e; padding: 2rem; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); text-align: center; border: 1px solid #333; min-width: 400px; max-width: 600px; width: 90%; }
+        h1 { color: #00bcd4; margin-bottom: 0.5rem; }
+        .badge { display: inline-block; padding: 0.25rem 0.75rem; border-radius: 9999px; font-size: 0.875rem; font-weight: bold; margin: 5px; }
+        .badge-model { background-color: #065f46; color: #34d399; border: 1px solid #047857; }
+        .badge-status { background-color: #1e3a8a; color: #60a5fa; border: 1px solid #1d4ed8; }
+        .badge-critical { background-color: #7f1d1d; color: #fca5a5; border: 1px solid #b91c1c; }
+        .badge-warning { background-color: #78350f; color: #fdba74; border: 1px solid #c2410c; }
+        .badge-ok { background-color: #14532d; color: #4ade80; border: 1px solid #166534; }
+        .refresh { margin-top: 1.5rem; cursor: pointer; color: #888; text-decoration: underline; font-size: 0.8rem; }
+        .refresh:hover { color: #fff; }
+        
+        /* Workers Edge Dashboard */
+        .workers-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 1.5rem; text-align: left; }
+        .worker-item { background: #2a2a2a; padding: 10px; border-radius: 6px; border: 1px solid #333; font-size: 0.85rem; }
+        .worker-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px; }
+        .worker-details { color: #aaa; font-size: 0.75rem; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>🧠 {{ didier_version }}</h1>
+        <p>Interface de Contrôle Edge</p>
+        <div style="margin: 1.5rem 0;">
+            <div class="badge badge-model">Modèle: {{ ollama_model }}</div>
+            <div class="badge badge-status">Status: Opérationnel</div>
+        </div>
+        
+        <!-- Workers Edge Dashboard -->
+        <h3 style="color: #f59e0b; margin: 1.5rem 0 0.5rem 0; border-bottom: 1px solid #333; padding-bottom: 0.5rem;">🛠️ Workers Edge</h3>
+        <div class="workers-grid">
+            {% for item in audit_report %}
+            <div class="worker-item">
+                <div class="worker-header">
+                    <strong>{{ item.component }}</strong>
+                    <span class="badge {% if item.status == 'CRITICAL' %}badge-critical{% elif item.status == 'WARNING' %}badge-warning{% else %}badge-ok{% endif %}" style="font-size: 0.7rem; padding: 2px 6px;">{{ item.status }}</span>
+                </div>
+                <div class="worker-details">{{ item.details }}</div>
+            </div>
+            {% endfor %}
+        </div>
+
+        <p><em>"Je pense, donc je doute."</em></p>
+        <div class="refresh" onclick="location.reload()">Rafraîchir l'état</div>
+    </div>
+</body>
+</html>

@@ -1,0 +1,1094 @@
+import asyncio
+import base64
+import json
+import logging
+import os
+import signal
+import subprocess
+import time
+import threading
+from pathlib import Path
+from typing import Any, Generator
+
+import cv2
+import psutil
+import shutil
+import soundfile as sf
+import numpy as np
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+
+from core.logging import setup_logging
+from core.orchestrator import Orchestrator
+from core.routers import ai_router, system_router, vision_router
+from core.status import read_status, update_status
+from core.routers.actuators import router as actuators_router
+
+
+app = FastAPI(title="Didier Orchestrator", version="2.0")
+WEB_DIR = Path("web")
+#app.mount("/static", StaticFiles(directory="web"), name="static")
+INDEX_PATH = WEB_DIR / "index.html"
+VERSION_PATH = Path("VERSION")
+if WEB_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
+app.include_router(system_router)
+app.include_router(vision_router)
+app.include_router(ai_router)
+app.include_router(actuators_router)
+_orchestrator: Orchestrator | None = None
+_camera_watchdog_task: asyncio.Task | None = None
+_AUDIO_CACHE: dict[str, Any] = {"ts": 0.0, "level": None, "available": False}
+_AUDIO_CACHE_LOCK = threading.Lock()
+_NPU_CACHE: dict[str, Any] = {"ts": 0.0, "active": None, "util": None}
+_NPU_CACHE_LOCK = threading.Lock()
+_VIDEO_LOCK = threading.Lock()
+try:
+    import audioop  # type: ignore
+except Exception:  # pragma: no cover
+    audioop = None
+
+_VISION_TAGS_PATH = Path("data/vision/tags.json")
+_DOCKER_ROOT_CACHE: dict[str, Any] = {"path": None, "ts": 0.0}
+
+
+def _get_docker_root() -> Path:
+    cached = _DOCKER_ROOT_CACHE.get("path")
+    if cached and (time.time() - float(_DOCKER_ROOT_CACHE.get("ts", 0.0)) < 10):
+        return Path(cached)
+    default_root = Path("/host/var/lib/docker")
+    daemon_path = Path("/host/etc/docker/daemon.json")
+    docker_root = default_root
+    if daemon_path.exists():
+        try:
+            data = json.loads(daemon_path.read_text(encoding="utf-8"))
+            root = data.get("data-root") if isinstance(data, dict) else None
+            if root:
+                docker_root = Path("/host") / str(root).lstrip("/")
+        except Exception:
+            docker_root = default_root
+    _DOCKER_ROOT_CACHE["path"] = str(docker_root)
+    _DOCKER_ROOT_CACHE["ts"] = time.time()
+    return docker_root
+
+
+def _read_docker_containers() -> list[dict[str, Any]]:
+    containers: list[dict[str, Any]] = []
+    containers_dir = _get_docker_root() / "containers"
+    if not containers_dir.exists():
+        return containers
+    for cfg_path in containers_dir.glob("*/config.v2.json"):
+        try:
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        name = str(data.get("Name") or "").lstrip("/")
+        state = data.get("State") if isinstance(data.get("State"), dict) else {}
+        status = state.get("Status") if isinstance(state, dict) else None
+        if not status and isinstance(state, dict):
+            if state.get("Running") is True:
+                status = "running"
+        config = data.get("Config") if isinstance(data.get("Config"), dict) else {}
+        labels = config.get("Labels") if isinstance(config.get("Labels"), dict) else {}
+        service = labels.get("com.docker.compose.service") if labels else None
+        image = config.get("Image") or data.get("Image") or None
+        containers.append(
+            {
+                "id": data.get("ID"),
+                "name": name or service or "inconnu",
+                "service": service,
+                "status": status,
+                "image": image,
+            }
+        )
+    containers.sort(key=lambda item: str(item.get("name", "")))
+    return containers
+
+
+def _search_repo_files(query: str, limit: int = 40) -> list[dict[str, Any]]:
+    query = query.strip().lower()
+    if len(query) < 2:
+        return []
+    root = Path(".").resolve()
+    ignored = {
+        ".git",
+        ".deps",
+        "__pycache__",
+        "venv",
+        "node_modules",
+        "models",
+        "logs",
+        "data",
+        "ollama",
+        "voices",
+    }
+    results: list[dict[str, Any]] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in ignored and not d.startswith(".")]
+        for filename in filenames:
+            if filename.startswith("."):
+                continue
+            rel_path = str(Path(dirpath, filename).relative_to(root))
+            if query not in filename.lower() and query not in rel_path.lower():
+                continue
+            try:
+                size = (Path(dirpath) / filename).stat().st_size
+            except Exception:
+                size = None
+            results.append({"path": rel_path, "size": size})
+            if len(results) >= limit:
+                return results
+    return results
+
+
+def _load_vision_tags() -> dict[str, str]:
+    if not _VISION_TAGS_PATH.exists():
+        return {}
+    try:
+        data = json.loads(_VISION_TAGS_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return {str(k): str(v) for k, v in data.items() if v is not None}
+    except Exception:
+        return {}
+    return {}
+
+
+def _save_vision_tags(tags: dict[str, str]) -> None:
+    _VISION_TAGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _VISION_TAGS_PATH.write_text(
+        json.dumps(tags, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+async def _warmup_ollama() -> None:
+    try:
+        orchestrator = _require_orchestrator()
+        config = orchestrator.config
+        base_url = config.get("ollama.base_url", "http://localhost:11434")
+        model = config.get("ollama.model", "")
+        if not model:
+            return
+        payload: dict[str, Any] = {
+            "model": model,
+            "prompt": "Bonjour.",
+            "stream": False,
+            "options": {"num_predict": 1, "temperature": 0.2},
+        }
+        keep_alive = config.get("ollama.keep_alive", None)
+        if keep_alive:
+            payload["keep_alive"] = keep_alive
+        import httpx
+
+        async with httpx.AsyncClient(timeout=90) as client:
+            await client.post(f"{base_url}/api/generate", json=payload)
+    except Exception as exc:
+        logging.getLogger("API").warning("Ollama warmup failed: %s", exc)
+
+
+def _rms_pcm16(data: bytes) -> int:
+    if not data:
+        return 0
+    try:
+        samples = np.frombuffer(data, dtype=np.int16)
+        if samples.size == 0:
+            return 0
+        return int(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
+    except Exception:
+        return 0
+
+
+def _is_music_prompt(prompt: str) -> bool:
+    lowered = prompt.lower()
+    if "musique" not in lowered and "music" not in lowered:
+        return False
+    triggers = ("joue", "jouer", "lance", "mets", "play")
+    return any(token in lowered for token in triggers)
+
+
+def _resolve_expert_prompt(
+    prompt: str, config: Any
+) -> tuple[str, str | None, str | None, str | None]:
+    experts = config.get("ollama.experts", {}) if config else {}
+    if not isinstance(experts, dict):
+        return prompt, None, None, None
+    raw = prompt.strip()
+    lowered = raw.lower()
+    for name, entry in experts.items():
+        if not isinstance(entry, dict):
+            continue
+        key = str(name).strip()
+        if not key:
+            continue
+        key_lower = key.lower()
+        if lowered.startswith(f"@{key_lower}"):
+            cleaned = raw[len(key) + 1 :].lstrip(" :")
+        elif lowered.startswith(f"{key_lower}:") or lowered.startswith(f"{key_lower} "):
+            cleaned = raw[len(key) :].lstrip(" :")
+        else:
+            continue
+        model = entry.get("model", None)
+        system_prompt = entry.get("system_prompt", None)
+        return cleaned if cleaned else raw, model, system_prompt, key
+    return prompt, None, None, None
+
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    setup_logging()
+    global _orchestrator
+    _orchestrator = Orchestrator()
+    await _orchestrator.start()
+    global _camera_watchdog_task
+    _camera_watchdog_task = asyncio.create_task(_camera_watchdog())
+    asyncio.create_task(_warmup_ollama())
+    logging.getLogger("API").info("Didier API started.")
+
+
+@app.on_event("shutdown")
+async def shutdown_event() -> None:
+    if _orchestrator:
+        await _orchestrator.stop()
+    global _camera_watchdog_task
+    if _camera_watchdog_task:
+        _camera_watchdog_task.cancel()
+        _camera_watchdog_task = None
+
+
+def _require_orchestrator() -> Orchestrator:
+    if not _orchestrator:
+        raise HTTPException(status_code=503, detail="Orchestrator not ready")
+    return _orchestrator
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index() -> str:
+    if INDEX_PATH.exists():
+        return INDEX_PATH.read_text(encoding="utf-8")
+    return "<h1>Didier</h1><p>UI not found.</p>"
+
+
+def _read_cpu_temp_c() -> float | None:
+    temp_path = Path("/sys/class/thermal/thermal_zone0/temp")
+    if not temp_path.exists():
+        return None
+    try:
+        raw = temp_path.read_text().strip()
+        return round(float(raw) / 1000.0, 1)
+    except Exception:
+        return None
+
+
+def _format_go(value: int | float) -> str:
+    gb = float(value) / (1024**3)
+    if gb >= 10:
+        return f"{int(round(gb))}GO"
+    gb = round(gb, 1)
+    if gb.is_integer():
+        return f"{int(gb)}GO"
+    return f"{gb}GO"
+
+
+def _disk_usage(path: str, label_path: str | None = None) -> dict[str, Any]:
+    try:
+        usage = shutil.disk_usage(path)
+    except Exception:
+        return {"available": False, "path": label_path or path}
+    total = usage.total
+    used = usage.used
+    percent = round((used / total) * 100, 1) if total else 0
+    return {
+        "available": True,
+        "path": label_path or path,
+        "total": total,
+        "used": used,
+        "free": usage.free,
+        "percent": percent,
+        "label": f"{_format_go(used)}/{_format_go(total)}",
+    }
+
+
+def _resolve_disk_path(primary: str | None, fallbacks: list[str]) -> str | None:
+    candidates: list[str] = []
+    if primary:
+        candidates.append(primary)
+    for candidate in fallbacks:
+        if candidate:
+            candidates.append(candidate)
+    for candidate in candidates:
+        try:
+            if Path(candidate).exists():
+                return candidate
+        except Exception:
+            continue
+    return primary
+
+
+def _read_npu_usage(device_path: str | None, pcie_address: str | None) -> dict[str, Any]:
+    device_ok = Path(device_path).exists() if device_path else False
+    pcie_path = Path(f"/sys/bus/pci/devices/{pcie_address}") if pcie_address else None
+    pcie_ok = pcie_path.exists() if pcie_path else False
+    utilization = None
+    if device_ok and pcie_ok and pcie_path:
+        runtime_path = None
+        hailo_dir = pcie_path / "hailo_chardev"
+        if hailo_dir.exists():
+            for child in hailo_dir.iterdir():
+                candidate = child / "power" / "runtime_active_time"
+                if candidate.exists():
+                    runtime_path = candidate
+                    break
+        if runtime_path and runtime_path.exists():
+            try:
+                active = int(runtime_path.read_text().strip())
+                now = time.time()
+                with _NPU_CACHE_LOCK:
+                    last_active = _NPU_CACHE.get("active")
+                    last_ts = _NPU_CACHE.get("ts", 0.0)
+                    _NPU_CACHE["active"] = active
+                    _NPU_CACHE["ts"] = now
+                    if last_active is not None and last_ts:
+                        delta_active = max(0, active - last_active)
+                        delta_wall = max(0.001, now - last_ts)
+                        # runtime_active_time is usually in microseconds
+                        active_seconds = delta_active / 1_000_000
+                        utilization = int(
+                            max(0, min(100, (active_seconds / delta_wall) * 100))
+                        )
+                        _NPU_CACHE["util"] = utilization
+                    else:
+                        utilization = _NPU_CACHE.get("util")
+            except Exception:
+                utilization = None
+    return {"available": device_ok and pcie_ok, "utilization": utilization}
+
+
+def _read_asr_status() -> dict[str, Any]:
+    status = read_status()
+    status.setdefault("listening", False)
+    status.setdefault("thinking", False)
+    status.setdefault("speaking", False)
+    status.setdefault("state", "IDLE")
+    return status
+
+
+def _read_mic_level(
+    alsa_device: str, sample_rate: int, channels: int = 1, cooldown: float = 1.5
+) -> dict[str, Any]:
+    if not alsa_device:
+        return {"available": False, "level_percent": None, "listening": False}
+    if shutil.which("arecord") is None:
+        return {"available": False, "level_percent": None, "listening": False}
+    status = _read_asr_status()
+    if status.get("listening"):
+        with _AUDIO_CACHE_LOCK:
+            cached_level = _AUDIO_CACHE["level"]
+        return {
+            "available": True,
+            "level_percent": cached_level,
+            "listening": True,
+        }
+    now = time.time()
+    with _AUDIO_CACHE_LOCK:
+        if now - _AUDIO_CACHE["ts"] < cooldown and _AUDIO_CACHE["level"] is not None:
+            return {
+                "available": bool(_AUDIO_CACHE["available"]),
+                "level_percent": _AUDIO_CACHE["level"],
+                "cached": True,
+                "listening": False,
+            }
+
+    cmd = [
+        "arecord",
+        "-q",
+        "-D",
+        alsa_device,
+        "-f",
+        "S16_LE",
+        "-r",
+        str(sample_rate),
+        "-c",
+        str(channels),
+        "-d",
+        "1",
+        "-t",
+        "raw",
+    ]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, check=False, timeout=2
+        )
+        data = result.stdout or b""
+        if not data:
+            level_percent = 0
+        else:
+            if audioop:
+                rms = audioop.rms(data, 2)
+            else:
+                rms = _rms_pcm16(data)
+            level_percent = int(min(100, max(0, (rms / 32768) * 100)))
+        with _AUDIO_CACHE_LOCK:
+            _AUDIO_CACHE["ts"] = time.time()
+            _AUDIO_CACHE["level"] = level_percent
+            _AUDIO_CACHE["available"] = True
+        return {"available": True, "level_percent": level_percent, "listening": False}
+    except Exception as exc:
+        return {
+            "available": False,
+            "level_percent": None,
+            "listening": False,
+            "error": str(exc),
+        }
+
+
+def _read_version() -> dict[str, Any]:
+    git_hash = None
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        git_hash = result.stdout.strip()
+    except Exception:
+        git_hash = None
+
+    file_version = None
+    if VERSION_PATH.exists():
+        file_version = VERSION_PATH.read_text(encoding="utf-8").strip()
+
+    return {"git": git_hash, "version": file_version}
+
+
+async def _resolve_ollama_model(
+    base_url: str, preferred: str, fallback: str | None = None
+) -> str:
+    try:
+        import httpx
+
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get(f"{base_url}/api/tags")
+            response.raise_for_status()
+            data = response.json()
+        models = [
+            m.get("name") or m.get("model")
+            for m in (data.get("models") or [])
+            if (m.get("name") or m.get("model"))
+        ]
+        if preferred in models:
+            return preferred
+        if fallback and fallback in models:
+            return fallback
+        if models:
+            return models[0]
+    except Exception:
+        pass
+    return preferred
+
+
+def _check_soundboks_sink(sink_name: str) -> dict[str, Any]:
+    try:
+        result = subprocess.run(
+            ["pactl", "list", "short", "sinks"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        available = sink_name in result.stdout
+        return {"available": available, "sink": sink_name}
+    except Exception as exc:
+        return {"available": False, "sink": sink_name, "error": str(exc)}
+
+
+def _camera_holders(device: str | None) -> dict[str, Any]:
+    if not device:
+        return {"output": "Aucun périphérique configuré"}
+    if shutil.which("fuser") is None:
+        return {"output": "fuser indisponible"}
+    verbose = subprocess.run(
+        ["fuser", "-v", device], capture_output=True, text=True, check=False
+    )
+    plain = subprocess.run(
+        ["fuser", device], capture_output=True, text=True, check=False
+    )
+    output_verbose = ((verbose.stdout or "") + (verbose.stderr or "")).strip()
+    output_plain = ((plain.stdout or "") + (plain.stderr or "")).strip()
+    pids = []
+    for token in output_plain.replace(":", " ").split():
+        if token.isdigit():
+            pids.append(token)
+    pids = sorted(set(pids))
+    if not pids:
+        # Fallback: scan /proc for open fds
+        for pid_dir in Path("/proc").iterdir():
+            if not pid_dir.name.isdigit():
+                continue
+            fd_dir = pid_dir / "fd"
+            if not fd_dir.exists():
+                continue
+            try:
+                for fd in fd_dir.iterdir():
+                    try:
+                        target = os.readlink(fd)
+                    except OSError:
+                        continue
+                    if target == device:
+                        pids.append(pid_dir.name)
+                        break
+            except PermissionError:
+                continue
+        pids = sorted(set(pids))
+    details = []
+    if pids:
+        ps = subprocess.run(
+            ["ps", "-o", "pid,user,comm", "-p", ",".join(pids)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        ps_output = (ps.stdout or "").strip()
+        details.append(f"PIDs : {', '.join(pids)}")
+        if ps_output:
+            details.append(ps_output)
+            if "uvicorn" in ps_output:
+                details.append(
+                    "Note : le flux MJPEG de Didier garde la caméra ouverte tant que la page est ouverte."
+                )
+    if output_verbose:
+        details.append("fuser -v :")
+        details.append(output_verbose)
+    if not details:
+        details.append(
+            "Aucun PID détecté. Peut-être un accès noyau ou un processus root hors conteneur."
+        )
+    return {"output": "\n".join(details), "pids": pids}
+
+
+def _camera_reconnect(device: str | None) -> dict[str, Any]:
+    pids: list[int] = []
+    if device and shutil.which("fuser"):
+        result = subprocess.run(["fuser", device], capture_output=True, text=True, check=False)
+        tokens = (result.stdout or "").replace(":", " ").split()
+        own_pids = {os.getpid(), os.getppid()}
+        for token in tokens:
+            if token.isdigit():
+                pid = int(token)
+                if pid not in own_pids:
+                    pids.append(pid)
+    # Kill known camera processes as a fallback
+    for name in ["libcamera-vid", "libcamera-still", "libcamera-hello", "rpicam-vid", "rpicam-still", "mjpg_streamer", "ffmpeg", "gst-launch-1.0"]:
+        subprocess.run(["pkill", "-9", "-f", name], check=False)
+    if pids:
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except Exception:
+                pass
+        time.sleep(0.2)
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
+    if shutil.which("modprobe"):
+        modules_dir = Path("/lib/modules")
+        if modules_dir.exists():
+            subprocess.run(["modprobe", "-r", "uvcvideo"], check=False)
+            subprocess.run(["modprobe", "uvcvideo"], check=False)
+    return {"status": "relance tentée"}
+
+
+def _camera_force_format(device: str | None, width: int | None, height: int | None, fourcc: str | None) -> dict[str, Any]:
+    if not device:
+        return {"status": "aucun périphérique configuré"}
+    if shutil.which("v4l2-ctl") is None:
+        return {"status": "v4l2-ctl absent"}
+    width = width or 640
+    height = height or 480
+    fourcc = fourcc or "YUYV"
+    cmd = [
+        "v4l2-ctl",
+        "-d",
+        device,
+        f"--set-fmt-video=width={width},height={height},pixelformat={fourcc}",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    output = (result.stdout or "") + (result.stderr or "")
+    return {"status": "format tenté", "output": output.strip()}
+
+
+def _check_camera(index: int, device: str | None) -> dict[str, Any]:
+    try:
+        cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
+        opened = cap.isOpened()
+        ret = False
+        if opened:
+            ret, _ = cap.read()
+        cap.release()
+        return {
+            "device": device or f"index:{index}",
+            "opened": opened,
+            "frame": ret,
+        }
+    except Exception as exc:
+        return {"device": device or f"index:{index}", "opened": False, "error": str(exc)}
+
+
+def _check_camera_mic() -> dict[str, Any]:
+    cards_path = Path("/proc/asound/cards")
+    if not cards_path.exists():
+        return {"available": False, "error": "no /proc/asound/cards"}
+    content = cards_path.read_text(encoding="utf-8")
+    available = "USB" in content or "Camera" in content or "PS3" in content
+    return {"available": available}
+
+
+def _check_camera_usb(vendor: str | None, product: str | None) -> dict[str, Any]:
+    if not vendor or not product:
+        return {"present": False, "error": "usb id not configured"}
+    base = Path("/sys/bus/usb/devices")
+    if not base.exists():
+        return {"present": False, "error": "no /sys/bus/usb/devices"}
+    for dev in base.iterdir():
+        v = dev / "idVendor"
+        p = dev / "idProduct"
+        if not v.exists() or not p.exists():
+            continue
+        if v.read_text().strip().lower() == vendor.lower() and p.read_text().strip().lower() == product.lower():
+            return {"present": True, "path": str(dev)}
+    return {"present": False}
+
+
+def _check_npu(device_path: str | None, pcie_address: str | None) -> dict[str, Any]:
+    device_ok = Path(device_path).exists() if device_path else False
+    pcie_ok = Path(f"/sys/bus/pci/devices/{pcie_address}").exists() if pcie_address else False
+    return {"device": device_ok, "pcie": pcie_ok}
+
+
+def _check_tts(
+    model_path: str | None, config_path: str | None, voices_path: str | None = None
+) -> dict[str, Any]:
+    model_ok = Path(model_path).exists() if model_path else False
+    config_ok = Path(config_path).exists() if config_path else False
+    voices_ok = Path(voices_path).exists() if voices_path else False
+    paplay_ok = shutil.which("paplay") is not None
+    return {
+        "model": model_ok,
+        "config": config_ok or voices_ok,
+        "paplay": paplay_ok,
+    }
+
+
+def _normalize_zones(
+    zones: Any, width: int | None, height: int | None
+) -> list[dict[str, Any]]:
+    if not zones:
+        return []
+    normalized: list[dict[str, Any]] = []
+    for idx, zone in enumerate(zones):
+        name = f"zone-{idx + 1}"
+        color = None
+        if isinstance(zone, dict):
+            name = zone.get("name", name)
+            color = zone.get("color")
+            x, y, w, h = (
+                zone.get("x"),
+                zone.get("y"),
+                zone.get("w"),
+                zone.get("h"),
+            )
+        elif isinstance(zone, (list, tuple)) and len(zone) >= 4:
+            x, y, w, h = zone[:4]
+        else:
+            continue
+        try:
+            x = float(x)
+            y = float(y)
+            w = float(w)
+            h = float(h)
+        except Exception:
+            continue
+        if max(x, y, w, h) > 1.0:
+            if width and height:
+                x = x / float(width)
+                y = y / float(height)
+                w = w / float(width)
+                h = h / float(height)
+            else:
+                continue
+        x = max(0.0, min(1.0, x))
+        y = max(0.0, min(1.0, y))
+        w = max(0.0, min(1.0, w))
+        h = max(0.0, min(1.0, h))
+        normalized.append(
+            {
+                "name": name,
+                "color": color,
+                "x": x,
+                "y": y,
+                "w": w,
+                "h": h,
+            }
+        )
+    return normalized
+
+
+async def _camera_watchdog() -> None:
+    while True:
+        await asyncio.sleep(10)
+        if _orchestrator is None:
+            continue
+        cfg = _orchestrator.config
+        if not cfg.get("vision.watchdog_enabled", False):
+            continue
+        camera_index = int(cfg.get("vision.camera_index", 0))
+        camera_device = cfg.get("vision.camera_device", None)
+        result = _check_camera(camera_index, camera_device)
+        if not result.get("opened") or not result.get("frame"):
+            _camera_reconnect(camera_device)
+
+
+def _apply_camera_settings(
+    cap: cv2.VideoCapture, width: int | None, height: int | None, fps: int | None, fourcc: str | None
+) -> None:
+    if fourcc:
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
+    if width:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    if height:
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    if fps:
+        cap.set(cv2.CAP_PROP_FPS, fps)
+
+
+def _open_camera(
+    device: str | None,
+    index: int,
+    width: int | None,
+    height: int | None,
+    fps: int | None,
+    fourcc: str | None,
+    kill_on_open: bool = False,
+) -> cv2.VideoCapture:
+    if kill_on_open and device and shutil.which("fuser"):
+        try:
+            result = subprocess.run(
+                ["fuser", device], capture_output=True, text=True, check=False
+            )
+            own_pids = {os.getpid(), os.getppid()}
+            tokens = (result.stdout or "").replace(":", " ").split()
+            for token in tokens:
+                if not token.isdigit():
+                    continue
+                pid = int(token)
+                if pid in own_pids:
+                    continue
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    if device:
+        cap = cv2.VideoCapture(device)
+        if cap.isOpened():
+            _apply_camera_settings(cap, width, height, fps, fourcc)
+            return cap
+        cap.release()
+        cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
+        if cap.isOpened():
+            _apply_camera_settings(cap, width, height, fps, fourcc)
+            return cap
+    cap = cv2.VideoCapture(index)
+    if cap.isOpened():
+        _apply_camera_settings(cap, width, height, fps, fourcc)
+        return cap
+    cap.release()
+    cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
+    _apply_camera_settings(cap, width, height, fps, fourcc)
+    return cap
+
+
+def _mjpeg_generator(
+    camera_device: str | None,
+    camera_index: int,
+    width: int | None,
+    height: int | None,
+    fps: int | None,
+    fourcc: str | None,
+    kill_on_open: bool,
+) -> Generator[bytes, None, None]:
+    if not _VIDEO_LOCK.acquire(blocking=False):
+        raise RuntimeError("Camera busy")
+    cap = _open_camera(
+        camera_device, camera_index, width, height, fps, fourcc, kill_on_open
+    )
+    if not cap.isOpened():
+        cap.release()
+        if camera_device:
+            try:
+                yield from _mjpeg_generator_v4l2(
+                    camera_device, width, height, fps, fourcc
+                )
+            finally:
+                _VIDEO_LOCK.release()
+            return
+        _VIDEO_LOCK.release()
+        raise RuntimeError("Unable to open camera")
+    failures = 0
+    reopen_attempts = 0
+    try:
+        for _ in range(5):
+            cap.read()
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                failures += 1
+                if failures >= 30:
+                    cap.release()
+                    time.sleep(0.2)
+                    cap = _open_camera(
+                        camera_device,
+                        camera_index,
+                        width,
+                        height,
+                        fps,
+                        fourcc,
+                        kill_on_open,
+                    )
+                    reopen_attempts += 1
+                    failures = 0
+                    if reopen_attempts >= 2 and camera_device:
+                        cap.release()
+                        yield from _mjpeg_generator_v4l2(
+                            camera_device, width, height, fps, fourcc
+                        )
+                        return
+                time.sleep(0.05)
+                continue
+            failures = 0
+            ok, buffer = cv2.imencode(".jpg", frame)
+            if not ok:
+                continue
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
+            )
+            time.sleep(0.03)
+    finally:
+        cap.release()
+        _VIDEO_LOCK.release()
+
+
+def _mjpeg_generator_from_vision(vision: Any) -> Generator[bytes, None, None]:
+    last_frame = None
+    while True:
+        frame = None
+        try:
+            frame = vision.get_latest_jpeg()
+        except Exception:
+            frame = None
+        if frame:
+            if frame is not last_frame:
+                last_frame = frame
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+            )
+        time.sleep(0.03)
+
+
+def _mjpeg_generator_v4l2(
+    camera_device: str,
+    width: int | None,
+    height: int | None,
+    fps: int | None,
+    fourcc: str | None,
+) -> Generator[bytes, None, None]:
+    if shutil.which("v4l2-ctl") is None:
+        raise RuntimeError("v4l2-ctl absent")
+    width = int(width or 640)
+    height = int(height or 480)
+    fourcc = (fourcc or "YUYV").upper()
+    fmt_cmd = [
+        "v4l2-ctl",
+        "-d",
+        camera_device,
+        f"--set-fmt-video=width={width},height={height},pixelformat={fourcc}",
+    ]
+    subprocess.run(fmt_cmd, check=False)
+    if fps:
+        subprocess.run(
+            ["v4l2-ctl", "-d", camera_device, f"--set-parm={int(fps)}"],
+            check=False,
+        )
+    cmd = [
+        "v4l2-ctl",
+        "-d",
+        camera_device,
+        "--stream-mmap",
+        "--stream-count=100000",
+        "--stream-to=-",
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    if not proc.stdout:
+        proc.terminate()
+        raise RuntimeError("v4l2-ctl stdout unavailable")
+    bytes_per_pixel = 2
+    if fourcc in {"GRBG", "RGGB", "GBRG", "BGGR"}:
+        bytes_per_pixel = 1
+    frame_size = width * height * bytes_per_pixel
+
+    def read_exact(size: int) -> bytes | None:
+        data = b""
+        while len(data) < size:
+            chunk = proc.stdout.read(size - len(data))
+            if not chunk:
+                return None
+            data += chunk
+        return data
+
+    try:
+        import numpy as np
+
+        while True:
+            raw = read_exact(frame_size)
+            if raw is None:
+                break
+            if bytes_per_pixel == 2:
+                frame = np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 2))
+                if fourcc == "UYVY":
+                    bgr = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_UYVY)
+                else:
+                    bgr = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_YUYV)
+            else:
+                frame = np.frombuffer(raw, dtype=np.uint8).reshape((height, width))
+                bgr = cv2.cvtColor(frame, cv2.COLOR_BayerGR2BGR)
+            ok, buffer = cv2.imencode(".jpg", bgr)
+            if not ok:
+                continue
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
+            )
+            time.sleep(0.03)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            proc.kill()
+
+
+class RemoteMjpegStream:
+    def __init__(self, input_url: str, fps: int = 15) -> None:
+        self._input_url = input_url
+        self._fps = fps
+        self._proc: subprocess.Popen | None = None
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._last_jpeg: bytes | None = None
+        self._last_ts: float = 0.0
+        self._last_error: str | None = None
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        if shutil.which("ffmpeg") is None:
+            self._last_error = "ffmpeg not installed"
+            return
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-fflags",
+            "nobuffer",
+            "-flags",
+            "low_delay",
+            "-i",
+            self._input_url,
+            "-an",
+            "-vf",
+            f"fps={self._fps}",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "mjpeg",
+            "-",
+        ]
+        try:
+            self._proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+        except Exception as exc:
+            self._last_error = str(exc)
+            return
+        buffer = b""
+        try:
+            while not self._stop.is_set():
+                if not self._proc or not self._proc.stdout:
+                    break
+                chunk = self._proc.stdout.read(4096)
+                if not chunk:
+                    break
+                buffer += chunk
+                while True:
+                    start = buffer.find(b"\xff\xd8")
+                    if start == -1:
+                        break
+                    end = buffer.find(b"\xff\xd9", start + 2)
+                    if end == -1:
+                        break
+                    frame = buffer[start : end + 2]
+                    buffer = buffer[end + 2 :]
+                    with self._lock:
+                        self._last_jpeg = frame
+                        self._last_ts = time.time()
+        finally:
+            if self._proc:
+                try:
+                    self._proc.terminate()
+                except Exception:
+                    pass
+                self._proc = None
+
+    def get_last(self) -> tuple[bytes | None, float]:
+        with self._lock:
+            return self._last_jpeg, self._last_ts
+
+
+_REMOTE_STREAM: RemoteMjpegStream | None = None
+_REMOTE_STREAM_LOCK = threading.Lock()
+
+
+def _get_remote_stream(input_url: str, fps: int = 15) -> RemoteMjpegStream:
+    global _REMOTE_STREAM
+    with _REMOTE_STREAM_LOCK:
+        if _REMOTE_STREAM is None or _REMOTE_STREAM._input_url != input_url:
+            _REMOTE_STREAM = RemoteMjpegStream(input_url, fps=fps)
+        _REMOTE_STREAM.start()
+        return _REMOTE_STREAM
+
+
+def _remote_mjpeg_generator(stream: RemoteMjpegStream) -> Generator[bytes, None, None]:
+    last_sent = None
+    target_fps = max(int(getattr(stream, "_fps", 15) or 15), 1)
+    interval_s = max(1.0 / float(target_fps), 0.03)
+    while True:
+        frame, _ts = stream.get_last()
+        if frame and frame is not last_sent:
+            last_sent = frame
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+            )
+        time.sleep(interval_s)

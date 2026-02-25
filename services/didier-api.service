@@ -1,0 +1,36 @@
+[Unit]
+Description=Didier Unified API Entry (Uvicorn 5010)
+After=network-online.target didier-vision.service didier-brain.service didier-audio.service didier-asr.service
+Wants=network-online.target
+Conflicts=run_didier.service didier.service
+
+[Service]
+WorkingDirectory=/mnt/didier_ssd/didier/workspace/Didier
+User=tchernobog
+Environment=PATH=/mnt/didier_ssd/didier/workspace/Didier/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=PULSE_SERVER=unix:/run/user/1000/pulse/native
+Environment=DIDIER_LOG_DIR=/mnt/didier_ssd/didier/workspace/Didier/logs
+Environment=DIDIER_LOG_LEVEL=INFO
+Environment=DIDIER_LOG_ROTATE_MB=25
+Environment=DIDIER_LOG_BACKUPS=14
+Environment=DIDIER_VISION_SOCK=/tmp/didier_vision.sock
+Environment=DIDIER_BRAIN_SOCK=/tmp/didier_brain.sock
+Environment=DIDIER_AUDIO_SOCK=/tmp/didier_audio.sock
+Environment=DIDIER_API_SHARED_STATE_INTERVAL_S=1.0
+Environment=DIDIER_ASR_WORKER_MODE=1
+Environment=DIDIER_ASR_WORKER_URL=http://127.0.0.1:5014
+ExecStart=/mnt/didier_ssd/didier/workspace/Didier/venv/bin/uvicorn core.api:app --host 0.0.0.0 --port 5010 --no-access-log --timeout-keep-alive 2
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=20s
+TimeoutStopSec=10s
+KillSignal=SIGTERM
+CPUQuota=80%
+MemoryMax=1.5G
+Nice=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

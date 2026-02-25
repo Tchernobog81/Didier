@@ -1,0 +1,41 @@
+[Unit]
+Description=Didier MVP Vision Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/mnt/didier_ssd/didier/workspace/Didier
+User=tchernobog
+Environment=PATH=/mnt/didier_ssd/didier/workspace/Didier/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=DIDIER_VISION_HOST=127.0.0.1
+Environment=DIDIER_VISION_PORT=5011
+Environment=DIDIER_VISION_SOCK=/tmp/didier_vision.sock
+Environment=DIDIER_VISION_FPS=30
+Environment=DIDIER_VISION_SHARED_STATE_INTERVAL_S=1.0
+Environment=DIDIER_VISION_TAPPAS_RESTART_INTERVAL_S=6
+Environment=DIDIER_VISION_ENABLE_TAPPAS=0
+Environment=DIDIER_VISION_DEVICE=/dev/video0
+Environment=DIDIER_VISION_WIDTH=640
+Environment=DIDIER_VISION_HEIGHT=480
+Environment=DIDIER_VISION_SEE_MAX_AGE_S=2.5
+Environment=DIDIER_VISION_SEE_OWNER_CHECK=1
+Environment=DIDIER_VISION_SEE_OWNER_TIMEOUT_S=0.8
+Environment="DIDIER_VISION_ROOM_HINT=la piece"
+Environment=DIDIER_HAILO_HEF=/mnt/didier_ssd/didier/models/hailo/hailo_model.hef
+Environment=HAILO_MONITOR=1
+Environment="DIDIER_TAPPAS_COMMAND=/bin/bash -lc 'gst-launch-1.0 -q v4l2src device=/dev/video0 io-mode=2 ! video/x-raw,format=YUY2,width=640,height=480,framerate=30/1 ! videoconvert ! videoscale ! video/x-raw,format=RGB,width=640,height=640,framerate=30/1 ! hailonet hef-path=/mnt/didier_ssd/didier/models/hailo/hailo_model.hef ! fakesink sync=false || gst-launch-1.0 -q videotestsrc is-live=true pattern=ball ! video/x-raw,format=RGB,width=640,height=640,framerate=30/1 ! hailonet hef-path=/mnt/didier_ssd/didier/models/hailo/hailo_model.hef ! fakesink sync=false'"
+ExecStartPre=-/usr/bin/rm -f /tmp/didier_vision.sock
+ExecStart=/mnt/didier_ssd/didier/workspace/Didier/venv/bin/python /mnt/didier_ssd/didier/workspace/Didier/scripts/run_vision.py
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=20s
+TimeoutStopSec=10s
+KillSignal=SIGTERM
+CPUQuota=80%
+MemoryMax=1.5G
+Nice=4
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

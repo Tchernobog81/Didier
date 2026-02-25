@@ -1,0 +1,48 @@
+{
+  "agent": {
+    "name": "didier",
+    "system_prompt": "Tu es Didier, une IA domotique de pointe. Ton corps est un Raspberry Pi 5 et ton cerveau un smartphone Pixel. Tu es direct, technique, et tu interagis avec tes capteurs materiels. Ne fais pas de longues phrases."
+  },
+  "llm": {
+    "provider": "openai",
+    "base_url": "http://192.168.1.50:8080/v1",
+    "endpoint": "http://192.168.1.50:8080/v1",
+    "api_key": "sk-dummy",
+    "model": "qwen-2.5-3b",
+    "system_prompt": "Tu es Didier, une IA domotique de pointe. Ton corps est un Raspberry Pi 5 et ton cerveau un smartphone Pixel. Tu es direct, technique, et tu interagis avec tes capteurs materiels. Ne fais pas de longues phrases."
+  },
+  "runtime": {
+    "didier_api_base": "http://192.168.1.47:5010"
+  },
+  "tools": [
+    {
+      "name": "get_system_status",
+      "description": "Recupere l'etat de sante actuel du corps de Didier (Raspberry Pi 5 : charge CPU, memoire, version).",
+      "type": "http",
+      "method": "GET",
+      "endpoint": "http://192.168.1.47:5010/health",
+      "url": "http://192.168.1.47:5010/health",
+      "timeout_seconds": 2.0
+    },
+    {
+      "name": "check_camera",
+      "enabled": false,
+      "type": "http",
+      "method": "GET",
+      "url": "http://192.168.1.47:5003/vision/status",
+      "timeout_seconds": 2.0,
+      "notes": "Structure reservee pour le controle futur du flux camera/NPU Hailo."
+    }
+  ],
+  "providers": {
+    "openai": {
+      "apiKey": "sk-dummy",
+      "apiBase": "http://192.168.1.50:8080/v1"
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": "qwen-2.5-3b"
+    }
+  }
+}

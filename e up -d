@@ -1,0 +1,17 @@
+[0;1;34m# ]8;;file://didier/etc/systemd/system/run_didier.service\/etc/systemd/system/run_didier.service]8;;\[0m
+[0;1;36m[Unit][0m
+[0;1;32mDescription=[0mDidier Orchestrator
+[0;1;32mAfter=[0mnetwork.target
+[0;1;38:5:245m[0m
+[0;1;36m[Service][0m
+[0;1;32mUser=[0mtchernobog
+[0;1;32mWorkingDirectory=[0m/home/tchernobog/workspace/Didier
+[0;1;32mEnvironment=[0mPATH=/home/tchernobog/workspace/Didier/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+[0;1;32mEnvironment=[0mXDG_RUNTIME_DIR=/run/user/1000
+[0;1;32mEnvironment=[0mPULSE_SERVER=unix:/run/user/1000/pulse/native
+[0;1;32mExecStart=[0m/home/tchernobog/workspace/Didier/venv/bin/uvicorn core.api:app --host 0.0.0.0 --port 5003
+[0;1;32mRestart=[0mon-failure
+[0;1;32mRestartSec=[0m5s
+[0;1;38:5:245m[0m
+[0;1;36m[Install][0m
+[0;1;32mWantedBy=[0mmulti-user.target

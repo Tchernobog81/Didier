@@ -1,0 +1,35 @@
+[Unit]
+Description=Didier MVP Brain Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/mnt/didier_ssd/didier/workspace/Didier
+User=tchernobog
+Environment=PATH=/mnt/didier_ssd/didier/workspace/Didier/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=DIDIER_BRAIN_HOST=127.0.0.1
+Environment=DIDIER_BRAIN_PORT=5012
+Environment=DIDIER_BRAIN_SOCK=/tmp/didier_brain.sock
+Environment=DIDIER_OLLAMA_BASE_URL=http://127.0.0.1:11434
+Environment=DIDIER_OLLAMA_UNIX_SOCKET=/run/ollama/ollama.sock
+Environment=DIDIER_BRAIN_MODEL=llama3.2:3b
+Environment=DIDIER_MICRO_BRAIN_ENABLED=1
+Environment=DIDIER_MICRO_POLL_S=1.0
+Environment=DIDIER_BRAIN_SHARED_STATE_INTERVAL_S=1.0
+Environment=DIDIER_BRAIN_TASK_ROUTING=1
+Environment=DIDIER_BRAIN_TASK_ROUTE_TARGET=picobot
+ExecStartPre=-/usr/bin/rm -f /tmp/didier_brain.sock
+ExecStart=/mnt/didier_ssd/didier/workspace/Didier/venv/bin/python /mnt/didier_ssd/didier/workspace/Didier/scripts/run_brain.py
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=20s
+TimeoutStopSec=10s
+KillSignal=SIGTERM
+CPUQuota=80%
+MemoryMax=1.5G
+Nice=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
