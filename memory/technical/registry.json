@@ -1,6 +1,6 @@
 {
   "schema": "didier.technical_registry.v1",
-  "updated_at": "2026-02-28",
+  "updated_at": "2026-03-01",
   "status": "active",
   "canonical_sources": {
     "static_config": {
@@ -100,7 +100,27 @@
     {
       "date": "2026-03-01",
       "area": "session-handoff",
-      "notes": "A restart-ready checkpoint handoff now lives in memory/technical/next-session.md, including the active runtime state, the generated YOLO26 artifacts, the missing-DFC blocker, and the first-step plan for resuming with a compiled yolo26n.hef."
+      "notes": "memory/technical/next-session.md now records the latest validated YOLO26 runtime state: tentacles/vision.py decodes paired 4ch+80ch heads, uses letterbox preprocessing for 640x480 -> 640x640 instead of stretching, exposes detector_debug via /vision/status, and config/config.json now pins vision.npu_score_threshold to 0.15. With these two changes, raw Hailo detections are restored and /vision/detections again reports real objects (latest confirmed example: person)."
+    },
+    {
+      "date": "2026-03-01",
+      "area": "vision-ui-stabilization",
+      "notes": "Validated UI/runtime state now includes: primary non-empty hold, more stable remote MJPEG handling, suppression of shape-only secondary fallback noise when Hailo is active, explicit Hailo activity rendering in the NPU tile when utilization is unavailable, and wire-label object-first overlays in the vision UI (release line up to didier-v4r30-wire-label-object-diagnostics-2026-03-01). The next follow-up is full COCO 80-class naming normalization in the active runtime/UI."
+    },
+    {
+      "date": "2026-03-01",
+      "area": "vision-v4r36-surface-cadence-parity",
+      "notes": "Validated runtime state now includes the v4r36 Surface cadence fix: the remote MJPEG HTTP generator no longer follows arbitration target FPS when the backend reader is healthy, so the configured 15 fps Surface stream is emitted at its real cadence instead of dropping to 10 fps in TENDU. During the validation window, both /vision/detections and /vision/detections-secondary returned the same semantic Hailo class (`personne`), and /metrics exposed live NPU activity through estimated utilization plus real_fps when the driver percentage stayed unavailable."
+    },
+    {
+      "date": "2026-03-01",
+      "area": "vision-v4r37-coco-hints-visible",
+      "notes": "Validated runtime state now includes explicit `semantic_hints` on primary and secondary detection payloads plus UI support for object-first COCO hint banners/tags when no detection is confirmed yet. This makes sub-threshold COCO classes visible (for example `personne`, `camion`, `parapluie`, `television`) without lowering thresholds again, while keeping v4r36 stream cadence and NPU telemetry behavior intact."
+    },
+    {
+      "date": "2026-03-01",
+      "area": "actuators-v4r40-yeelight-binding-hardening",
+      "notes": "Validated runtime state now includes hardened Yeelight binding repair: tentacles/actuators.py uses SSDP discovery plus a bounded nearby TCP scan to recover from DHCP drift, treats missing hardware IDs as null instead of the literal string `None`, and refuses heuristic multi-lamp rebinding when discovery is incomplete. The repaired registry now maps the six logical lamp IDs to the currently measured reachable IPs, and config/actuators.json persists the canonical manual color-sync baseline captured on 2026-03-01 (`power_on=true`, `bright=80`, `rgb=65283`, `hex=#00FF03`, `hue=121`, `sat=100`)."
     }
   ],
   "hotspots": [

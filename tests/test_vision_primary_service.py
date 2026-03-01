@@ -39,6 +39,42 @@ class VisionPrimaryServiceTests(unittest.TestCase):
         self.assertEqual(state.last_payload_ts, 5.0)
         self.assertEqual(state.last_payload["frame"]["width"], 10)
 
+    def test_fresh_cached_payload_holds_recent_non_empty_when_latest_is_empty(self) -> None:
+        state = PrimaryDetectionsState(
+            cache_ttl_s=0.7,
+            non_empty_hold_ttl_s=1.2,
+            last_payload_ts=10.0,
+            last_payload={"detections": [], "frame": {"width": 10, "height": 10}},
+            last_non_empty_ts=9.8,
+            last_non_empty_payload={
+                "detections": [{"label": "personne"}],
+                "frame": {"width": 10, "height": 10},
+            },
+        )
+
+        cached = state.fresh_cached_payload(10.3, source="primary_cache")
+
+        self.assertIsNotNone(cached)
+        self.assertEqual(cached["source"], "primary_hold_non_empty")
+        self.assertEqual(cached["detections"][0]["label"], "personne")
+
+    def test_finalize_fresh_payload_holds_recent_non_empty_when_new_payload_is_empty(self) -> None:
+        state = PrimaryDetectionsState(non_empty_hold_ttl_s=1.2)
+        state.last_non_empty_ts = 5.0
+        state.last_non_empty_payload = {
+            "detections": [{"label": "voiture"}],
+            "frame": {"width": 10, "height": 10},
+        }
+
+        result = state.finalize_fresh_payload(
+            {"detections": [], "frame": {"width": 10, "height": 10}, "ts": 1.0},
+            refreshed_at=5.4,
+        )
+
+        self.assertEqual(result["source"], "primary_hold_non_empty")
+        self.assertEqual(result["detections"][0]["label"], "voiture")
+        self.assertEqual(state.last_payload["detections"], [])
+
     def test_empty_payload_is_standardized(self) -> None:
         state = PrimaryDetectionsState()
 

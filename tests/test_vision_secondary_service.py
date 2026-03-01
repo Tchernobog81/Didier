@@ -7,11 +7,12 @@ from core.vision_secondary_service import secondary_min_interval_s
 
 
 class _Arbitrator:
-    def __init__(self, mode: str) -> None:
+    def __init__(self, mode: str, target_fps: int = 20) -> None:
         self._mode = mode
+        self._target_fps = target_fps
 
-    def snapshot(self) -> dict[str, str]:
-        return {"mode": self._mode}
+    def snapshot(self) -> dict[str, object]:
+        return {"mode": self._mode, "limits": {"target_fps": self._target_fps}}
 
 
 class VisionSecondaryServiceTests(unittest.TestCase):
@@ -30,9 +31,9 @@ class VisionSecondaryServiceTests(unittest.TestCase):
         self.assertEqual(enriched["detections"][0]["shape"], "quadrilatere")
 
     def test_secondary_min_interval_s_respects_arbitration_mode(self) -> None:
-        self.assertEqual(secondary_min_interval_s(_Arbitrator("NOMINAL")), 1.2)
-        self.assertEqual(secondary_min_interval_s(_Arbitrator("TENDU")), 2.0)
-        self.assertEqual(secondary_min_interval_s(_Arbitrator("SURVIE")), 3.5)
+        self.assertEqual(secondary_min_interval_s(_Arbitrator("NOMINAL", target_fps=20)), 0.12)
+        self.assertEqual(secondary_min_interval_s(_Arbitrator("TENDU", target_fps=10)), 0.2)
+        self.assertEqual(secondary_min_interval_s(_Arbitrator("SURVIE", target_fps=6)), 1.25)
 
     def test_secondary_state_prefers_recent_non_empty_hold_when_cache_is_empty(self) -> None:
         state = SecondaryDetectionsState(non_empty_hold_ttl_s=4.0)

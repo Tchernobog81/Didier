@@ -58,3 +58,27 @@ def vision_npu_status(
         "execution_target": target,
         "reason": reason,
     }
+
+
+def estimated_npu_utilization(
+    *,
+    infer_fps: float,
+    secondary_fps: float = 0.0,
+    reference_fps: float = 20.0,
+) -> int | None:
+    try:
+        primary = max(0.0, float(infer_fps))
+    except Exception:
+        primary = 0.0
+    try:
+        secondary = max(0.0, float(secondary_fps))
+    except Exception:
+        secondary = 0.0
+    try:
+        baseline = max(1.0, float(reference_fps))
+    except Exception:
+        baseline = 20.0
+    effective_fps = primary + secondary
+    if effective_fps <= 0.05:
+        return None
+    return int(max(1, min(100, round((effective_fps / baseline) * 100))))

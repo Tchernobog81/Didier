@@ -2,8 +2,9 @@
   "devices": {
     "yl_192_168_1_19": {
       "type": "yeelight",
-      "ip": "192.168.1.19",
+      "ip": "192.168.1.14",
       "name": "Cuisine",
+      "yeelight_id": "0x000000001127147e",
       "validated": true,
       "capabilities": [
         "on",
@@ -14,7 +15,7 @@
         "wifi"
       ],
       "last_command": {
-        "ts": 1771088379.7785437,
+        "ts": 1772403093.1371078,
         "action": "off",
         "params": {}
       },
@@ -25,8 +26,9 @@
     },
     "yl_192_168_1_12": {
       "type": "yeelight",
-      "ip": "192.168.1.12",
-      "name": "Entrée",
+      "ip": "192.168.1.13",
+      "name": "Chiottes",
+      "yeelight_id": "0x0000000011297492",
       "validated": true,
       "capabilities": [
         "on",
@@ -37,19 +39,20 @@
         "wifi"
       ],
       "last_command": {
-        "ts": 1772212335.0607903,
-        "action": "on",
+        "ts": 1772403071.4579947,
+        "action": "off",
         "params": {}
       },
       "last_validation": {
-        "ts": 1771536325.082699,
+        "ts": 1772403058.8900526,
         "result": "ok"
       }
     },
     "yl_192_168_1_18": {
       "type": "yeelight",
       "ip": "192.168.1.18",
-      "name": "Chiottes",
+      "name": "Entrée",
+      "yeelight_id": "0x000000001127173b",
       "validated": true,
       "capabilities": [
         "on",
@@ -60,19 +63,20 @@
         "wifi"
       ],
       "last_command": {
-        "ts": 1771519555.733403,
+        "ts": 1772403073.512878,
         "action": "off",
         "params": {}
       },
       "last_validation": {
-        "ts": 1771087780.375744,
+        "ts": 1772402972.7301452,
         "result": "ok"
       }
     },
     "yl_192_168_1_24": {
       "type": "yeelight",
-      "ip": "192.168.1.24",
+      "ip": "192.168.1.21",
       "name": "Canapé",
+      "yeelight_id": "mac:64:90:c1:b3:ac:e8",
       "validated": true,
       "capabilities": [
         "on",
@@ -83,7 +87,7 @@
         "wifi"
       ],
       "last_command": {
-        "ts": 1771432894.6101081,
+        "ts": 1772403145.1904535,
         "action": "off",
         "params": {}
       },
@@ -96,6 +100,7 @@
       "type": "yeelight",
       "ip": "192.168.1.23",
       "name": "Salle à manger",
+      "yeelight_id": "mac:64:90:c1:b3:b5:dc",
       "validated": true,
       "capabilities": [
         "on",
@@ -106,8 +111,8 @@
         "wifi"
       ],
       "last_command": {
-        "ts": 1772041275.491015,
-        "action": "on",
+        "ts": 1772403148.957679,
+        "action": "off",
         "params": {}
       },
       "last_validation": {
@@ -117,8 +122,9 @@
     },
     "yl_192_168_1_22": {
       "type": "yeelight",
-      "ip": "192.168.1.22",
+      "ip": "192.168.1.20",
       "name": "Dancefloor",
+      "yeelight_id": "0x000000000e8682a4",
       "validated": true,
       "capabilities": [
         "on",
@@ -129,7 +135,7 @@
         "wifi"
       ],
       "last_command": {
-        "ts": 1771088381.3436036,
+        "ts": 1772403097.2567253,
         "action": "off",
         "params": {}
       },
@@ -137,6 +143,23 @@
         "ts": 1771087819.8513432,
         "result": "ok"
       }
+    }
+  },
+  "reference_metrics": {
+    "lamp_sync_green_2026_03_01": {
+      "date": "2026-03-01",
+      "source": "manual user sync + live Didier status probes",
+      "scope": "all six Yeelight lamps",
+      "expected": {
+        "power_on": true,
+        "bright": 80,
+        "color_mode": 1,
+        "rgb": 65283,
+        "hex": "#00FF03",
+        "hue": 121,
+        "sat": 100
+      },
+      "notes": "Canonical actuator color/brightness alignment baseline ('vert franc')."
     }
   }
 }

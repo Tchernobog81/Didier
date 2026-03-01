@@ -31,7 +31,9 @@ from core.shared_state import update_hardware_profile
 from core.shared_state import update_metrics as update_shared_metrics
 from core.shared_state import update_worker_metrics
 from core.status import read_status, update_status
+from core.vision_stream_service import stream_emit_interval
 from core.routers.actuators import router as actuators_router
+from core.vision_npu_policy import estimated_npu_utilization
 
 
 app = FastAPI(title="Didier Orchestrator", version="2.0")
@@ -76,8 +78,8 @@ _REQUEST_THROTTLE_LAST_TS: dict[tuple[str, str], float] = {}
 _REQUEST_THROTTLE_LAST_CLEANUP = 0.0
 _REQUEST_THROTTLE_TTL_S = 30.0
 _REQUEST_THROTTLE_RULES_S: dict[str, float] = {
-    "/vision/detections": 0.35,
-    "/vision/detections-secondary": 0.80,
+    "/vision/detections": 0.20,
+    "/vision/detections-secondary": 0.20,
     "/vision/status-secondary": 0.50,
     "/vision/zones": 1.50,
     "/device-status": 0.75,
@@ -194,14 +196,19 @@ def _run_subprocess(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[An
     return subprocess.run(*args, **kwargs)
 
 
-def _target_stream_interval(default_fps: int = 20) -> float:
-    fps = max(1, min(int(default_fps or 20), 60))
-    try:
-        fps = get_resource_arbitrator().get_target_fps(default=fps)
-    except Exception:
-        pass
-    fps = max(1, min(int(fps), 60))
-    return max(1.0 / float(fps), 0.03)
+def _target_stream_interval(default_fps: int = 20, *, follow_target: bool = True) -> float:
+    target_fps: int | None = None
+    if follow_target:
+        fps = max(1, min(int(default_fps or 20), 60))
+        try:
+            target_fps = get_resource_arbitrator().get_target_fps(default=fps)
+        except Exception:
+            target_fps = None
+    return stream_emit_interval(
+        configured_fps=default_fps,
+        target_fps=target_fps,
+        follow_target=follow_target,
+    )
 
 
 def _get_docker_root() -> Path:
@@ -491,6 +498,7 @@ async def shutdown_event() -> None:
         _orchestrator_bootstrap_task.cancel()
         await asyncio.gather(_orchestrator_bootstrap_task, return_exceptions=True)
         _orchestrator_bootstrap_task = None
+    _reset_remote_stream()
     if _orchestrator:
         await _orchestrator.stop()
     global _camera_watchdog_task, _shared_state_task, _resource_arbitrator
@@ -763,7 +771,22 @@ def _enrich_npu_metrics_from_vision(payload: dict[str, Any], orchestrator: Orche
         bool(npu.get("active", False))
         and (not isinstance(util, (int, float)) or float(util) <= 0.0)
     ):
-        npu["utilization"] = None
+        estimated_util = estimated_npu_utilization(
+            infer_fps=infer_fps,
+            secondary_fps=secondary_fps,
+            reference_fps=20.0,
+        )
+        npu["utilization"] = estimated_util
+        if estimated_util is not None:
+            npu["utilization_estimated"] = True
+            cores = npu.get("cores")
+            if isinstance(cores, list):
+                for item in cores:
+                    if not isinstance(item, dict):
+                        continue
+                    core_util = item.get("utilization")
+                    if not isinstance(core_util, (int, float)) or float(core_util) <= 0.0:
+                        item["utilization"] = estimated_util
     npu["activity_source"] = "vision_status"
     cores = npu.get("cores")
     if isinstance(cores, list) and cores and bool(npu.get("active", False)):
@@ -1565,6 +1588,7 @@ def _mjpeg_generator_v4l2(
 
 class RemoteMjpegStream:
     def __init__(self, input_url: str, fps: int = 15) -> None:
+        self._logger = logging.getLogger("API")
         self._input_url = input_url
         self._fps = fps
         self._proc: asyncio.subprocess.Process | None = None
@@ -1573,28 +1597,61 @@ class RemoteMjpegStream:
         self._lock = threading.Lock()
         self._last_jpeg: bytes | None = None
         self._last_ts: float = 0.0
+        self._last_frame_gap_s: float | None = None
         self._last_error: str | None = None
+        self._started_at: float = 0.0
+        self._last_spawn_ts: float = 0.0
+        self._spawn_count: int = 0
+        self._restart_count: int = 0
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._started_at = time.time()
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="remote-mjpeg-stream",
+        )
         self._thread.start()
 
-    def _run(self) -> None:
-        if shutil.which("ffmpeg") is None:
-            self._last_error = "ffmpeg not installed"
-            return
-        cmd = [
+    def stop(self) -> None:
+        self._stop.set()
+        proc = self._proc
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        thread = self._thread
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=DEFAULT_SUBPROCESS_TIMEOUT_S + 0.75)
+        if thread and not thread.is_alive():
+            self._thread = None
+
+    def set_fps(self, fps: int) -> None:
+        self._fps = max(int(fps or self._fps or 1), 1)
+
+    def is_alive(self) -> bool:
+        thread = self._thread
+        return bool(thread and thread.is_alive())
+
+    def _ffmpeg_cmd(self) -> list[str]:
+        return [
             "ffmpeg",
             "-hide_banner",
             "-loglevel",
             "error",
+            "-nostats",
             "-fflags",
-            "nobuffer",
+            "+nobuffer+discardcorrupt",
             "-flags",
             "low_delay",
+            "-analyzeduration",
+            "0",
+            "-probesize",
+            "32768",
             "-i",
             self._input_url,
             "-an",
@@ -1606,111 +1663,252 @@ class RemoteMjpegStream:
             "mjpeg",
             "-",
         ]
-        loop: asyncio.AbstractEventLoop | None = None
+
+    def _close_proc(self, loop: asyncio.AbstractEventLoop) -> None:
+        proc = self._proc
+        self._proc = None
+        if proc is None:
+            return
         try:
-            loop = asyncio.new_event_loop()
-            self._proc = loop.run_until_complete(
+            proc.terminate()
+        except Exception:
+            pass
+        try:
+            loop.run_until_complete(
                 asyncio.wait_for(
-                    asyncio.create_subprocess_exec(
-                        *cmd,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                    ),
+                    proc.wait(),
                     timeout=DEFAULT_SUBPROCESS_TIMEOUT_S,
                 )
             )
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                loop.run_until_complete(proc.wait())
+            except Exception:
+                pass
+
+    def _run(self) -> None:
+        if shutil.which("ffmpeg") is None:
+            self._last_error = "ffmpeg not installed"
+            return
+        loop: asyncio.AbstractEventLoop | None = None
+        try:
+            loop = asyncio.new_event_loop()
+            while not self._stop.is_set():
+                try:
+                    self._proc = loop.run_until_complete(
+                        asyncio.wait_for(
+                            asyncio.create_subprocess_exec(
+                                *self._ffmpeg_cmd(),
+                                stdout=asyncio.subprocess.PIPE,
+                                stderr=asyncio.subprocess.DEVNULL,
+                            ),
+                            timeout=DEFAULT_SUBPROCESS_TIMEOUT_S,
+                        )
+                    )
+                    self._last_spawn_ts = time.time()
+                    self._spawn_count += 1
+                    self._last_error = "waiting for source frames"
+                    self._logger.info(
+                        "Remote stream reader spawned (url=%s, fps=%s, spawn=%s).",
+                        self._input_url,
+                        self._fps,
+                        self._spawn_count,
+                    )
+                except Exception as exc:
+                    self._last_error = str(exc)
+                    self._logger.warning(
+                        "Remote stream spawn failed (url=%s, error=%s).",
+                        self._input_url,
+                        self._last_error,
+                    )
+                    if self._stop.wait(0.25):
+                        break
+                    continue
+                buffer = b""
+                run_started_at = time.time()
+                try:
+                    while not self._stop.is_set():
+                        proc = self._proc
+                        if not proc or not proc.stdout:
+                            break
+                        try:
+                            chunk = loop.run_until_complete(
+                                asyncio.wait_for(
+                                    proc.stdout.read(4096),
+                                    timeout=DEFAULT_SUBPROCESS_TIMEOUT_S,
+                                )
+                            )
+                        except asyncio.TimeoutError:
+                            if proc.returncode is not None:
+                                break
+                            last_frame_ts = float(self._last_ts or 0.0)
+                            last_activity_ts = last_frame_ts if last_frame_ts > 0.0 else run_started_at
+                            stall_after_s = max(
+                                2.5,
+                                min(
+                                    8.0,
+                                    _target_stream_interval(
+                                        default_fps=self._fps,
+                                        follow_target=False,
+                                    )
+                                    * 20.0,
+                                ),
+                            )
+                            if (time.time() - last_activity_ts) > stall_after_s:
+                                self._last_error = "ffmpeg stream stalled"
+                                self._logger.warning(
+                                    "Remote stream stalled (url=%s, wait=%.2fs, restarts=%s).",
+                                    self._input_url,
+                                    time.time() - last_activity_ts,
+                                    self._restart_count,
+                                )
+                                break
+                            continue
+                        if not chunk:
+                            break
+                        buffer += chunk
+                        while True:
+                            start = buffer.find(b"\xff\xd8")
+                            if start == -1:
+                                break
+                            end = buffer.find(b"\xff\xd9", start + 2)
+                            if end == -1:
+                                break
+                            frame = buffer[start : end + 2]
+                            buffer = buffer[end + 2 :]
+                            now = time.time()
+                            first_frame = False
+                            with self._lock:
+                                previous_ts = self._last_ts
+                                self._last_jpeg = frame
+                                self._last_ts = now
+                                first_frame = previous_ts <= 0.0
+                                if previous_ts > 0.0:
+                                    self._last_frame_gap_s = round(
+                                        max(0.0, now - previous_ts),
+                                        3,
+                                    )
+                            self._last_error = None
+                            if first_frame:
+                                self._logger.info(
+                                    "Remote stream received first frame (url=%s, fps=%s).",
+                                    self._input_url,
+                                    self._fps,
+                                )
+                finally:
+                    self._close_proc(loop)
+                if self._stop.is_set():
+                    break
+                self._restart_count += 1
+                if self._last_error is None:
+                    self._last_error = "ffmpeg stream restart"
+                self._logger.warning(
+                    "Remote stream restarting (url=%s, reason=%s, restart=%s).",
+                    self._input_url,
+                    self._last_error,
+                    self._restart_count,
+                )
+                if self._stop.wait(
+                    min(
+                        _target_stream_interval(
+                            default_fps=self._fps,
+                            follow_target=False,
+                        ),
+                        0.25,
+                    )
+                ):
+                    break
         except Exception as exc:
             self._last_error = str(exc)
-            try:
-                if loop is not None:
-                    loop.close()
-            except Exception:
-                pass
-            return
-        buffer = b""
-        try:
-            while not self._stop.is_set():
-                if not self._proc or not self._proc.stdout:
-                    break
-                try:
-                    chunk = loop.run_until_complete(
-                        asyncio.wait_for(
-                            self._proc.stdout.read(4096),
-                            timeout=DEFAULT_SUBPROCESS_TIMEOUT_S,
-                        )
-                    )
-                except asyncio.TimeoutError:
-                    continue
-                if not chunk:
-                    break
-                buffer += chunk
-                while True:
-                    start = buffer.find(b"\xff\xd8")
-                    if start == -1:
-                        break
-                    end = buffer.find(b"\xff\xd9", start + 2)
-                    if end == -1:
-                        break
-                    frame = buffer[start : end + 2]
-                    buffer = buffer[end + 2 :]
-                    with self._lock:
-                        self._last_jpeg = frame
-                        self._last_ts = time.time()
         finally:
-            if self._proc:
+            if loop is not None:
+                self._close_proc(loop)
                 try:
-                    self._proc.terminate()
+                    loop.close()
                 except Exception:
                     pass
-                try:
-                    loop.run_until_complete(
-                        asyncio.wait_for(
-                            self._proc.wait(),
-                            timeout=DEFAULT_SUBPROCESS_TIMEOUT_S,
-                        )
-                    )
-                except Exception:
-                    try:
-                        self._proc.kill()
-                    except Exception:
-                        pass
-                    try:
-                        loop.run_until_complete(self._proc.wait())
-                    except Exception:
-                        pass
-                self._proc = None
-            try:
-                loop.close()
-            except Exception:
-                pass
 
     def get_last(self) -> tuple[bytes | None, float]:
         with self._lock:
             return self._last_jpeg, self._last_ts
+
+    def debug_snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            last_ts = float(self._last_ts or 0.0)
+            frame_gap_s = self._last_frame_gap_s
+        now = time.time()
+        waiting_s: float | None = None
+        if self._last_error == "waiting for source frames" and self._last_spawn_ts > 0.0:
+            waiting_s = round(max(0.0, now - self._last_spawn_ts), 1)
+        input_scheme = self._input_url.split(":", 1)[0].lower() if ":" in self._input_url else ""
+        return {
+            "input_url": self._input_url,
+            "input_scheme": input_scheme or None,
+            "fps": int(max(1, int(self._fps or 1))),
+            "last_ts": last_ts,
+            "frame_gap_s": frame_gap_s,
+            "last_error": self._last_error,
+            "alive": self.is_alive(),
+            "started_at": float(self._started_at or 0.0),
+            "last_spawn_ts": float(self._last_spawn_ts or 0.0),
+            "spawn_count": int(self._spawn_count),
+            "restart_count": int(self._restart_count),
+            "waiting_s": waiting_s,
+        }
 
 
 _REMOTE_STREAM: RemoteMjpegStream | None = None
 _REMOTE_STREAM_LOCK = threading.Lock()
 
 
-def _get_remote_stream(input_url: str, fps: int = 15) -> RemoteMjpegStream:
+def _reset_remote_stream() -> None:
     global _REMOTE_STREAM
     with _REMOTE_STREAM_LOCK:
+        stream = _REMOTE_STREAM
+        _REMOTE_STREAM = None
+    if stream is not None:
+        stream.stop()
+
+
+def _get_remote_stream(input_url: str, fps: int = 15) -> RemoteMjpegStream:
+    global _REMOTE_STREAM
+    previous: RemoteMjpegStream | None = None
+    with _REMOTE_STREAM_LOCK:
         if _REMOTE_STREAM is None or _REMOTE_STREAM._input_url != input_url:
+            previous = _REMOTE_STREAM
             _REMOTE_STREAM = RemoteMjpegStream(input_url, fps=fps)
+        else:
+            _REMOTE_STREAM.set_fps(fps)
         _REMOTE_STREAM.start()
-        return _REMOTE_STREAM
+        stream = _REMOTE_STREAM
+    if previous is not None and previous is not stream:
+        previous.stop()
+    return stream
 
 
 def _remote_mjpeg_generator(stream: RemoteMjpegStream) -> Generator[bytes, None, None]:
-    last_sent = None
+    last_frame_ts = 0.0
+    last_emit_ts = 0.0
     target_fps = max(int(getattr(stream, "_fps", 15) or 15), 1)
+    interval_s = _target_stream_interval(
+        default_fps=target_fps,
+        follow_target=False,
+    )
     while True:
-        frame, _ts = stream.get_last()
-        if frame and frame is not last_sent:
-            last_sent = frame
+        frame, frame_ts = stream.get_last()
+        now = time.time()
+        if frame and (
+            frame_ts != last_frame_ts or (now - last_emit_ts) >= interval_s
+        ):
+            last_frame_ts = float(frame_ts or 0.0)
+            last_emit_ts = now
             yield (
                 b"--frame\r\n"
                 b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
             )
-        time.sleep(_target_stream_interval(default_fps=target_fps))
+            continue
+        time.sleep(interval_s)

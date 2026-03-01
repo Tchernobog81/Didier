@@ -13,7 +13,7 @@
   },
   "ollama": {
     "base_url": "http://localhost:11434",
-    "model": "qwen2.5:1.5b",
+    "model": "llama3.2:1b",
     "model_profiles": {
       "ask": "qwen2.5:1.5b",
       "coding": "qwen2.5-coder:1.5b"
@@ -25,7 +25,7 @@
     "autotune_enabled": true,
     "autotune_interval_seconds": 1800,
     "autotune_cooldown_seconds": 1800,
-    "autotune_prompt": "Réponds en une phrase courte: Bonjour.",
+    "autotune_prompt": "R\u00e9ponds en une phrase courte: Bonjour.",
     "autotune_num_predict": 32,
     "autotune_temperature": 0.2,
     "autotune_timeout_seconds": 30,
@@ -40,30 +40,30 @@
     "experts": {
       "jardinage": {
         "model": "qwen2.5:1.5b",
-        "system_prompt": "Tu es un expert jardinage. Conseils pratiques, saisonniers, sûrs. Pose une question si l'info manque."
+        "system_prompt": "Tu es un expert jardinage. Conseils pratiques, saisonniers, s\u00fbrs. Pose une question si l'info manque."
       },
       "bricolage": {
         "model": "gemma2:2b",
-        "system_prompt": "Tu es un expert bricolage. Donne des étapes courtes et sécurisées, avec outils nécessaires."
+        "system_prompt": "Tu es un expert bricolage. Donne des \u00e9tapes courtes et s\u00e9curis\u00e9es, avec outils n\u00e9cessaires."
       },
       "cuisine": {
         "model": "qwen2.5:1.5b",
-        "system_prompt": "Tu es un chef. Donne des recettes simples, des variantes, et des timings précis."
+        "system_prompt": "Tu es un chef. Donne des recettes simples, des variantes, et des timings pr\u00e9cis."
       },
       "code": {
         "model": "qwen2.5-coder:1.5b",
-        "system_prompt": "Tu es un assistant code. Réponses courtes, exécutables, avec attention aux erreurs."
+        "system_prompt": "Tu es un assistant code. R\u00e9ponses courtes, ex\u00e9cutables, avec attention aux erreurs."
       },
       "resume": {
         "model": "phi3.5:3.8b",
-        "system_prompt": "Tu es un expert synthèse. Résume en points clés, puis propose une action."
+        "system_prompt": "Tu es un expert synth\u00e8se. R\u00e9sume en points cl\u00e9s, puis propose une action."
       },
       "fun": {
         "model": "llama3.2:1b",
-        "system_prompt": "Tu es créatif et amusant. Réponses courtes, ton léger."
+        "system_prompt": "Tu es cr\u00e9atif et amusant. R\u00e9ponses courtes, ton l\u00e9ger."
       }
     },
-    "model_selected_at": 1772209018.2841482
+    "model_selected_at": 1772361463.671267
   },
   "picobot": {
     "enabled": true,
@@ -229,7 +229,7 @@
     "model": "qwen2.5-coder:1.5b",
     "num_predict": 400,
     "temperature": 0.2,
-    "system_prompt": "Tu es un assistant de code précis, concis, et pragmatique. Donne des réponses courtes et exécutables."
+    "system_prompt": "Tu es un assistant de code pr\u00e9cis, concis, et pragmatique. Donne des r\u00e9ponses courtes et ex\u00e9cutables."
   },
   "music": {
     "enabled": true,
@@ -237,11 +237,11 @@
     "output_path": "data/music.wav"
   },
   "personality": {
-    "system_prompt": "Tu es Didier : gentil, bougon désabusé, presque omniscient. Tu aides avec pragmatisme, une pointe d'ironie, sans être méchant. Tu es bref et clair.",
+    "system_prompt": "Tu es Didier : gentil, bougon d\u00e9sabus\u00e9, presque omniscient. Tu aides avec pragmatisme, une pointe d'ironie, sans \u00eatre m\u00e9chant. Tu es bref et clair.",
     "catchphrases": [
       "On ne sent pas le cul des gens qu'on ne connait pas.",
-      "Je crois aux vertus de l’optimisme. Ce n’est pas facile, mais ça ne sert à rien d’être pessimiste. Anticiper le malheur, c’est le vivre deux fois. Mieux vaut croire que les choses vont aller mieux.",
-      "Les cons ça ose tout, c'est même à ça qu'on les reconnait."
+      "Je crois aux vertus de l\u2019optimisme. Ce n\u2019est pas facile, mais \u00e7a ne sert \u00e0 rien d\u2019\u00eatre pessimiste. Anticiper le malheur, c\u2019est le vivre deux fois. Mieux vaut croire que les choses vont aller mieux.",
+      "Les cons \u00e7a ose tout, c'est m\u00eame \u00e0 \u00e7a qu'on les reconnait."
     ]
   },
   "memory": {
@@ -360,12 +360,14 @@
     "owner_profile_path": "data/vision/owner_face.npy",
     "owner_threshold": 0.35,
     "detector": "auto",
+    "npu_score_threshold": 0.15,
+    "secondary_npu_score_threshold": 0.12,
     "model_path": "/mnt/didier_ssd/didier/models/hailo/hailo_model.hef",
     "safe_hailo_detect": true,
     "safe_hailo_empty_streak": 2,
     "capture_path": "data/capture.jpg",
     "describe_model": "moondream:1.8b",
-    "describe_prompt": "Décris l'image en français, en une phrase utile.",
+    "describe_prompt": "D\u00e9cris l'image en fran\u00e7ais, en une phrase utile.",
     "describe_num_predict": 120,
     "remote_stream": {
       "enabled": true,

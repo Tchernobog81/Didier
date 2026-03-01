@@ -55,20 +55,34 @@ def secondary_empty_payload(reason: str, stream_ts: float = 0.0) -> dict[str, An
 def secondary_min_interval_s(
     arbitrator: Any,
     *,
-    nominal_s: float = 1.2,
-    tendu_s: float = 2.0,
-    survie_s: float = 3.5,
+    nominal_s: float = 0.25,
+    tendu_s: float = 0.4,
+    survie_s: float = 1.25,
 ) -> float:
     try:
         snap = arbitrator.snapshot()
     except Exception:
         snap = {}
+    limits = (snap or {}).get("limits", {})
+    target_fps = 0.0
+    if isinstance(limits, Mapping):
+        try:
+            target_fps = float(limits.get("target_fps", 0.0) or 0.0)
+        except Exception:
+            target_fps = 0.0
+    paced_interval = None
+    if target_fps > 0.0:
+        paced_interval = max(0.12, min(0.5, 2.0 / target_fps))
     mode = str((snap or {}).get("mode", "NOMINAL")).upper()
     if mode == "SURVIE":
         return float(survie_s)
     if mode == "TENDU":
-        return float(tendu_s)
-    return float(nominal_s)
+        base = float(tendu_s)
+    else:
+        base = float(nominal_s)
+    if paced_interval is None:
+        return base
+    return min(base, float(paced_interval))
 
 
 @dataclass

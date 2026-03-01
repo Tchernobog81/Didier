@@ -1,6 +1,7 @@
 import unittest
 
 from core.vision_npu_policy import is_hailo_vision_active
+from core.vision_npu_policy import estimated_npu_utilization
 from core.vision_npu_policy import npu_requirement_error
 from core.vision_npu_policy import vision_npu_status
 
@@ -55,6 +56,15 @@ class VisionNPUStatePolicyTests(unittest.TestCase):
         self.assertEqual(blocked["reason"], "npu_required_but_inactive")
         self.assertEqual(cpu["execution_target"], "cpu")
         self.assertEqual(cpu["reason"], "fallback_or_cpu_mode")
+
+    def test_estimated_npu_utilization_tracks_live_fps_when_driver_util_is_missing(self) -> None:
+        self.assertEqual(
+            estimated_npu_utilization(infer_fps=15.0, secondary_fps=1.0, reference_fps=20.0),
+            80,
+        )
+        self.assertIsNone(
+            estimated_npu_utilization(infer_fps=0.0, secondary_fps=0.0, reference_fps=20.0)
+        )
 
 
 if __name__ == "__main__":

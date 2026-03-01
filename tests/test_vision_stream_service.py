@@ -5,6 +5,7 @@ from core.vision_stream_service import SecondaryStreamConfig
 from core.vision_stream_service import build_primary_camera_plan
 from core.vision_stream_service import build_secondary_stream_plan
 from core.vision_stream_service import evaluate_primary_stream
+from core.vision_stream_service import stream_emit_interval
 
 
 class VisionStreamServiceTests(unittest.TestCase):
@@ -68,7 +69,7 @@ class VisionStreamServiceTests(unittest.TestCase):
         )
         self.assertIsNotNone(plan)
         self.assertIsNone(error)
-        self.assertEqual(plan.fps, 18)
+        self.assertEqual(plan.fps, 15)
 
     def test_build_primary_camera_plan_keeps_effective_capture_settings(self) -> None:
         plan = build_primary_camera_plan(
@@ -93,6 +94,26 @@ class VisionStreamServiceTests(unittest.TestCase):
         self.assertEqual(plan.fps, 12)
         self.assertEqual(plan.fourcc, "MJPG")
         self.assertTrue(plan.kill_on_open)
+
+    def test_stream_emit_interval_can_follow_or_ignore_target_fps(self) -> None:
+        self.assertAlmostEqual(
+            stream_emit_interval(
+                configured_fps=15,
+                target_fps=10,
+                follow_target=True,
+            ),
+            0.1,
+            places=3,
+        )
+        self.assertAlmostEqual(
+            stream_emit_interval(
+                configured_fps=15,
+                target_fps=10,
+                follow_target=False,
+            ),
+            1.0 / 15.0,
+            places=3,
+        )
 
 
 if __name__ == "__main__":

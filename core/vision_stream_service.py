@@ -42,6 +42,22 @@ def _coerce_float(value: Any, default: float) -> float:
         return float(default)
 
 
+def stream_emit_interval(
+    *,
+    configured_fps: int,
+    target_fps: int | None = None,
+    follow_target: bool = True,
+) -> float:
+    fps = max(1, min(int(configured_fps or 20), 60))
+    if follow_target and target_fps is not None:
+        try:
+            fps = int(target_fps)
+        except Exception:
+            pass
+    fps = max(1, min(int(fps), 60))
+    return max(1.0 / float(fps), 0.03)
+
+
 @dataclass(frozen=True)
 class PrimaryStreamConfig:
     enable_live: bool = False
@@ -171,9 +187,10 @@ def build_secondary_stream_plan(
         return None, "input_url required"
     if not ffmpeg_available:
         return None, "ffmpeg not installed"
+    _ = target_fps
     return SecondaryStreamPlan(
         input_url=config.input_url,
-        fps=max(1, int(target_fps or config.fps)),
+        fps=max(1, int(config.fps)),
     ), None
 
 

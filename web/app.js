@@ -19,9 +19,11 @@ const videoFrame = document.getElementById("video-frame");
 const zonesOverlay = document.getElementById("zones-overlay");
 const zonesOverlaySecondary = document.getElementById("zones-overlay-secondary");
 const SHOW_STATIC_VISION_ZONES = false;
-const OVERLAY_MIN_CONFIDENCE_PRIMARY = 0.4;
-const OVERLAY_MIN_CONFIDENCE_SECONDARY = 0.25;
+const OVERLAY_MIN_CONFIDENCE_PRIMARY = 0.15;
+const OVERLAY_MIN_CONFIDENCE_SECONDARY = 0.12;
 const OVERLAY_HIDE_BBOX_POLYGONS = true;
+const VISION_DETECTIONS_POLL_MS = 250;
+const VISION_DETECTIONS_SECONDARY_POLL_MS = 250;
 const ollamaModels = document.getElementById("ollama-models");
 const versionBadge = document.getElementById("version-badge");
 const uiVersionText = document.getElementById("ui-version-text");
@@ -134,6 +136,7 @@ const VIDEO_KEEPALIVE_REFRESH_MS = 240000;
 const METRICS_POLL_MS = 2000;
 const CPU_GRAPH_REFRESH_MS = 5000;
 const SURFACE_STATUS_POLL_MS = 4000;
+const ACTUATOR_STATUS_POLL_MS = 5000;
 const SERVICE_503_BACKOFF_MS = 30000;
 const METRICS_WS_RETRY_MS = 3000;
 const METRICS_WS_PATH = "/ws/metrics";
@@ -182,23 +185,13 @@ let surfaceStatusInFlight = false;
 let ollamaModelsInFlight = false;
 let versionInFlight = false;
 let visionZonesInFlight = false;
+let actuatorStatusPollInFlight = false;
 const actuatorRealtimeTimers = new Map();
 
 function isVisionTabActive() {
   // Backward compatibility: older builds used "vision" while current UI uses "dashboard".
   return currentActiveTab === "dashboard" || currentActiveTab === "vision";
 }
-
-const ACTUATOR_COLOR_PRESETS = [
-  "#ffffff",
-  "#ff4d4f",
-  "#ff8a00",
-  "#ffd400",
-  "#52c41a",
-  "#00d4ff",
-  "#1677ff",
-  "#722ed1",
-];
 
 function withTimeout(ms) {
   const controller = new AbortController();
@@ -340,6 +333,37 @@ function updateSurfacePillFromBackend(secondary) {
   }
   setPillState(devicePillSurfaceVideo, "unknown", "en attente");
   return true;
+}
+
+function describeSecondaryBackendState(secondary) {
+  if (!secondary) return "Etat du flux secondaire indisponible.";
+  if (secondary.enabled === false) return "Flux secondaire desactive.";
+  const diagnostic = String(secondary.diagnostic || "");
+  if (secondary.status === "online") return null;
+  if (diagnostic === "source_waiting") {
+    const waiting = Number(secondary.waiting_s);
+    if (Number.isFinite(waiting) && waiting > 0) {
+      return `Flux detecte, attente de paquets source (${waiting.toFixed(1)}s).`;
+    }
+    return "Flux detecte, attente de paquets source.";
+  }
+  if (diagnostic === "source_stalled" || diagnostic === "stale_frame") {
+    return "Flux secondaire fige, relance backend en cours.";
+  }
+  if (diagnostic === "restarting") {
+    return "Flux secondaire en relance.";
+  }
+  if (secondary.last_error) {
+    return `Flux secondaire: ${secondary.last_error}.`;
+  }
+  return "Aucun paquet recu sur UDP 1234.";
+}
+
+function shouldReconnectSecondaryStream(secondary) {
+  if (!videoStreamSecondary || !secondary || secondary.enabled === false) return false;
+  if (secondary.status === "online") return false;
+  const diagnostic = String(secondary.diagnostic || "");
+  return diagnostic === "stream_not_started" || diagnostic === "reader_down";
 }
 
 function setStreamFallback(container, textEl, visible, message) {
@@ -546,6 +570,12 @@ function npuCoreLabel(core, idx) {
   return compact.toUpperCase();
 }
 
+function npuCoreRuntimeActive(core) {
+  const status =
+    core && core.runtime_status ? String(core.runtime_status).trim().toLowerCase() : "";
+  return status === "active" || status === "resuming";
+}
+
 function renderNpuCores(cores) {
   if (!npuCoresEl) return;
   npuCoresEl.innerHTML = "";
@@ -565,11 +595,20 @@ function renderNpuCores(cores) {
     const valueRaw = core ? core.utilization : null;
     const hasValue = valueRaw !== null && valueRaw !== undefined && Number.isFinite(Number(valueRaw));
     const value = hasValue ? Number(valueRaw) : 0;
-    fill.style.width = `${clampPercent(value)}%`;
+    const runtimeActive = npuCoreRuntimeActive(core);
+    const showActiveHint = runtimeActive && (!hasValue || value <= 0);
+    fill.style.width = `${clampPercent(showActiveHint ? 14 : value)}%`;
     bar.appendChild(fill);
     const val = document.createElement("span");
     val.className = "core-value";
-    val.textContent = hasValue ? `${Math.round(value)}%` : "--";
+    val.textContent = showActiveHint
+      ? "ACTIF"
+      : hasValue
+        ? `${Math.round(value)}%`
+        : "--";
+    if (core && core.runtime_status) {
+      coreRow.title = `runtime: ${String(core.runtime_status)}`;
+    }
     coreRow.appendChild(label);
     coreRow.appendChild(bar);
     coreRow.appendChild(val);
@@ -581,12 +620,20 @@ function npuUtilization(npuData) {
   if (!npuData || typeof npuData !== "object") return null;
   const direct = npuData.utilization;
   if (direct !== null && direct !== undefined && Number.isFinite(Number(direct))) {
-    return Number(direct);
+    const directValue = Number(direct);
+    if (directValue > 0) return directValue;
   }
   const cores = Array.isArray(npuData.cores) ? npuData.cores : [];
   const values = cores
     .map((core) => (core && Number.isFinite(Number(core.utilization)) ? Number(core.utilization) : null))
     .filter((value) => value !== null);
+  const positiveValues = values.filter((value) => value > 0);
+  if (positiveValues.length) {
+    return positiveValues.reduce((acc, value) => acc + value, 0) / positiveValues.length;
+  }
+  if (cores.some((core) => npuCoreRuntimeActive(core)) || Boolean(npuData.active)) {
+    return null;
+  }
   if (!values.length) return null;
   return values.reduce((acc, value) => acc + value, 0) / values.length;
 }
@@ -612,13 +659,14 @@ function updateNpuPillFromMetrics(npuData) {
   const inferredActive =
     Boolean(npuData.active) ||
     (util !== null && util > 1) ||
-    cores.some((core) => Number(core && core.utilization) > 1);
+    cores.some((core) => Number(core && core.utilization) > 1) ||
+    cores.some((core) => npuCoreRuntimeActive(core));
 
   if (inferredActive) {
-    const utilText = util === null ? "--" : `${Math.round(util)}%`;
+    const utilText = util === null ? null : `${Math.round(util)}%`;
     const fpsText = realFps !== null && realFps > 0.1 ? `${realFps.toFixed(1)}f` : null;
     const suffix = coreCount > 1 ? `/${coreCount}c` : "";
-    const head = util !== null ? utilText : fpsText || utilText;
+    const head = utilText || (fpsText ? `act ${fpsText}` : "act");
     setPillState(devicePillNpu, "ok", `${head}${suffix}`);
     return;
   }
@@ -723,7 +771,8 @@ function applyMetricsData(data) {
       const inferredActive =
         Boolean(npuData.active) ||
         utilRounded > 1 ||
-        cores.some((core) => Number(core && core.utilization) > 1);
+        cores.some((core) => Number(core && core.utilization) > 1) ||
+        cores.some((core) => npuCoreRuntimeActive(core));
       const fpsSuffix =
         realFps !== null && realFps > 0.1 ? ` · ${realFps.toFixed(1)}fps` : "";
       npuEl.textContent = inferredActive
@@ -785,14 +834,18 @@ async function fetchVisionStatusSecondary() {
     if (!res.ok) throw new Error("status-secondary");
     const data = await res.json();
     const secondary = data && data.camera_secondary ? data.camera_secondary : data;
-    if (secondary && secondary.enabled === false) {
-      setSurfaceFallback(true, "Flux secondaire desactive.");
-    } else if (secondary && secondary.status === "online") {
+    const fallbackMessage = describeSecondaryBackendState(secondary);
+    if (!fallbackMessage) {
       setSurfaceFallback(false);
-    } else if (secondary && secondary.opened && secondary.frame === false) {
-      setSurfaceFallback(true, "Flux detecte, attente d'image...");
     } else {
-      setSurfaceFallback(true, "Aucun paquet recu sur UDP 1234.");
+      setSurfaceFallback(true, fallbackMessage);
+    }
+    if (shouldReconnectSecondaryStream(secondary)) {
+      const now = Date.now();
+      if (now - lastSecondaryRefreshAt > VIDEO_REFRESH_COOLDOWN_MS) {
+        lastSecondaryRefreshAt = now;
+        videoStreamSecondary.src = `/video/stream-secondary?ts=${now}`;
+      }
     }
     if (!updateSurfacePillFromBackend(secondary)) {
       updateSurfacePill();
@@ -895,11 +948,7 @@ async function fetchDeviceStatus() {
       setPrimaryFallback(true, "Etat camera indisponible.");
       setPillState(devicePillPs3Video, "unknown", "N/D");
     }
-    if (data.camera_secondary && videoStreamSecondary) {
-      const ageRaw = data.camera_secondary.last_frame_age_s;
-      const age =
-        ageRaw === null || ageRaw === undefined ? null : Number(ageRaw);
-      const stale = age !== null && Number.isFinite(age) && age > VIDEO_STALE_S;
+    if (data.camera_secondary && videoStreamSecondary && !hasSurfaceBackendStatus) {
       const missing =
         data.camera_secondary.frame === false ||
         data.camera_secondary.opened === false;
@@ -1161,9 +1210,11 @@ let visionZones = [];
 let visionDetections = [];
 let visionFrame = null;
 let visionDetectionsTs = 0;
+let visionSemanticHints = [];
 let visionDetectionsSecondary = [];
 let visionFrameSecondary = null;
 let visionDetectionsSecondaryTs = 0;
+let visionSemanticHintsSecondary = [];
 let visionDetectionsInFlight = false;
 let visionDetectionsSecondaryInFlight = false;
 let activeDetection = null;
@@ -1219,6 +1270,137 @@ function getCustomLabel(det) {
   return detectionLabels[key] || "";
 }
 
+function detectionConfidenceValue(det) {
+  if (!det) return null;
+  const raw = det.confidence;
+  if (raw === null || raw === undefined) return null;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : null;
+}
+
+function detectionHasSemanticSignal(det) {
+  if (!det || typeof det !== "object") return false;
+  if (det.class_id !== null && det.class_id !== undefined) return true;
+  return detectionConfidenceValue(det) !== null;
+}
+
+function detectionsContainSemanticSignal(detections) {
+  if (!Array.isArray(detections)) return false;
+  return detections.some((det) => detectionHasSemanticSignal(det));
+}
+
+function detectionPrimaryLabel(det) {
+  const customLabel = getCustomLabel(det);
+  if (customLabel) return customLabel;
+  if (detectionHasSemanticSignal(det)) {
+    const raw = det && det.label ? String(det.label).trim() : "";
+    return raw || "objet";
+  }
+  return "cible visuelle";
+}
+
+function detectionDiagnosticText(det) {
+  if (detectionHasSemanticSignal(det)) {
+    const parts = ["IA"];
+    if (det && det.class_id !== null && det.class_id !== undefined) {
+      parts.push(`classe ${det.class_id}`);
+    }
+    return parts.join(" · ");
+  }
+  return "fallback contour";
+}
+
+function semanticHintsFromPayload(data, secondary = false) {
+  const direct = data && Array.isArray(data.semantic_hints) ? data.semantic_hints : null;
+  const status =
+    data && data.status && typeof data.status === "object" ? data.status : null;
+  const fallback = secondary
+    ? status && status.secondary_object_hints
+    : status && (status.primary_object_hints || status.object_hints);
+  const source =
+    direct ||
+    (fallback && Array.isArray(fallback.top_labels) ? fallback.top_labels : []);
+  if (!Array.isArray(source)) return [];
+  return source
+    .map((item) => {
+      if (!item || typeof item !== "object") return null;
+      const label = String(item.label || item.class_name || "").trim();
+      const scoreRaw = Number(item.score);
+      const score = Number.isFinite(scoreRaw) ? scoreRaw : null;
+      if (!label) return null;
+      return { label, score };
+    })
+    .filter(Boolean);
+}
+
+function formatSemanticHintText(hints, maxItems = 2) {
+  if (!Array.isArray(hints) || !hints.length) return "";
+  const items = [];
+  hints.slice(0, Math.max(1, Number(maxItems) || 1)).forEach((hint) => {
+    if (!hint || typeof hint !== "object") return;
+    const label = String(hint.label || "").trim();
+    if (!label) return;
+    const scoreRaw = Number(hint.score);
+    if (Number.isFinite(scoreRaw)) {
+      items.push(`${label} ${(scoreRaw * 100).toFixed(0)}%`);
+    } else {
+      items.push(label);
+    }
+  });
+  return items.join(" · ");
+}
+
+function detectionOverlayText(det) {
+  const label = detectionPrimaryLabel(det);
+  const confidence = detectionConfidenceValue(det);
+  if (detectionHasSemanticSignal(det) && confidence !== null) {
+    return `${label} ${(confidence * 100).toFixed(0)}%`;
+  }
+  return label;
+}
+
+function detectionBounds(det) {
+  if (det && Array.isArray(det.bbox) && det.bbox.length >= 4) {
+    const x = Number(det.bbox[0]);
+    const y = Number(det.bbox[1]);
+    const w = Number(det.bbox[2]);
+    const h = Number(det.bbox[3]);
+    if (
+      Number.isFinite(x) &&
+      Number.isFinite(y) &&
+      Number.isFinite(w) &&
+      Number.isFinite(h)
+    ) {
+      return { x, y, w, h };
+    }
+  }
+  if (det && Array.isArray(det.poly) && det.poly.length >= 3) {
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    det.poly.forEach((pt) => {
+      if (!Array.isArray(pt) || pt.length < 2) return;
+      const px = Number(pt[0]);
+      const py = Number(pt[1]);
+      if (!Number.isFinite(px) || !Number.isFinite(py)) return;
+      minX = Math.min(minX, px);
+      minY = Math.min(minY, py);
+      maxX = Math.max(maxX, px);
+      maxY = Math.max(maxY, py);
+    });
+    if (
+      Number.isFinite(minX) &&
+      Number.isFinite(minY) &&
+      Number.isFinite(maxX) &&
+      Number.isFinite(maxY)
+    ) {
+      return { x: minX, y: minY, w: Math.max(1, maxX - minX), h: Math.max(1, maxY - minY) };
+    }
+  }
+  return null;
+}
+
 function setCustomLabel(key, value) {
   if (!key) return;
   const label = String(value || "").trim();
@@ -1245,25 +1427,35 @@ function formatTime(ts) {
 function renderDetectionTags() {
   if (!detectionTags || !detectionTagsEmpty) return;
   detectionTags.innerHTML = "";
-  if (!visionDetections.length) {
+  const semanticDetections = Array.isArray(visionDetections)
+    ? visionDetections.filter((det) => detectionHasSemanticSignal(det))
+    : [];
+  const hintText = formatSemanticHintText(visionSemanticHints, 3);
+  const hasSemanticDetections = semanticDetections.length > 0;
+  if (!visionDetections.length || !hasSemanticDetections) {
     detectionTagsEmpty.style.display = "block";
+    detectionTagsEmpty.textContent = hintText
+      ? `Aucun objet confirme · indices COCO: ${hintText}`
+      : "Aucun objet confirme";
     if (detectionTagsEditor) {
       detectionTagsEditor.classList.remove("is-open");
       detectionTagsEditor.setAttribute("aria-hidden", "true");
     }
-    if (detectionTagsMeta) detectionTagsMeta.textContent = "0 objet";
+    if (detectionTagsMeta) {
+      const at = visionDetectionsTs ? formatTime(visionDetectionsTs) : "--:--:--";
+      detectionTagsMeta.textContent = `0 objet confirme · ${at}`;
+    }
     return;
   }
   detectionTagsEmpty.style.display = "none";
   if (detectionTagsMeta) {
-    const count = visionDetections.length;
+    const count = semanticDetections.length;
     const suffix = count > 1 ? "objets" : "objet";
     const at = visionDetectionsTs ? formatTime(visionDetectionsTs) : "--:--:--";
     detectionTagsMeta.textContent = `${count} ${suffix} · ${at}`;
   }
-  visionDetections.forEach((det, idx) => {
+  semanticDetections.forEach((det, idx) => {
     const customLabel = getCustomLabel(det);
-    const baseLabel = det.label || "objet";
     const chip = document.createElement("button");
     chip.type = "button";
     chip.className = "detection-chip";
@@ -1271,20 +1463,47 @@ function renderDetectionTags() {
     if (activeDetectionKey && activeDetectionKey === detectionKey(det)) {
       chip.classList.add("is-active");
     }
-    chip.textContent = customLabel || baseLabel;
+    chip.textContent =
+      customLabel ||
+      (detectionHasSemanticSignal(det) ? detectionPrimaryLabel(det) : `cible ${idx + 1}`);
+    chip.title = detectionDiagnosticText(det);
     chip.addEventListener("click", () => {
       openTagEditor(det, idx);
     });
     detectionTags.appendChild(chip);
   });
 }
+
+function drawSemanticHintBanner(ctx, hints, canvasWidth) {
+  const text = formatSemanticHintText(hints, 2);
+  if (!text) return false;
+  const label = `Indices COCO: ${text}`;
+  ctx.save();
+  ctx.font = "11px 'IBM Plex Mono', monospace";
+  const textWidth = ctx.measureText(label).width;
+  const boxW = Math.ceil(textWidth + 14);
+  const boxH = 20;
+  const boxX = 6;
+  const maxWidth = Math.max(12, Number(canvasWidth) || 12);
+  const clampedW = Math.min(boxW, maxWidth - 12);
+  ctx.fillStyle = "rgba(15, 23, 42, 0.78)";
+  ctx.strokeStyle = "rgba(148, 163, 184, 0.85)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.rect(boxX, 6, clampedW, boxH);
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = "#cbd5e1";
+  ctx.fillText(label, boxX + 7, 20);
+  ctx.restore();
+  return true;
+}
 function openTagEditor(det, idx) {
   if (!detectionTagsEditor || !detectionTagsEditorInput) return;
   activeDetection = det;
   activeDetectionKey = detectionKey(det);
   if (detectionTagsEditorLabel) {
-    const baseLabel = det.label || "objet";
-    detectionTagsEditorLabel.textContent = `Objet ${idx + 1} · ${baseLabel}`;
+    detectionTagsEditorLabel.textContent = `Objet ${idx + 1} · ${detectionPrimaryLabel(det)}`;
   }
   detectionTagsEditorInput.value = getCustomLabel(det) || "";
   detectionTagsEditor.classList.add("is-open");
@@ -3240,26 +3459,49 @@ function rgbNumberToHex(value) {
   return `#${n.toString(16).padStart(6, "0")}`;
 }
 
+function applyActuatorStatus(id, status) {
+  const key = String(id || "").trim();
+  if (!key) return null;
+  const normalized =
+    status && typeof status === "object" ? { ...status } : {};
+  actuatorsStatusById.set(key, normalized);
+  return normalized;
+}
+
 function actuatorViewModel(device) {
   const id = device && device.id ? String(device.id) : "";
   const status = actuatorsStatusById.get(id) || {};
   const merged = { ...(device || {}), ...status };
   const state = merged && typeof merged.state === "object" ? merged.state : {};
-  let powerOn = null;
-  if (state && typeof state.power_on === "boolean") {
-    powerOn = state.power_on;
-  } else if (merged.last_command && typeof merged.last_command === "object") {
-    const lastAction = String(merged.last_command.action || "").toLowerCase();
-    if (lastAction === "on") powerOn = true;
-    if (lastAction === "off") powerOn = false;
-  }
+  const reachable = merged.reachable === true;
+  const powerKnown = state && typeof state.power_on === "boolean";
+  const powerOn = powerKnown ? state.power_on : null;
   const brightRaw = toIntOrNull(state.bright);
   const brightness = brightRaw === null ? 100 : Math.max(1, Math.min(100, brightRaw));
   const colorHex = rgbNumberToHex(state.rgb);
+  const powerLabel = !reachable
+    ? "HORS LIGNE"
+    : powerOn === true
+      ? "ON"
+      : powerOn === false
+        ? "OFF"
+        : "SYNC?";
+  const statusText = !reachable
+    ? "Lampe hors ligne"
+    : powerOn === true
+      ? "Lampe allumée"
+      : powerOn === false
+        ? "Lampe éteinte"
+        : "État réel indisponible";
   return {
     id,
     name: String(merged.name || "").trim(),
+    reachable,
+    powerKnown,
     powerOn,
+    powerLabel,
+    statusText,
+    nextPowerAction: powerOn === true ? "off" : "on",
     brightness,
     colorHex,
   };
@@ -3286,17 +3528,37 @@ function renderActuators() {
     const title = document.createElement("h3");
     title.textContent = model.name || model.id;
     head.appendChild(title);
+    const statusBadge = document.createElement("span");
+    statusBadge.className = `actuator-status-badge ${
+      model.reachable
+        ? model.powerOn === true
+          ? "is-on"
+          : model.powerOn === false
+            ? "is-off"
+            : "is-unknown"
+        : "is-offline"
+    }`;
+    statusBadge.textContent = model.statusText;
+    head.appendChild(statusBadge);
 
     const actions = document.createElement("div");
     actions.className = "actuator-actions";
     const toggleBtn = document.createElement("button");
     toggleBtn.type = "button";
     toggleBtn.className = `actuator-toggle ${
-      model.powerOn === true ? "is-on" : "is-off"
+      model.reachable
+        ? model.powerOn === true
+          ? "is-on"
+          : model.powerOn === false
+            ? "is-off"
+            : "is-unknown"
+        : "is-offline"
     }`;
     toggleBtn.dataset.actuatorAction = "toggle";
-    toggleBtn.dataset.actuatorNextAction = model.powerOn === true ? "off" : "on";
-    toggleBtn.textContent = model.powerOn === true ? "ON" : "OFF";
+    toggleBtn.dataset.actuatorNextAction = model.nextPowerAction;
+    toggleBtn.textContent = model.powerLabel;
+    toggleBtn.title = model.statusText;
+    toggleBtn.disabled = !model.reachable;
     actions.appendChild(toggleBtn);
 
     const dimmerRow = document.createElement("div");
@@ -3310,6 +3572,7 @@ function renderActuators() {
     dimmerInput.step = "1";
     dimmerInput.value = String(model.brightness);
     dimmerInput.dataset.actuatorAction = "bright";
+    dimmerInput.disabled = !model.reachable;
     const dimmerValue = document.createElement("span");
     dimmerValue.className = "actuator-dimmer-value";
     dimmerValue.textContent = `${model.brightness}%`;
@@ -3320,29 +3583,26 @@ function renderActuators() {
     const colorRow = document.createElement("div");
     colorRow.className = "actuator-color";
     const colorLabel = document.createElement("span");
-    colorLabel.textContent = "Couleur";
+    colorLabel.textContent = "Palette";
+    const colorWell = document.createElement("label");
+    colorWell.className = "actuator-color-well";
+    colorWell.style.setProperty("--actuator-color", model.colorHex);
     const colorInput = document.createElement("input");
     colorInput.type = "color";
+    colorInput.className = "actuator-color-input";
     colorInput.value = model.colorHex;
     colorInput.dataset.actuatorAction = "color";
-    const palette = document.createElement("div");
-    palette.className = "actuator-color-palette";
-    ACTUATOR_COLOR_PRESETS.forEach((hex) => {
-      const swatch = document.createElement("button");
-      swatch.type = "button";
-      swatch.className = "actuator-color-swatch";
-      if (hex.toLowerCase() === String(model.colorHex || "").toLowerCase()) {
-        swatch.classList.add("is-active");
-      }
-      swatch.style.backgroundColor = hex;
-      swatch.dataset.actuatorAction = "color-preset";
-      swatch.dataset.colorValue = hex;
-      swatch.title = hex;
-      palette.appendChild(swatch);
-    });
+    colorInput.disabled = !model.reachable;
+    colorInput.setAttribute("aria-label", `Couleur ${model.name || model.id}`);
+    const colorValue = document.createElement("span");
+    colorValue.className = "actuator-color-value";
+    colorValue.textContent = model.reachable
+      ? String(model.colorHex || "#ffffff").toUpperCase()
+      : "HORS LIGNE";
+    colorWell.appendChild(colorInput);
+    colorWell.appendChild(colorValue);
     colorRow.appendChild(colorLabel);
-    colorRow.appendChild(colorInput);
-    colorRow.appendChild(palette);
+    colorRow.appendChild(colorWell);
 
     const renameRow = document.createElement("div");
     renameRow.className = "actuator-rename";
@@ -3375,9 +3635,14 @@ async function fetchActuatorStatus(id, silent = false) {
       throw new Error(detail || "status indisponible");
     }
     const status = await res.json();
-    actuatorsStatusById.set(id, status || {});
+    applyActuatorStatus(id, status);
     return status;
   } catch (err) {
+    applyActuatorStatus(id, {
+      reachable: false,
+      state: {},
+      error: err && err.message ? String(err.message) : "indisponible",
+    });
     if (!silent) {
       setActuatorsMessage(
         `Erreur status ${id}: ${err && err.message ? err.message : "indisponible"}`,
@@ -3385,6 +3650,26 @@ async function fetchActuatorStatus(id, silent = false) {
       );
     }
     return null;
+  }
+}
+
+async function refreshActuatorStatuses(options = {}) {
+  if (!actuatorsDevices.length) return;
+  const force = Boolean(options.force);
+  const silent = options.silent !== false;
+  const rerender = options.rerender !== false;
+  if (!force && (currentActiveTab !== "actuators" || document.hidden)) return;
+  if (actuatorStatusPollInFlight) return;
+  actuatorStatusPollInFlight = true;
+  try {
+    await Promise.all(
+      actuatorsDevices.map((device) => fetchActuatorStatus(String(device.id), silent))
+    );
+    if (rerender) {
+      renderActuators();
+    }
+  } finally {
+    actuatorStatusPollInFlight = false;
   }
 }
 
@@ -3402,12 +3687,15 @@ async function fetchActuators() {
       .filter((item) => item && item.id)
       .sort((a, b) => String(a.id).localeCompare(String(b.id), "fr"));
     actuatorsDevices = devices;
-    await Promise.all(
-      devices.map((device) => fetchActuatorStatus(String(device.id), true))
-    );
+    await refreshActuatorStatuses({ force: true, silent: true, rerender: false });
     renderActuators();
     const count = devices.length;
-    setActuatorsMessage(`${count} device${count > 1 ? "s" : ""}`);
+    const onlineCount = devices.filter(
+      (device) => (actuatorsStatusById.get(String(device.id)) || {}).reachable === true
+    ).length;
+    setActuatorsMessage(
+      `${count} device${count > 1 ? "s" : ""} · ${onlineCount} en ligne`
+    );
   } catch (err) {
     actuatorsDevices = [];
     actuatorsStatusById.clear();
@@ -3573,8 +3861,79 @@ function shouldDrawDetectionOverlay(det, options = {}) {
   return true;
 }
 
+function drawDetectionCallout(ctx, det, options = {}) {
+  const bounds = detectionBounds(det);
+  if (!bounds) return false;
+  const scaleX = Number.isFinite(Number(options.scaleX)) ? Number(options.scaleX) : 1;
+  const scaleY = Number.isFinite(Number(options.scaleY)) ? Number(options.scaleY) : 1;
+  const canvasW = Number.isFinite(Number(options.canvasW)) ? Number(options.canvasW) : 0;
+  const canvasH = Number.isFinite(Number(options.canvasH)) ? Number(options.canvasH) : 0;
+  const color = options.color || "#f59e0b";
+  const title = String(options.title || "").trim();
+  if (!title) return false;
+  const detail = String(options.detail || "").trim();
+  const sx = bounds.x * scaleX;
+  const sy = bounds.y * scaleY;
+  const sw = Math.max(1, bounds.w * scaleX);
+  const sh = Math.max(1, bounds.h * scaleY);
+  const anchorX = Math.max(6, Math.min(canvasW - 6, sx + sw / 2));
+  const anchorY = Math.max(6, Math.min(canvasH - 6, sy + Math.min(14, sh * 0.22)));
+  const preferRight = anchorX <= canvasW * 0.55;
+  const titleFont = "600 12px 'IBM Plex Mono', monospace";
+  const detailFont = "11px 'IBM Plex Mono', monospace";
+
+  ctx.save();
+  ctx.font = titleFont;
+  const titleWidth = ctx.measureText(title).width;
+  let detailWidth = 0;
+  if (detail) {
+    ctx.font = detailFont;
+    detailWidth = ctx.measureText(detail).width;
+  }
+  const boxW = Math.ceil(Math.max(titleWidth, detailWidth) + 16);
+  const boxH = detail ? 34 : 22;
+  let boxX = preferRight ? anchorX + 18 : anchorX - boxW - 18;
+  boxX = Math.max(4, Math.min(boxX, Math.max(4, canvasW - boxW - 4)));
+  let boxY = anchorY - boxH - 12;
+  if (boxY < 4) {
+    boxY = Math.min(Math.max(4, canvasH - boxH - 4), sy + sh + 12);
+  }
+  boxY = Math.max(4, Math.min(boxY, Math.max(4, canvasH - boxH - 4)));
+  const lineEndX = preferRight ? boxX : boxX + boxW;
+  const lineEndY = boxY + (detail ? 17 : 11);
+
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(anchorX, anchorY);
+  ctx.lineTo(lineEndX, lineEndY);
+  ctx.stroke();
+
+  ctx.fillStyle = "rgba(15, 23, 42, 0.86)";
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.rect(boxX, boxY, boxW, boxH);
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.fillStyle = "#f8fafc";
+  ctx.font = titleFont;
+  ctx.fillText(title, boxX + 8, boxY + 14);
+  if (detail) {
+    ctx.fillStyle = color;
+    ctx.font = detailFont;
+    ctx.fillText(detail, boxX + 8, boxY + 27);
+  }
+  ctx.restore();
+  return true;
+}
+
 function drawDetections(ctx) {
-  if (!visionDetections || !visionDetections.length) return;
+  if (!visionDetections || !visionDetections.length) {
+    drawSemanticHintBanner(ctx, visionSemanticHints, zonesOverlay.width);
+    return;
+  }
   const frameW =
     visionFrame && Number.isFinite(visionFrame.width)
       ? Number(visionFrame.width)
@@ -3587,24 +3946,16 @@ function drawDetections(ctx) {
   const scaleY = frameH ? zonesOverlay.height / frameH : 1;
   ctx.lineWidth = 2;
   ctx.font = "12px 'IBM Plex Mono', monospace";
+  const hasSemanticSignal = detectionsContainSemanticSignal(visionDetections);
   visionDetections.forEach((det) => {
     if (!shouldDrawDetectionOverlay(det, { minConfidence: OVERLAY_MIN_CONFIDENCE_PRIMARY })) return;
-    const baseLabel = det.label || "objet";
-    const shapeLabel =
-      det.shape !== null && det.shape !== undefined
-        ? String(det.shape).trim()
-        : "";
-    const customLabel = getCustomLabel(det);
-    const label = customLabel || (shapeLabel ? `${baseLabel} (${shapeLabel})` : baseLabel);
-    const confidence =
-      det.confidence !== null && det.confidence !== undefined
-        ? Number(det.confidence)
-        : null;
+    const title = detectionOverlayText(det);
+    const detail = detectionDiagnosticText(det);
+    const baseLabel = detectionHasSemanticSignal(det)
+      ? String(det.label || "objet").trim().toLowerCase()
+      : "";
     const color = baseLabel === "personne" ? "#22c55e" : "#f59e0b";
     ctx.strokeStyle = color;
-    ctx.fillStyle = color;
-    let labelX = 4;
-    let labelY = 14;
     ctx.beginPath();
     det.poly.forEach((pt, idx) => {
       if (!Array.isArray(pt) || pt.length < 2) return;
@@ -3612,22 +3963,30 @@ function drawDetections(ctx) {
       const py = Number(pt[1]) * scaleY;
       if (idx === 0) {
         ctx.moveTo(px, py);
-        labelX = px + 4;
-        labelY = py + 12;
       } else {
         ctx.lineTo(px, py);
       }
     });
     ctx.closePath();
     ctx.stroke();
-    const text =
-      confidence !== null && Number.isFinite(confidence)
-        ? `${label} ${(confidence * 100).toFixed(0)}%`
-        : label;
-    const clampedX = Math.min(Math.max(4, labelX), zonesOverlay.width - 4);
-    const clampedY = Math.min(Math.max(14, labelY), zonesOverlay.height - 4);
-    ctx.fillText(text, clampedX, clampedY);
+    if (
+      !drawDetectionCallout(ctx, det, {
+        scaleX,
+        scaleY,
+        canvasW: zonesOverlay.width,
+        canvasH: zonesOverlay.height,
+        color,
+        title,
+        detail,
+      })
+    ) {
+      ctx.fillStyle = color;
+      ctx.fillText(title, 6, 16);
+    }
   });
+  if (!hasSemanticSignal) {
+    drawSemanticHintBanner(ctx, visionSemanticHints, zonesOverlay.width);
+  }
 }
 
 function drawSecondaryOverlay() {
@@ -3640,7 +3999,14 @@ function drawSecondaryOverlay() {
 }
 
 function drawDetectionsSecondary(ctx) {
-  if (!visionDetectionsSecondary || !visionDetectionsSecondary.length) return;
+  if (!visionDetectionsSecondary || !visionDetectionsSecondary.length) {
+    drawSemanticHintBanner(
+      ctx,
+      visionSemanticHintsSecondary,
+      zonesOverlaySecondary.width
+    );
+    return;
+  }
   const frameW =
     visionFrameSecondary && Number.isFinite(visionFrameSecondary.width)
       ? Number(visionFrameSecondary.width)
@@ -3653,6 +4019,7 @@ function drawDetectionsSecondary(ctx) {
   const scaleY = frameH ? zonesOverlaySecondary.height / frameH : 1;
   ctx.lineWidth = 2;
   ctx.font = "12px 'IBM Plex Mono', monospace";
+  const hasSemanticSignal = detectionsContainSemanticSignal(visionDetectionsSecondary);
   visionDetectionsSecondary.forEach((det) => {
     if (
       !shouldDrawDetectionOverlay(det, {
@@ -3662,21 +4029,13 @@ function drawDetectionsSecondary(ctx) {
     ) {
       return;
     }
-    const shapeLabel =
-      det.shape !== null && det.shape !== undefined
-        ? String(det.shape).trim()
-        : "";
-    const labelBase = det.label || "objet";
-    const label = shapeLabel ? `${labelBase} (${shapeLabel})` : labelBase;
-    const confidence =
-      det.confidence !== null && det.confidence !== undefined
-        ? Number(det.confidence)
-        : null;
-    const color = label === "personne" ? "#22c55e" : "#f59e0b";
+    const title = detectionOverlayText(det);
+    const detail = detectionDiagnosticText(det);
+    const baseLabel = detectionHasSemanticSignal(det)
+      ? String(det.label || "objet").trim().toLowerCase()
+      : "";
+    const color = baseLabel === "personne" ? "#22c55e" : "#f59e0b";
     ctx.strokeStyle = color;
-    ctx.fillStyle = color;
-    let labelX = 4;
-    let labelY = 14;
     ctx.beginPath();
     det.poly.forEach((pt, idx) => {
       if (!Array.isArray(pt) || pt.length < 2) return;
@@ -3684,25 +4043,34 @@ function drawDetectionsSecondary(ctx) {
       const py = Number(pt[1]) * scaleY;
       if (idx === 0) {
         ctx.moveTo(px, py);
-        labelX = px + 4;
-        labelY = py + 12;
       } else {
         ctx.lineTo(px, py);
       }
     });
     ctx.closePath();
     ctx.stroke();
-    const text =
-      confidence !== null && Number.isFinite(confidence)
-        ? `${label} ${(confidence * 100).toFixed(0)}%`
-        : label;
-    const clampedX = Math.min(Math.max(4, labelX), zonesOverlaySecondary.width - 4);
-    const clampedY = Math.min(
-      Math.max(14, labelY),
-      zonesOverlaySecondary.height - 4
-    );
-    ctx.fillText(text, clampedX, clampedY);
+    if (
+      !drawDetectionCallout(ctx, det, {
+        scaleX,
+        scaleY,
+        canvasW: zonesOverlaySecondary.width,
+        canvasH: zonesOverlaySecondary.height,
+        color,
+        title,
+        detail,
+      })
+    ) {
+      ctx.fillStyle = color;
+      ctx.fillText(title, 6, 16);
+    }
   });
+  if (!hasSemanticSignal) {
+    drawSemanticHintBanner(
+      ctx,
+      visionSemanticHintsSecondary,
+      zonesOverlaySecondary.width
+    );
+  }
 }
 
 function pointInPolygon(x, y, points) {
@@ -3790,11 +4158,13 @@ async function fetchVisionDetections() {
     visionDetections = Array.isArray(data.detections) ? data.detections : [];
     visionFrame = data.frame || null;
     visionDetectionsTs = data.ts || 0;
+    visionSemanticHints = semanticHintsFromPayload(data, false);
     drawZones();
     renderDetectionTags();
   } catch (err) {
     visionDetections = [];
     visionFrame = null;
+    visionSemanticHints = [];
     drawZones();
     renderDetectionTags();
   } finally {
@@ -3823,10 +4193,12 @@ async function fetchVisionDetectionsSecondary() {
       : [];
     visionFrameSecondary = data.frame || null;
     visionDetectionsSecondaryTs = data.ts || 0;
+    visionSemanticHintsSecondary = semanticHintsFromPayload(data, true);
     drawSecondaryOverlay();
   } catch (err) {
     visionDetectionsSecondary = [];
     visionFrameSecondary = null;
+    visionSemanticHintsSecondary = [];
     drawSecondaryOverlay();
   } finally {
     visionDetectionsSecondaryInFlight = false;
@@ -4152,9 +4524,9 @@ setInterval(fetchVersion, 20000);
 fetchVisionZones();
 setInterval(fetchVisionZones, 20000);
 fetchVisionDetections();
-setInterval(fetchVisionDetections, 1500);
+setInterval(fetchVisionDetections, VISION_DETECTIONS_POLL_MS);
 fetchVisionDetectionsSecondary();
-setInterval(fetchVisionDetectionsSecondary, 2200);
+setInterval(fetchVisionDetectionsSecondary, VISION_DETECTIONS_SECONDARY_POLL_MS);
 fetchPicobotStatus();
 setInterval(fetchPicobotStatus, 4000);
 fetchHardwareModels();
@@ -4302,10 +4674,7 @@ setInterval(() => {
   }
   if (videoStreamSecondary && VIDEO_KEEPALIVE_REFRESH_MS > 0) {
     if (!lastSecondaryStreamLoadAt) lastSecondaryStreamLoadAt = now;
-    if (now - lastSecondaryStreamLoadAt > VIDEO_KEEPALIVE_REFRESH_MS) {
-      lastSecondaryStreamLoadAt = now;
-      videoStreamSecondary.src = `/video/stream-secondary?ts=${now}`;
-    }
+    // Do not force periodic Surface stream reloads while healthy: they cause visible cuts.
   }
 }, 5000);
 
@@ -4468,8 +4837,11 @@ if (actuatorsList) {
     const timer = setTimeout(async () => {
       actuatorRealtimeTimers.delete(key);
       try {
-        await sendActuatorCommand(id, action, params);
+        const data = await sendActuatorCommand(id, action, params);
+        applyActuatorStatus(id, data);
       } catch (err) {
+        await fetchActuatorStatus(id, true);
+        renderActuators();
         setActuatorsMessage(
           `Erreur ${action}: ${err && err.message ? err.message : "échec"}`,
           true
@@ -4480,6 +4852,23 @@ if (actuatorsList) {
   };
 
   actuatorsList.addEventListener("input", (event) => {
+    const colorInput = event.target.closest(
+      'input[type="color"][data-actuator-action="color"]'
+    );
+    if (colorInput) {
+      const well = colorInput.closest(".actuator-color-well");
+      if (well) {
+        well.style.setProperty(
+          "--actuator-color",
+          String(colorInput.value || "#ffffff")
+        );
+        const valueEl = well.querySelector(".actuator-color-value");
+        if (valueEl) {
+          valueEl.textContent = String(colorInput.value || "#ffffff").toUpperCase();
+        }
+      }
+      return;
+    }
     const range = event.target.closest('input[type="range"][data-actuator-action="bright"]');
     if (!range) return;
     const row = range.closest(".actuator-dimmer");
@@ -4509,27 +4898,6 @@ if (actuatorsList) {
     const id = card.dataset.actuatorId;
     const action = button.dataset.actuatorAction;
     if (!id || !action) return;
-    if (action === "color-preset") {
-      const hex = String(button.dataset.colorValue || "#ffffff");
-      const colorInput = card.querySelector('input[type="color"][data-actuator-action="color"]');
-      if (colorInput) colorInput.value = hex;
-      setActuatorsMessage("Envoi color...");
-      button.disabled = true;
-      try {
-        await sendActuatorCommand(id, "color", { value: hex });
-        await fetchActuatorStatus(id, true);
-        renderActuators();
-        setActuatorsMessage("Commande color envoyée");
-      } catch (err) {
-        setActuatorsMessage(
-          `Erreur color: ${err && err.message ? err.message : "échec"}`,
-          true
-        );
-      } finally {
-        button.disabled = false;
-      }
-      return;
-    }
     const effectiveAction =
       action === "toggle"
         ? String(button.dataset.actuatorNextAction || "on").toLowerCase()
@@ -4542,11 +4910,13 @@ if (actuatorsList) {
     setActuatorsMessage(`Envoi ${effectiveAction}...`);
     button.disabled = true;
     try {
-      await sendActuatorCommand(id, effectiveAction, params);
-      await fetchActuatorStatus(id, true);
+      const data = await sendActuatorCommand(id, effectiveAction, params);
+      applyActuatorStatus(id, data);
       renderActuators();
       setActuatorsMessage(`Commande ${effectiveAction} envoyée`);
     } catch (err) {
+      await fetchActuatorStatus(id, true);
+      renderActuators();
       setActuatorsMessage(
         `Erreur ${effectiveAction}: ${err && err.message ? err.message : "échec"}`,
         true
@@ -4572,11 +4942,13 @@ if (actuatorsList) {
     input.disabled = true;
     setActuatorsMessage(`Envoi ${action}...`);
     try {
-      await sendActuatorCommand(id, action, params);
-      await fetchActuatorStatus(id, true);
+      const data = await sendActuatorCommand(id, action, params);
+      applyActuatorStatus(id, data);
       renderActuators();
       setActuatorsMessage(`Commande ${action} envoyée`);
     } catch (err) {
+      await fetchActuatorStatus(id, true);
+      renderActuators();
       setActuatorsMessage(
         `Erreur ${action}: ${err && err.message ? err.message : "échec"}`,
         true
@@ -4586,6 +4958,10 @@ if (actuatorsList) {
     }
   });
 }
+
+setInterval(() => {
+  refreshActuatorStatuses();
+}, ACTUATOR_STATUS_POLL_MS);
 
 
 if (cameraReconnect) {

@@ -1,9 +1,31 @@
 # Fondation Didier (Version Exportable)
 
-Date de reference: 2026-02-25
-Statut global: ARCHITECTURE PICOBOT STABILISEE + ROUTING LLMFIT HARDWARE-AWARE ETAPES 1-7 INTEGREES
-- Release UI: `V4r3`
+Date de reference: 2026-03-01
+Statut global: VISION YOLO26 HAILO ACTIVE + FLUX SURFACE CADENCE CORRIGEE + PARITE DE DETECTION PS3/SURFACE + INDICES COCO VISIBLES VALIDES
+- Release UI: `didier-v4r37-coco-hints-visible-2026-03-01`
 - Tag de reference: `didier_alive`
+
+## Mise a jour 2026-03-01 (V4r37 - Vision YOLO26 / Surface / COCO)
+
+- Release validee: `didier-v4r37-coco-hints-visible-2026-03-01`
+- Vision Hailo:
+  - `yolo26n.hef` est l'artefact runtime actif
+  - le post-processing manuel des 6 sorties YOLO26 (branches boxes + classes) est actif dans le runtime
+  - la detection semantique est validee sur les deux flux pendant la meme fenetre de controle (`personne` sur PS3 et `personne` sur Surface)
+  - les payloads de detection exposent maintenant `semantic_hints`, ce qui rend visibles les meilleures classes COCO meme quand aucune detection n'est encore confirmee
+- Flux Surface:
+  - la cause des saccades etait backend: le generateur MJPEG HTTP suivait encore le `target_fps` de l'arbitre (`10 fps` en `TENDU`) au lieu du `15 fps` configure pour le flux distant
+  - le correctif v4r36 (toujours actif dans v4r37) force maintenant la reemission, le watchdog de stall et le backoff de restart a respecter le `fps` configure du flux Surface
+  - validation backend: `/vision/status-secondary` remonte `diagnostic=healthy`, `fps=15`, `frame_gap_s~0.04`
+- UI diagnostic objet:
+  - quand un frame reste sous seuil, l'UI peut maintenant afficher des `indices COCO` plutot qu'un vide semantique ou seulement des formes brutes
+  - cela permet de voir des classes comme `personne`, `camion`, `parapluie`, `television` meme en dessous du seuil de confirmation
+- Telemetrie NPU:
+  - `/metrics` publie maintenant un `utilization` estime si Hailo est actif mais que le driver ne fournit pas de pourcentage exploitable
+  - retour valide en temps reel: `active=true`, `real_fps~15`, `hailo0` visible comme actif
+- Source canonique de cet etat runtime:
+  - `memory/technical/next-session.md`
+  - `memory/technical/registry.json`
 
 ## Mise a jour 2026-02-25 (Hard Purge OpenClaw)
 

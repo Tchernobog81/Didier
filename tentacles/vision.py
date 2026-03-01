@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import json
 import logging
 import os
 import re
@@ -18,9 +19,104 @@ from core.config_access import npu_settings
 from tentacles.base import BaseTentacle
 from core.config import DidierConfig
 from core.hardware_gatekeeper import HardwareLease, get_hardware_gatekeeper
+from core.vision_capture_service import CaptureSourceConfig
+from core.vision_capture_service import build_gstreamer_pipeline as build_capture_gstreamer_pipeline
+from core.vision_capture_service import can_use_v4l2_fallback
+from core.vision_capture_service import iter_capture_attempts
+from core.vision_capture_service import resolve_capture_source
 from core.vision_npu_policy import vision_npu_status
+from core.vision_preprocess_service import map_model_box_to_frame as map_preprocessed_box_to_frame
+from core.vision_preprocess_service import prepare_model_input
+from core.vision_yolo26_service import build_object_hints
+from core.vision_yolo26_service import decode_yolo26_head_pairs
+from core.vision_yolo26_service import decorate_debug_snapshot
+from core.vision_yolo26_service import normalize_spatial_head
+from core.vision_yolo26_service import sigmoid
 
 DEFAULT_SUBPROCESS_TIMEOUT_S = 2.0
+
+COCO_LABEL_TRANSLATIONS_FR = {
+    "person": "personne",
+    "bicycle": "velo",
+    "car": "voiture",
+    "motorcycle": "moto",
+    "airplane": "avion",
+    "bus": "bus",
+    "train": "train",
+    "truck": "camion",
+    "boat": "bateau",
+    "traffic light": "feu tricolore",
+    "fire hydrant": "borne incendie",
+    "stop sign": "stop",
+    "parking meter": "horodateur",
+    "bench": "banc",
+    "bird": "oiseau",
+    "cat": "chat",
+    "dog": "chien",
+    "horse": "cheval",
+    "sheep": "mouton",
+    "cow": "vache",
+    "elephant": "elephant",
+    "bear": "ours",
+    "zebra": "zebre",
+    "giraffe": "girafe",
+    "backpack": "sac a dos",
+    "umbrella": "parapluie",
+    "handbag": "sac a main",
+    "tie": "cravate",
+    "suitcase": "valise",
+    "frisbee": "frisbee",
+    "skis": "skis",
+    "snowboard": "snowboard",
+    "sports ball": "ballon",
+    "kite": "cerf-volant",
+    "baseball bat": "batte",
+    "baseball glove": "gant de baseball",
+    "skateboard": "skateboard",
+    "surfboard": "planche de surf",
+    "tennis racket": "raquette de tennis",
+    "bottle": "bouteille",
+    "wine glass": "verre a vin",
+    "cup": "tasse",
+    "fork": "fourchette",
+    "knife": "couteau",
+    "spoon": "cuillere",
+    "bowl": "bol",
+    "banana": "banane",
+    "apple": "pomme",
+    "sandwich": "sandwich",
+    "orange": "orange",
+    "broccoli": "brocoli",
+    "carrot": "carotte",
+    "hot dog": "hot-dog",
+    "pizza": "pizza",
+    "donut": "donut",
+    "cake": "gateau",
+    "chair": "chaise",
+    "couch": "canape",
+    "potted plant": "plante",
+    "bed": "lit",
+    "dining table": "table",
+    "toilet": "toilettes",
+    "tv": "television",
+    "laptop": "ordinateur portable",
+    "mouse": "souris",
+    "remote": "telecommande",
+    "keyboard": "clavier",
+    "cell phone": "telephone",
+    "microwave": "micro-ondes",
+    "oven": "four",
+    "toaster": "grille-pain",
+    "sink": "evier",
+    "refrigerator": "refrigerateur",
+    "book": "livre",
+    "clock": "horloge",
+    "vase": "vase",
+    "scissors": "ciseaux",
+    "teddy bear": "ours en peluche",
+    "hair drier": "seche-cheveux",
+    "toothbrush": "brosse a dents",
+}
 
 
 class HailoDetector:
@@ -49,6 +145,9 @@ class HailoDetector:
         self._input_shape = None
         self._input_name = None
         self._output_shapes_logged = False
+        self._last_output_shapes: dict[str, Any] = {}
+        self._last_decode_debug: dict[str, Any] = {}
+        self._last_preprocess_meta: dict[str, Any] | None = None
         self._last_npu_load = None
         self._score_threshold = max(0.05, min(float(score_threshold), 0.95))
         self._nms_threshold = max(0.1, min(float(nms_threshold), 0.95))
@@ -79,6 +178,16 @@ class HailoDetector:
     @property
     def ready(self) -> bool:
         return self._ready
+
+    def debug_snapshot(self) -> dict[str, Any]:
+        snapshot = dict(getattr(self, "_last_decode_debug", {}) or {})
+        output_shapes = dict(getattr(self, "_last_output_shapes", {}) or {})
+        if output_shapes:
+            snapshot.setdefault("output_shapes", output_shapes)
+        preprocess = dict(getattr(self, "_last_preprocess_meta", {}) or {})
+        if preprocess:
+            snapshot.setdefault("preprocess", preprocess)
+        return snapshot
 
     def _init_detector(self) -> None:
         if not self._model_path.exists():
@@ -214,15 +323,13 @@ class HailoDetector:
         return (h, w, c)
 
     def _preprocess(self, frame: Any) -> np.ndarray | None:
-        if self._input_shape is None:
-            return None
-        h, w, _ = self._input_shape
-        resized = cv2.resize(frame, (w, h))
-        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        tensor = np.expand_dims(rgb, axis=0).astype(np.uint8)
-        order = self._infer_format_order()
-        if order == "NCHW":
-            tensor = np.transpose(tensor, (0, 3, 1, 2))
+        tensor, meta = prepare_model_input(
+            frame,
+            self._input_shape,
+            use_letterbox=bool(self._e2e_nms_free),
+            format_order=self._infer_format_order(),
+        )
+        self._last_preprocess_meta = dict(meta or {}) if meta else None
         return tensor
 
     def _infer_format_order(self) -> str | None:
@@ -250,9 +357,77 @@ class HailoDetector:
                         shapes[str(key)] = list(value.shape)
                     except Exception:
                         shapes[str(key)] = "unknown"
+            self._last_output_shapes = shapes
             self._logger.info("Hailo outputs: %s", shapes)
         except Exception:
             return
+
+    def _remember_decode_debug(self, **values: Any) -> None:
+        current = dict(getattr(self, "_last_decode_debug", {}) or {})
+        current.update(values)
+        self._last_decode_debug = current
+
+    def _normalize_spatial_head(self, tensor: Any) -> np.ndarray | None:
+        return normalize_spatial_head(tensor)
+
+    def _sigmoid(self, values: np.ndarray) -> np.ndarray:
+        return sigmoid(values)
+
+    def _map_model_box_to_frame(
+        self,
+        *,
+        x1: float,
+        y1: float,
+        x2: float,
+        y2: float,
+        frame_w: int,
+        frame_h: int,
+    ) -> list[int] | None:
+        return map_preprocessed_box_to_frame(
+            x1=x1,
+            y1=y1,
+            x2=x2,
+            y2=y2,
+            frame_w=frame_w,
+            frame_h=frame_h,
+            preprocess_meta=getattr(self, "_last_preprocess_meta", None),
+            input_shape=getattr(self, "_input_shape", None),
+        )
+
+    def _apply_class_aware_nms(self, detections: List[dict]) -> List[dict]:
+        if len(detections) <= 1:
+            return detections
+        grouped: dict[int | None, List[dict]] = {}
+        for det in detections:
+            grouped.setdefault(det.get("class_id"), []).append(det)
+        filtered: List[dict] = []
+        for group in grouped.values():
+            filtered.extend(self._apply_nms(group))
+        filtered.sort(key=lambda item: float(item.get("confidence", 0.0)), reverse=True)
+        return filtered
+
+    def _decode_yolo26_head_pairs(
+        self,
+        outputs: Any,
+        frame_w: int | None,
+        frame_h: int | None,
+    ) -> List[dict] | None:
+        if not self._e2e_nms_free:
+            return None
+        detections, debug = decode_yolo26_head_pairs(
+            outputs,
+            frame_w=frame_w,
+            frame_h=frame_h,
+            input_shape=getattr(self, "_input_shape", None),
+            preprocess_meta=getattr(self, "_last_preprocess_meta", None),
+            score_threshold=self._score_threshold,
+            max_detections=self._max_detections,
+            apply_nms=self._apply_nms,
+            map_box_to_frame=map_preprocessed_box_to_frame,
+        )
+        if debug:
+            self._remember_decode_debug(**debug)
+        return detections
 
     def _postprocess(
         self, outputs: Any, frame_shape: tuple[int, int] | None
@@ -261,6 +436,13 @@ class HailoDetector:
         if not isinstance(outputs, dict):
             return detections
         frame_h, frame_w = (frame_shape if frame_shape else (None, None))
+        paired_yolo26 = self._decode_yolo26_head_pairs(outputs, frame_w, frame_h)
+        if paired_yolo26 is not None:
+            paired_yolo26.sort(
+                key=lambda item: float(item.get("confidence", 0.0)),
+                reverse=True,
+            )
+            return paired_yolo26[: self._max_detections]
         hailo_nms_handled = False
         for _, tensor in outputs.items():
             nms_detections = self._parse_hailo_nms_by_class(tensor, frame_w, frame_h)
@@ -276,10 +458,27 @@ class HailoDetector:
                 if det is not None:
                     detections.append(det)
         if hailo_nms_handled:
+            self._remember_decode_debug(
+                decode_path="hailo_nms_by_class",
+                raw_detections=int(len(detections)),
+                nms_kept=int(len(detections)),
+                nms_mode="hailo_native",
+            )
             detections.sort(key=lambda item: float(item.get("confidence", 0.0)), reverse=True)
             return detections[: self._max_detections]
         if not self._e2e_nms_free:
             detections = self._apply_nms(detections)
+            self._remember_decode_debug(
+                decode_path="flat_rows",
+                raw_detections=int(len(detections)),
+                nms_mode="global_opencv",
+            )
+        else:
+            self._remember_decode_debug(
+                decode_path="direct_yolo_rows",
+                raw_detections=int(len(detections)),
+                nms_mode="none",
+            )
         detections.sort(key=lambda item: float(item.get("confidence", 0.0)), reverse=True)
         return detections[: self._max_detections]
 
@@ -826,6 +1025,7 @@ class Tentacle(BaseTentacle):
         self._camera_index = int(self.config.get("vision.camera_index", 0))
         self._npu_required_for_vision = bool(npu_settings(self.config).required_for_vision)
         self._camera_device = self.config.get("vision.camera_device", None)
+        self._camera_source = self.config.get("vision.camera_source", None)
         self._capture_backend = str(self.config.get("vision.capture_backend", "auto")).lower()
         self._width = self.config.get("vision.width", None)
         self._height = self.config.get("vision.height", None)
@@ -861,6 +1061,12 @@ class Tentacle(BaseTentacle):
         self._npu_score_threshold = float(
             self.config.get("vision.npu_score_threshold", 0.35)
         )
+        self._secondary_npu_score_threshold = float(
+            self.config.get(
+                "vision.secondary_npu_score_threshold",
+                self._npu_score_threshold,
+            )
+        )
         self._npu_nms_threshold = float(
             self.config.get("vision.npu_nms_threshold", 0.45)
         )
@@ -894,6 +1100,8 @@ class Tentacle(BaseTentacle):
         self._last_secondary_infer_ts = 0.0
         self._primary_infer_fps = 0.0
         self._secondary_infer_fps = 0.0
+        self._last_primary_detector_debug: dict[str, Any] | None = None
+        self._last_secondary_detector_debug: dict[str, Any] | None = None
         self._jpeg_lock = threading.Lock()
         self._last_jpeg: bytes | None = None
         self._frame_lock = threading.Lock()
@@ -1048,8 +1256,36 @@ class Tentacle(BaseTentacle):
         try:
             if not self._labels_path.exists():
                 return []
-            lines = self._labels_path.read_text(encoding="utf-8").splitlines()
-            return [line.strip() for line in lines if line.strip()]
+            suffix = str(self._labels_path.suffix or "").strip().lower()
+            raw_text = self._labels_path.read_text(encoding="utf-8")
+            labels: list[str]
+            if suffix == ".json":
+                parsed = json.loads(raw_text)
+                if isinstance(parsed, dict):
+                    parsed = parsed.get("labels", [])
+                if not isinstance(parsed, list):
+                    return []
+                labels = [str(item).strip() for item in parsed if str(item).strip()]
+            elif suffix in {".yaml", ".yml"}:
+                labels = []
+                for raw_line in raw_text.splitlines():
+                    line = raw_line.strip()
+                    if not line or line.startswith("#") or line == "labels:":
+                        continue
+                    if line.startswith("- "):
+                        line = line[2:].strip()
+                    if ":" in line and not line.startswith(("http://", "https://", "rtsp://")):
+                        continue
+                    label = line.strip().strip("'\"")
+                    if label:
+                        labels.append(label)
+            else:
+                lines = raw_text.splitlines()
+                labels = [line.strip() for line in lines if line.strip()]
+            return [
+                COCO_LABEL_TRANSLATIONS_FR.get(label.strip().lower(), label)
+                for label in labels
+            ]
         except Exception:
             return []
 
@@ -1068,6 +1304,66 @@ class Tentacle(BaseTentacle):
         except Exception:
             return None
         return None
+
+    def _class_name_for_id(self, class_id: Any) -> str | None:
+        try:
+            idx = int(class_id)
+        except Exception:
+            return None
+        if idx < 0:
+            return None
+        if idx in getattr(self, "_person_class_ids", set()):
+            return "personne"
+        labels = getattr(self, "_class_labels", []) or []
+        if 0 <= idx < len(labels):
+            label = str(labels[idx] or "").strip()
+            return label or None
+        return None
+
+    def _decorate_debug_snapshot(self, snapshot: dict[str, Any] | None) -> dict[str, Any] | None:
+        return decorate_debug_snapshot(
+            snapshot,
+            class_name_for_id=self._class_name_for_id,
+        )
+
+    def _object_hints_from_debug(
+        self,
+        snapshot: dict[str, Any] | None,
+        *,
+        min_score: float = 0.01,
+        max_items: int = 3,
+    ) -> dict[str, Any] | None:
+        return build_object_hints(
+            snapshot,
+            class_name_for_id=self._class_name_for_id,
+            min_score=min_score,
+            max_items=max_items,
+        )
+
+    def _semantic_hints_from_status_payload(
+        self,
+        payload: dict[str, Any] | None,
+        *,
+        secondary: bool,
+        max_items: int = 3,
+    ) -> list[dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return []
+        hint_key = "secondary_object_hints" if secondary else "primary_object_hints"
+        hints_block = payload.get(hint_key)
+        if not isinstance(hints_block, dict):
+            hints_block = payload.get("object_hints")
+        if not isinstance(hints_block, dict):
+            return []
+        top_labels = hints_block.get("top_labels", [])
+        if not isinstance(top_labels, list):
+            return []
+        hints: list[dict[str, Any]] = []
+        for item in top_labels[: max(1, int(max_items))]:
+            if not isinstance(item, dict):
+                continue
+            hints.append(dict(item))
+        return hints
 
     def _load_owner_embedder(self):
         if not self._owner_embedding_model.exists():
@@ -1190,7 +1486,8 @@ class Tentacle(BaseTentacle):
     def _capture_frame_v4l2(self) -> np.ndarray | None:
         if not self._v4l2_lock.acquire(timeout=1.2):
             return None
-        device = self._camera_device or f"/dev/video{self._camera_index}"
+        source = resolve_capture_source(self._capture_source_config())
+        device = source if not isinstance(source, int) else f"/dev/video{source}"
         width = int(self._width or 640)
         height = int(self._height or 480)
         fourcc = (self._fourcc or "YUYV").upper()
@@ -1225,13 +1522,16 @@ class Tentacle(BaseTentacle):
 
     def enroll_owner(self, samples: int = 5) -> dict[str, Any]:
         cap = None
-        use_fallback = self._capture_backend == "v4l2"
+        use_fallback = self._capture_backend == "v4l2" and self._can_use_v4l2_fallback()
         if not use_fallback:
             cap = self._open_camera()
             if not cap.isOpened():
                 cap.release()
                 cap = None
-                use_fallback = True
+                if self._can_use_v4l2_fallback():
+                    use_fallback = True
+                else:
+                    return {"ok": False, "error": "Capture failed"}
         use_embedding = self._owner_mode == "embedding" and self._owner_embedder is not None
         use_lbph = self._owner_mode != "hist" and self._can_use_lbph() and not use_embedding
         histograms: list[np.ndarray] = []
@@ -1325,13 +1625,16 @@ class Tentacle(BaseTentacle):
         if self._owner_recognizer is None and self._owner_profile is None and self._owner_embedding is None:
             return {"ok": False, "enrolled": False}
         cap = None
-        use_fallback = self._capture_backend == "v4l2"
+        use_fallback = self._capture_backend == "v4l2" and self._can_use_v4l2_fallback()
         if not use_fallback:
             cap = self._open_camera()
             if not cap.isOpened():
                 cap.release()
                 cap = None
-                use_fallback = True
+                if self._can_use_v4l2_fallback():
+                    use_fallback = True
+                else:
+                    return {"ok": False, "enrolled": True, "error": "Capture failed"}
         try:
             if use_fallback:
                 frame = self._capture_frame_v4l2()
@@ -1413,12 +1716,10 @@ class Tentacle(BaseTentacle):
             try:
                 class_id = det.get("class_id")
                 label = det.get("label")
-                if class_id is not None and self._class_labels:
-                    idx = int(class_id)
-                    if 0 <= idx < len(self._class_labels):
-                        label = self._class_labels[idx]
-                if class_id is not None and class_id in self._person_class_ids:
-                    label = "personne"
+                class_name = self._class_name_for_id(class_id)
+                if class_name:
+                    label = class_name
+                    det["class_name"] = class_name
                 if not label:
                     label = "objet"
                 det["label"] = label
@@ -1435,20 +1736,55 @@ class Tentacle(BaseTentacle):
             tagged.append(det)
         return tagged
 
-    def _detect_with_lock(self, frame: Any) -> List[dict]:
+    def _capture_detector_debug(self, *, secondary: bool) -> None:
+        if not hasattr(self._detector, "debug_snapshot"):
+            return
+        try:
+            snapshot = self._detector.debug_snapshot()
+        except Exception:
+            return
+        if not isinstance(snapshot, dict):
+            return
+        payload = self._decorate_debug_snapshot(snapshot) or {}
+        payload["stream"] = "secondary" if secondary else "primary"
+        payload["captured_at"] = time.time()
+        if secondary:
+            self._last_secondary_detector_debug = payload
+        else:
+            self._last_primary_detector_debug = payload
+
+    def _detect_with_lock(self, frame: Any, *, secondary: bool = False) -> List[dict]:
         if not self._detect_lock.acquire(timeout=0.4):
             self._last_error = "detect_lock_timeout"
             return []
         npu_lease: HardwareLease | None = None
+        previous_score_threshold: float | None = None
         if getattr(self._detector, "name", "") == "hailo":
             npu_lease = self._gatekeeper.acquire("npu", timeout_s=0.3, blocking=False)
             if npu_lease is None:
                 self._detect_lock.release()
                 self._last_error = "npu_gate_locked"
                 return []
+            if secondary and hasattr(self._detector, "_score_threshold"):
+                try:
+                    previous_score_threshold = float(getattr(self._detector, "_score_threshold"))
+                    tuned_threshold = max(
+                        0.05,
+                        min(float(self._secondary_npu_score_threshold), 0.95),
+                    )
+                    setattr(self._detector, "_score_threshold", tuned_threshold)
+                except Exception:
+                    previous_score_threshold = None
         try:
-            return self._detector.detect(frame)
+            detections = self._detector.detect(frame)
+            self._capture_detector_debug(secondary=secondary)
+            return detections
         finally:
+            if previous_score_threshold is not None:
+                try:
+                    setattr(self._detector, "_score_threshold", previous_score_threshold)
+                except Exception:
+                    pass
             if npu_lease is not None:
                 npu_lease.release()
             self._detect_lock.release()
@@ -1485,7 +1821,7 @@ class Tentacle(BaseTentacle):
         try:
             try:
                 detections = await asyncio.wait_for(
-                    asyncio.to_thread(self._detect_with_lock, frame),
+                    asyncio.to_thread(self._detect_with_lock, frame, secondary=False),
                     timeout=timeout_s,
                 )
             except asyncio.TimeoutError:
@@ -1653,13 +1989,16 @@ class Tentacle(BaseTentacle):
         try:
             with self._camera_io_lock:
                 cap = None
-                use_fallback = self._capture_backend == "v4l2"
+                use_fallback = self._capture_backend == "v4l2" and self._can_use_v4l2_fallback()
                 if not use_fallback:
                     cap = self._open_camera()
                     if not cap.isOpened():
                         cap.release()
                         cap = None
-                        use_fallback = True
+                        if self._can_use_v4l2_fallback():
+                            use_fallback = True
+                        else:
+                            return None
                 try:
                     if use_fallback:
                         return self._capture_frame_v4l2()
@@ -1673,24 +2012,27 @@ class Tentacle(BaseTentacle):
         finally:
             lease.release()
 
-    def _build_gstreamer_pipeline(self) -> str | None:
-        if not self._camera_device and self._camera_index is None:
-            return None
-        device = self._camera_device or f"/dev/video{self._camera_index}"
-        width = int(self._width or 640)
-        height = int(self._height or 480)
-        fps = int(self._fps or 30)
-        fourcc = (self._fourcc or "YUYV").upper()
-        if fourcc == "YUYV":
-            fourcc = "YUY2"
-        return (
-            f"v4l2src device={device} "
-            f"! video/x-raw,format={fourcc},width={width},height={height},framerate={fps}/1 "
-            "! videoconvert ! appsink"
+    def _capture_source_config(self) -> CaptureSourceConfig:
+        return CaptureSourceConfig(
+            camera_index=self._camera_index,
+            camera_device=self._camera_device,
+            camera_source=self._camera_source,
+            capture_backend=self._capture_backend,
+            width=self._width,
+            height=self._height,
+            fps=self._fps,
+            fourcc=self._fourcc,
         )
 
+    def _can_use_v4l2_fallback(self) -> bool:
+        return can_use_v4l2_fallback(self._capture_source_config())
+
+    def _build_gstreamer_pipeline(self) -> str | None:
+        return build_capture_gstreamer_pipeline(self._capture_source_config())
+
     def _open_camera(self) -> cv2.VideoCapture:
-        source = self._camera_device if self._camera_device else self._camera_index
+        capture_cfg = self._capture_source_config()
+        source = resolve_capture_source(capture_cfg)
         gst = self._build_gstreamer_pipeline()
 
         def _apply_settings(cap: cv2.VideoCapture) -> None:
@@ -1708,18 +2050,14 @@ class Tentacle(BaseTentacle):
             except Exception:
                 pass
 
-        open_attempts: list[tuple[str, Any, int | None]] = []
-        if self._capture_backend == "gstreamer" and gst:
-            open_attempts.append(("gstreamer", gst, cv2.CAP_GSTREAMER))
-        open_attempts.append(("v4l2", source, cv2.CAP_V4L2))
-        open_attempts.append(("opencv", source, None))
-        if self._camera_device:
-            open_attempts.append(("index-v4l2", self._camera_index, cv2.CAP_V4L2))
-            open_attempts.append(("index-opencv", self._camera_index, None))
-        if gst and self._capture_backend != "gstreamer":
-            open_attempts.append(("gstreamer", gst, cv2.CAP_GSTREAMER))
-
-        for backend_name, src, api_pref in open_attempts:
+        for attempt in iter_capture_attempts(
+            capture_cfg,
+            gstreamer_pipeline=gst,
+            cap_gstreamer=cv2.CAP_GSTREAMER,
+            cap_v4l2=cv2.CAP_V4L2,
+        ):
+            src = attempt.source
+            api_pref = attempt.api_preference
             cap = (
                 cv2.VideoCapture(src, api_pref)
                 if api_pref is not None
@@ -1744,6 +2082,17 @@ class Tentacle(BaseTentacle):
     def get_status(self) -> dict[str, Any]:
         detector_name = getattr(self._detector, "name", "unknown")
         detector_ready = bool(getattr(self._detector, "ready", False))
+        detector_debug = None
+        if hasattr(self._detector, "debug_snapshot"):
+            try:
+                detector_debug = self._decorate_debug_snapshot(self._detector.debug_snapshot())
+            except Exception:
+                detector_debug = None
+        object_hints = self._object_hints_from_debug(detector_debug)
+        primary_object_hints = self._object_hints_from_debug(self._last_primary_detector_debug)
+        secondary_object_hints = self._object_hints_from_debug(
+            self._last_secondary_detector_debug
+        )
         npu_status = vision_npu_status(
             detector_name=detector_name,
             detector_ready=detector_ready,
@@ -1770,8 +2119,15 @@ class Tentacle(BaseTentacle):
             "last_count": len(self._last_detections),
             "infer_fps": round(float(self._primary_infer_fps), 2),
             "secondary_infer_fps": round(float(self._secondary_infer_fps), 2),
+            "last_secondary_count": len(self._last_secondary_detections),
             "last_error": self._last_error,
             "npu_load": self._last_npu_load,
+            "detector_debug": detector_debug,
+            "object_hints": object_hints,
+            "primary_detector_debug": self._last_primary_detector_debug,
+            "primary_object_hints": primary_object_hints,
+            "secondary_detector_debug": self._last_secondary_detector_debug,
+            "secondary_object_hints": secondary_object_hints,
         }
 
     async def run(self) -> None:
@@ -1779,7 +2135,8 @@ class Tentacle(BaseTentacle):
             self._logger.info("Vision tentacle idle (enable_live=false).")
             await self.stop_event.wait()
             return
-        self._logger.info("Vision tentacle starting (camera=%s).", self._camera_index)
+        capture_source = resolve_capture_source(self._capture_source_config())
+        self._logger.info("Vision tentacle starting (camera=%s).", capture_source)
         while not self.stop_event.is_set():
             lease = await asyncio.to_thread(
                 self._gatekeeper.acquire,
@@ -1796,14 +2153,16 @@ class Tentacle(BaseTentacle):
             return
         self._stream_running = True
         cap = None
-        use_fallback = self._capture_backend == "v4l2"
+        use_fallback = self._capture_backend == "v4l2" and self._can_use_v4l2_fallback()
         if not use_fallback:
             cap = self._open_camera()
             if not cap.isOpened():
-                self._logger.warning("OpenCV camera failed; fallback v4l2-ctl.")
+                self._logger.warning("OpenCV camera failed; reopening strategy engaged.")
                 cap.release()
                 cap = None
-                use_fallback = True
+                self._last_error = "camera_open_failed"
+                if self._can_use_v4l2_fallback():
+                    use_fallback = True
 
         try:
             failures = 0
@@ -1851,6 +2210,19 @@ class Tentacle(BaseTentacle):
                     fallback_failures = 0
                     self._fallback_backoff_s = self._fallback_min_sleep_s
                 else:
+                    if cap is None or not cap.isOpened():
+                        try:
+                            if cap is not None:
+                                cap.release()
+                        except Exception:
+                            pass
+                        cap = self._open_camera()
+                        if cap is None or not cap.isOpened():
+                            self._last_error = "camera_reopen_failed"
+                            if self._can_use_v4l2_fallback():
+                                use_fallback = True
+                            await asyncio.sleep(self._fallback_min_sleep_s)
+                            continue
                     ret, frame = await asyncio.to_thread(cap.read)
                     if not ret:
                         failures += 1
@@ -1868,12 +2240,13 @@ class Tentacle(BaseTentacle):
                                 pass
                             cap = self._open_camera()
                             if not cap.isOpened():
-                                self._logger.warning(
-                                    "OpenCV reopen failed; switching to v4l2."
-                                )
+                                self._logger.warning("OpenCV reopen failed.")
                                 cap.release()
                                 cap = None
-                                use_fallback = True
+                                self._last_error = "camera_reopen_failed"
+                                if self._can_use_v4l2_fallback():
+                                    self._logger.warning("Switching to v4l2 fallback.")
+                                    use_fallback = True
                         await asyncio.sleep(0.05)
                         continue
                     frame = self._ensure_bgr_frame(frame)
@@ -1964,15 +2337,20 @@ class Tentacle(BaseTentacle):
             height, width = self._last_frame_shape
         elif self._width and self._height:
             width, height = int(self._width), int(self._height)
+        status = self.get_status()
         return {
             "detections": list(self._last_detections),
             "frame": {"width": width, "height": height},
             "ts": self._last_ts,
-            "status": self.get_status(),
+            "status": status,
+            "semantic_hints": self._semantic_hints_from_status_payload(
+                status,
+                secondary=False,
+            ),
         }
 
     def _detect_secondary_with_fallback(self, frame: Any) -> List[dict]:
-        detections = self._detect_with_lock(frame)
+        detections = self._detect_with_lock(frame, secondary=True)
         if detections:
             self._secondary_empty_hailo_streak = 0
             return detections
@@ -1981,7 +2359,7 @@ class Tentacle(BaseTentacle):
         if self._last_error in {"npu_gate_locked", "detect_lock_timeout"}:
             self._secondary_empty_hailo_streak = 0
             time.sleep(0.06)
-            detections = self._detect_with_lock(frame)
+            detections = self._detect_with_lock(frame, secondary=True)
             if detections:
                 return detections
             try:
@@ -2006,6 +2384,16 @@ class Tentacle(BaseTentacle):
             self._secondary_empty_hailo_streak = 0
         return detections
 
+    def _has_semantic_detections(self, detections: List[dict]) -> bool:
+        for item in detections:
+            if not isinstance(item, dict):
+                continue
+            if item.get("class_id") is not None:
+                return True
+            if item.get("confidence") is not None:
+                return True
+        return False
+
     def detect_secondary_frame(self, frame: Any) -> dict[str, Any]:
         if frame is None or not hasattr(frame, "shape"):
             raise RuntimeError("Invalid frame")
@@ -2013,13 +2401,25 @@ class Tentacle(BaseTentacle):
             self._last_secondary_frame_shape = frame.shape[:2]
             detections = self._detect_secondary_with_fallback(frame)
             detections = self._tag_detections(detections, frame)
+            if (
+                self._safe_hailo_detect
+                and self._is_hailo_detector()
+                and detections
+                and not self._has_semantic_detections(detections)
+            ):
+                detections = []
             self._store_secondary_detections(detections)
             height, width = self._last_secondary_frame_shape
+            status = self.get_status()
             return {
                 "detections": detections,
                 "frame": {"width": width, "height": height},
                 "ts": self._last_secondary_ts,
-                "status": self.get_status(),
+                "status": status,
+                "semantic_hints": self._semantic_hints_from_status_payload(
+                    status,
+                    secondary=True,
+                ),
             }
         finally:
             self._update_infer_fps(secondary=True)
@@ -2029,11 +2429,16 @@ class Tentacle(BaseTentacle):
         height = None
         if self._last_secondary_frame_shape:
             height, width = self._last_secondary_frame_shape
+        status = self.get_status()
         return {
             "detections": list(self._last_secondary_detections),
             "frame": {"width": width, "height": height},
             "ts": self._last_secondary_ts,
-            "status": self.get_status(),
+            "status": status,
+            "semantic_hints": self._semantic_hints_from_status_payload(
+                status,
+                secondary=True,
+            ),
         }
 
     def person_in_roi(self) -> bool:
