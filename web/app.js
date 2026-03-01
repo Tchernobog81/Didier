@@ -71,6 +71,9 @@ const tabButtons = document.querySelectorAll("[data-tab]");
 const tabPanels = document.querySelectorAll("[data-tab-panel]");
 const dockerGraph = document.getElementById("docker-graph");
 const dockerMeta = document.getElementById("docker-meta");
+const dockerSummary = document.getElementById("docker-summary");
+const dockerWorkersList = document.getElementById("docker-workers-list");
+const dockerLinksList = document.getElementById("docker-links-list");
 const picobotKpis = document.getElementById("picobot-kpis");
 const picobotMeta = document.getElementById("picobot-meta");
 const picobotTaskList = document.getElementById("picobot-task-list");
@@ -1870,6 +1873,197 @@ function buildDockerLayout(payload) {
   return columns;
 }
 
+function flattenDockerNodes(columns) {
+  const nodes = [];
+  if (!Array.isArray(columns)) return nodes;
+  columns.forEach((column) => {
+    if (!Array.isArray(column)) return;
+    column.forEach((node) => {
+      if (node) nodes.push(node);
+    });
+  });
+  return nodes;
+}
+
+function createDockerSummaryCard({ title, value, meta, status }) {
+  const card = document.createElement("div");
+  card.className = `docker-summary-card ${statusToClass(status)}`;
+  const titleEl = document.createElement("span");
+  titleEl.className = "docker-summary-title";
+  titleEl.textContent = title;
+  const valueEl = document.createElement("strong");
+  valueEl.className = "docker-summary-value";
+  valueEl.textContent = value;
+  const metaEl = document.createElement("span");
+  metaEl.className = "docker-summary-meta";
+  metaEl.textContent = meta;
+  card.appendChild(titleEl);
+  card.appendChild(valueEl);
+  card.appendChild(metaEl);
+  return card;
+}
+
+function renderDockerSummary(payload) {
+  if (!dockerSummary) return;
+  dockerSummary.innerHTML = "";
+  const workers = Array.isArray(payload?.workers) ? payload.workers : [];
+  const containers = Array.isArray(payload?.containers) ? payload.containers : [];
+  const integrations =
+    payload?.integrations && typeof payload.integrations === "object"
+      ? payload.integrations
+      : {};
+  const runningWorkers = workers.filter(
+    (worker) => statusToClass(worker && worker.status) === "is-running"
+  ).length;
+  const warnWorkers = workers.filter(
+    (worker) => statusToClass(worker && worker.status) === "is-warn"
+  ).length;
+  const stoppedWorkers = workers.filter(
+    (worker) => statusToClass(worker && worker.status) === "is-stopped"
+  ).length;
+  const syncLinks = dockerEdges.filter((edge) => edge && edge.mode !== "async").length;
+  const asyncLinks = dockerEdges.filter((edge) => edge && edge.mode === "async").length;
+  const integrationStatus = integrations.status ? String(integrations.status) : "inconnu";
+  const cards = [
+    {
+      title: "Workers",
+      value: `${runningWorkers}/${workers.length || 0}`,
+      meta: `warn:${warnWorkers} · ko:${stoppedWorkers}`,
+      status: stoppedWorkers > 0 ? "ko" : warnWorkers > 0 ? "warn" : "running",
+    },
+    {
+      title: "Flux",
+      value: `${syncLinks + asyncLinks}`,
+      meta: `sync:${syncLinks} · async:${asyncLinks}`,
+      status: asyncLinks > syncLinks ? "warn" : "running",
+    },
+    {
+      title: "Runtime",
+      value: `${containers.length}`,
+      meta: `service${containers.length > 1 ? "s dev" : " dev"}`,
+      status: containers.length > 0 ? "running" : "unknown",
+    },
+    {
+      title: "Intégrations",
+      value: statusToShortLabel(integrationStatus),
+      meta: [
+        integrations.ollama ? `ollama:${statusToShortLabel(integrations.ollama.status)}` : "",
+        integrations.picobot
+          ? `picobot:${statusToShortLabel(integrations.picobot.status)}`
+          : "",
+        integrations.signal ? `signal:${statusToShortLabel(integrations.signal.status)}` : "",
+      ]
+        .filter(Boolean)
+        .join(" · ") || "—",
+      status: integrationStatus,
+    },
+  ];
+  cards.forEach((card) => dockerSummary.appendChild(createDockerSummaryCard(card)));
+}
+
+function renderDockerWorkersList(payload) {
+  if (!dockerWorkersList) return;
+  dockerWorkersList.innerHTML = "";
+  const workers = Array.isArray(payload?.workers) ? payload.workers : [];
+  if (!workers.length) {
+    const empty = document.createElement("div");
+    empty.className = "docker-empty";
+    empty.textContent = "Aucun worker edge remonté.";
+    dockerWorkersList.appendChild(empty);
+    return;
+  }
+  workers.forEach((worker) => {
+    const row = document.createElement("div");
+    row.className = `docker-worker-row ${statusToClass(worker && worker.status)}`;
+    const main = document.createElement("div");
+    main.className = "docker-worker-main";
+    const head = document.createElement("div");
+    head.className = "docker-worker-head";
+    const label = document.createElement("strong");
+    label.className = "docker-worker-label";
+    label.textContent = worker && worker.label ? String(worker.label) : "Worker";
+    const pill = document.createElement("span");
+    pill.className = `docker-link-pill ${statusToClass(worker && worker.status)}`;
+    pill.textContent = statusToShortLabel(worker && worker.status);
+    head.appendChild(label);
+    head.appendChild(pill);
+    const meta = document.createElement("span");
+    meta.className = "docker-worker-meta";
+    meta.textContent = [
+      workerTypeLabel(worker && worker.worker_type),
+      worker && worker.ipc ? String(worker.ipc) : "",
+      worker && worker.meta ? String(worker.meta) : "",
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    main.appendChild(head);
+    main.appendChild(meta);
+    if (worker && worker.detail) {
+      const detail = document.createElement("span");
+      detail.className = "docker-worker-detail";
+      detail.textContent = String(worker.detail);
+      main.appendChild(detail);
+    }
+    row.appendChild(main);
+    dockerWorkersList.appendChild(row);
+  });
+}
+
+function renderDockerLinksList(nodeList) {
+  if (!dockerLinksList) return;
+  dockerLinksList.innerHTML = "";
+  const nodeLabels = new Map(
+    (Array.isArray(nodeList) ? nodeList : []).map((node) => [
+      String(node && node.id ? node.id : ""),
+      String(node && node.label ? node.label : ""),
+    ])
+  );
+  const rankedEdges = dockerEdges
+    .filter((edge) => edge && edge.from && edge.to)
+    .map((edge) => {
+      const label = normalizeEdgeLabel(edge.label);
+      let score = 0;
+      if (EDGE_LINK_LABEL_SIGNAL.has(label)) score += 4;
+      if (isWorkerCommunicationEdge(edge)) score += 3;
+      if (edge.mode === "async") score += 1;
+      return { edge, score };
+    })
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 10)
+    .map((item) => item.edge);
+  if (!rankedEdges.length) {
+    const empty = document.createElement("div");
+    empty.className = "docker-empty";
+    empty.textContent = "Aucun flux edge exploitable.";
+    dockerLinksList.appendChild(empty);
+    return;
+  }
+  rankedEdges.forEach((edge) => {
+    const row = document.createElement("div");
+    row.className = `docker-link-row docker-link-row-${edge.mode}`;
+    const top = document.createElement("div");
+    top.className = "docker-link-row-top";
+    const route = document.createElement("span");
+    route.className = "docker-link-route";
+    const fromLabel = nodeLabels.get(String(edge.from)) || String(edge.from);
+    const toLabel = nodeLabels.get(String(edge.to)) || String(edge.to);
+    route.textContent = `${fromLabel} → ${toLabel}`;
+    const pill = document.createElement("span");
+    pill.className = `docker-link-pill ${
+      edge.mode === "async" ? "is-warn" : "is-running"
+    }`;
+    pill.textContent = edge.mode === "async" ? "ASYNC" : "SYNC";
+    top.appendChild(route);
+    top.appendChild(pill);
+    const meta = document.createElement("span");
+    meta.className = "docker-worker-detail";
+    meta.textContent = edge.label ? String(edge.label) : "flux interne";
+    row.appendChild(top);
+    row.appendChild(meta);
+    dockerLinksList.appendChild(row);
+  });
+}
+
 function drawDockerLinks(svg) {
   if (!dockerGraph || !svg) return;
   const rect = dockerGraph.getBoundingClientRect();
@@ -1971,6 +2165,10 @@ function renderDockerDiagram(payload) {
   svg.classList.add("docker-links");
   dockerGraph.appendChild(svg);
   const columns = buildDockerLayout(payload);
+  const nodes = flattenDockerNodes(columns);
+  renderDockerSummary(payload);
+  renderDockerWorkersList(payload);
+  renderDockerLinksList(nodes);
   columns.forEach((col, idx) => {
     const columnEl = document.createElement("div");
     columnEl.className = "docker-column";
@@ -2016,7 +2214,11 @@ function renderDockerDiagram(payload) {
     const syncLinks = dockerEdges.filter((edge) => edge && edge.mode !== "async").length;
     const asyncLinks = dockerEdges.filter((edge) => edge && edge.mode === "async").length;
     const at = payload?.ts ? formatTime(payload.ts) : "--:--:--";
-    dockerMeta.textContent = `${count} ${suffix} · ${workersLabel} · sync:${syncLinks} async:${asyncLinks} · ${runtime} · ${at}`;
+    const integrationState =
+      payload?.integrations && payload.integrations.status
+        ? statusToShortLabel(payload.integrations.status)
+        : "UNK";
+    dockerMeta.textContent = `${count} ${suffix} · ${workersLabel} · sync:${syncLinks} async:${asyncLinks} · ${runtime} · int:${integrationState} · ${at}`;
   }
   requestAnimationFrame(() => drawDockerLinks(svg));
   setTimeout(() => drawDockerLinks(svg), 120);
@@ -2036,13 +2238,16 @@ async function fetchDockerDiagram() {
   if (!dockerGraph) return;
   if (currentActiveTab !== "docker") return;
   try {
-    const [diagramData, healthData, deviceData, metricsData] = await Promise.all([
+    const [diagramData, healthData, deviceData, metricsData, integrationsData] = await Promise.all([
       fetchJsonSafe("/docker/diagram"),
       fetchJsonSafe("/health"),
       latestDeviceStatus ? Promise.resolve(latestDeviceStatus) : fetchJsonSafe("/device-status"),
       fetchJsonSafe("/metrics"),
+      fetchJsonSafe("/system/integrations"),
     ]);
-    if (!diagramData && !healthData && !deviceData && !metricsData) throw new Error("edge");
+    if (!diagramData && !healthData && !deviceData && !metricsData && !integrationsData) {
+      throw new Error("edge");
+    }
     const workersFromMetricsRaw = metricsData && metricsData.workers ? metricsData.workers : null;
     let workersFromMetrics = [];
     if (Array.isArray(workersFromMetricsRaw)) {
@@ -2101,10 +2306,14 @@ async function fetchDockerDiagram() {
         String(healthData.status || "").toLowerCase() === "ok",
       healthName: healthData && healthData.name ? String(healthData.name) : "Didier",
       deviceStatus: deviceData || latestDeviceStatus || null,
+      integrations: integrationsData || null,
     };
     renderDockerDiagram(payload);
   } catch (err) {
     dockerGraph.textContent = "Schéma Workers Edge indisponible.";
+    if (dockerSummary) dockerSummary.innerHTML = "";
+    if (dockerWorkersList) dockerWorkersList.innerHTML = "";
+    if (dockerLinksList) dockerLinksList.innerHTML = "";
     if (dockerMeta) dockerMeta.textContent = "--";
   }
 }
@@ -3724,11 +3933,12 @@ function persistDidierBoostPreference() {
 async function sendDidierPrompt(prompt) {
   const shouldForceTask = false;
   const boostEnabled = Boolean(didierBoost && didierBoost.checked);
+  const startedAtMs = Date.now();
   appendTerminal(didierOutput, `> ${String(prompt || "").trim()}`);
-  const traceTs = new Date().toISOString();
+  const traceStartTs = new Date().toISOString();
   appendTerminal(
     didierTechOutput,
-    `[${traceTs}] prompt="${String(prompt || "").replace(/\s+/g, " ").trim()}" boost=${
+    `[${traceStartTs}] prompt="${String(prompt || "").replace(/\s+/g, " ").trim()}" boost=${
       boostEnabled ? "on" : "off"
     }`
   );
@@ -3762,28 +3972,77 @@ async function sendDidierPrompt(prompt) {
       thinkingBadge.classList.remove("thinking-active");
     }
     appendTerminal(didierOutput, data.response || "Pas de réponse.");
-    const route = String(data.route || "").trim() || "-";
+    const doneTs = new Date().toISOString();
+    const elapsedMs = Math.max(0, Date.now() - startedAtMs);
+    const route = String(
+      data.route ||
+        (data.routing && data.routing.execution_backend) ||
+        (data.routing && data.routing.route_hint) ||
+        ""
+    ).trim() || "-";
     const audioStatus = String(data.audio_status || "").trim() || "-";
     const reactSource = String(
       (data.react && data.react.source) || data.source || "-"
     ).trim();
     appendTerminal(
       didierTechOutput,
-      `[${traceTs}] route=${route} source=${reactSource} audio=${audioStatus}`
+      `[${doneTs}] route=${route} source=${reactSource} audio=${audioStatus} latency_ms=${elapsedMs}`
     );
+    const diagnostics =
+      data && data.diagnostics && typeof data.diagnostics === "object"
+        ? data.diagnostics
+        : {};
+    const responseDiag =
+      diagnostics.response && typeof diagnostics.response === "object"
+        ? diagnostics.response
+        : {};
+    const ttsDiag =
+      diagnostics.tts && typeof diagnostics.tts === "object"
+        ? diagnostics.tts
+        : {};
+    const metricsParts = [];
+    const responseChars = Number(responseDiag.chars);
+    if (Number.isFinite(responseChars)) {
+      metricsParts.push(`resp_chars=${Math.max(0, Math.round(responseChars))}`);
+    }
+    const responseSentences = Number(responseDiag.sentences);
+    if (Number.isFinite(responseSentences)) {
+      metricsParts.push(`resp_sent=${Math.max(0, Math.round(responseSentences))}`);
+    }
+    const ttsChars = Number(ttsDiag.chars);
+    if (Number.isFinite(ttsChars)) {
+      metricsParts.push(`tts_chars=${Math.max(0, Math.round(ttsChars))}`);
+    }
+    const ttsSentences = Number(ttsDiag.sentences);
+    if (Number.isFinite(ttsSentences)) {
+      metricsParts.push(`tts_sent=${Math.max(0, Math.round(ttsSentences))}`);
+    }
+    const queueMs = Number(diagnostics.audio_queue_ms);
+    if (Number.isFinite(queueMs)) {
+      metricsParts.push(`audio_queue_ms=${Math.max(0, Math.round(queueMs))}`);
+    }
+    const serverMs = Number(data.server_elapsed_ms);
+    if (Number.isFinite(serverMs)) {
+      metricsParts.push(`server_ms=${Math.max(0, Math.round(serverMs))}`);
+    }
+    if (metricsParts.length) {
+      appendTerminal(didierTechOutput, `[${doneTs}] metrics ${metricsParts.join(" ")}`);
+    }
     const audioNote = String(data.audio_note || "").trim();
     if (audioNote) {
-      appendTerminal(didierTechOutput, `[${traceTs}] audio_note=${audioNote}`);
+      appendTerminal(didierTechOutput, `[${doneTs}] audio_note=${audioNote}`);
     }
     const audioDetail = String(data.audio_detail || "").trim();
     if (audioDetail) {
-      appendTerminal(didierTechOutput, `[${traceTs}] audio_detail=${audioDetail}`);
+      appendTerminal(didierTechOutput, `[${doneTs}] audio_detail=${audioDetail}`);
     }
   } catch (err) {
     if (thinkingBadge) {
       thinkingBadge.textContent = "Réflexion : erreur";
       thinkingBadge.classList.remove("thinking-active");
     }
+    const doneTs = new Date().toISOString();
+    const elapsedMs = Math.max(0, Date.now() - startedAtMs);
     const timeout = err && err.name === "AbortError";
     appendTerminal(
       didierOutput,
@@ -3793,13 +4052,13 @@ async function sendDidierPrompt(prompt) {
     );
     appendTerminal(
       didierTechOutput,
-      `[${traceTs}] error=${
+      `[${doneTs}] error=${
         timeout
           ? "timeout ask-and-speak"
           : err && err.message
             ? String(err.message)
             : "join failure"
-      }`
+      } latency_ms=${elapsedMs}`
     );
   }
 }

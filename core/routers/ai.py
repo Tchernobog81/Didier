@@ -7,13 +7,37 @@ import time
 import unicodedata
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 import httpx
 from fastapi import APIRouter, HTTPException
+from core.ai_ask_and_speak_service import AskAndSpeakDeps
+from core.ai_ask_and_speak_service import handle_ask_and_speak
+from core.ai_backend_policy import resolve_gemini_boost_config
+from core.ai_coding_service import CodingGenerationDeps
+from core.ai_coding_service import CodingServiceError
+from core.ai_coding_service import generate_coding_response
+from core.ai_conversation_service import ConversationGenerationDeps
+from core.ai_conversation_service import ConversationServiceError
+from core.ai_conversation_service import generate_conversation_response as generate_conversation_response_service
+from core.ai_process_service import ProcessInputDeps
+from core.ai_process_service import process_input as process_input_service
+from core.ai_config import ollama_cfg as _ollama_cfg
+from core.ai_config import picobot_cfg as _picobot_cfg
+from core.ai_config import coding_cfg as _coding_cfg
+from core.ai_config import prepare_chat_text as _prepare_chat_text
+from core.ai_config import prepare_tts_text as _prepare_tts_text
+from core.ai_config import routing_cfg as _routing_cfg
 from core.backend_routing import choose_backend as choose_backend_contract
+from core.brain_client import generate_from_brain
 from core.ollama_targeting import probe_ollama_endpoint
 from core.ollama_targeting import resolve_pixel_ollama_base_url
+from core.picobot_client import memory_from_picobot
+from core.picobot_client import memory_write_picobot
+from core.picobot_client import metrics_from_picobot
+from core.picobot_client import react_from_picobot
+from core.picobot_client import route_from_picobot
+from core.picobot_client import tasks_from_picobot
+from core.text_compaction import text_stats
 from core.routers.guards import circuit_breaker
 from core.resource_arbitrator import get_resource_arbitrator
 from core.shared_state import read_state as read_shared_state
@@ -23,7 +47,6 @@ router = APIRouter()
 DEFAULT_HTTP_TIMEOUT_S = 2.0
 DEFAULT_LLM_HTTP_TIMEOUT_S = 12.0
 DEFAULT_SUBPROCESS_TIMEOUT_S = 2.0
-_PICOBOT_DEFAULT_BASES = ("http://127.0.0.1:3901",)
 _OLLAMA_MODELS_CACHE_TTL_S = 5.0
 _OLLAMA_MODELS_CACHE: dict[str, Any] | None = None
 _OLLAMA_MODELS_CACHE_TS = 0.0
@@ -356,13 +379,12 @@ def _looks_like_vision_anomaly(prompt: str) -> bool:
 def _should_react_filter(
     payload: dict[str, Any], prompt: str, orchestrator: Any
 ) -> bool:
+    cfg = _picobot_cfg(orchestrator)
     if "react_filter" in payload:
         return bool(payload.get("react_filter"))
     if _looks_like_vision_anomaly(prompt):
-        return bool(orchestrator.config.get("picobot.anomaly_react_enabled", True))
-    return bool(
-        orchestrator.config.get("picobot.react_filter_default", False)
-    )
+        return bool(cfg.anomaly_react_enabled)
+    return bool(cfg.react_filter_default)
 
 
 def _infer_task_type(
@@ -389,28 +411,6 @@ def choose_backend(prompt: str, task_type: str, payload: dict[str, Any] | None =
     return choose_backend_contract(prompt, task_type, context=ctx)
 
 
-def _resolve_generate_timeout_s(orchestrator: Any, backend_choice: dict[str, Any] | None) -> float:
-    timeout_s = float(orchestrator.config.get("ollama.timeout_seconds", 120))
-    timeout_s = max(2.0, min(timeout_s, 7.0))
-    execution_backend = str((backend_choice or {}).get("execution_backend", "")).strip()
-    if execution_backend == "pixel_ollama":
-        pixel_timeout_s = float(
-            orchestrator.config.get("routing.pixel_ollama.generate_timeout_s", min(timeout_s, 5.5))
-        )
-        timeout_s = max(1.5, min(pixel_timeout_s, 6.0))
-    return timeout_s
-
-
-def _resolve_local_fallback_timeout_s(orchestrator: Any, primary_timeout_s: float) -> float:
-    fallback_timeout_s = float(
-        orchestrator.config.get(
-            "routing.local_ollama.fallback_timeout_s",
-            max(1.8, min(primary_timeout_s * 0.5, 2.8)),
-        )
-    )
-    return max(1.5, min(fallback_timeout_s, 3.0))
-
-
 def _extract_openai_chat_text(payload: dict[str, Any]) -> str:
     choices = payload.get("choices", []) if isinstance(payload, dict) else []
     if not isinstance(choices, list) or not choices:
@@ -429,59 +429,6 @@ def _extract_openai_chat_text(payload: dict[str, Any]) -> str:
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
-
-
-def _resolve_gemini_boost_config(orchestrator: Any) -> dict[str, Any]:
-    picobot_cfg = orchestrator.config.get("picobot", {}) if orchestrator else {}
-    if not isinstance(picobot_cfg, dict):
-        picobot_cfg = {}
-    gemini_cfg = picobot_cfg.get("gemini", {})
-    if not isinstance(gemini_cfg, dict):
-        gemini_cfg = {}
-    try:
-        timeout_s = float(gemini_cfg.get("timeout_s", 3.2))
-    except Exception:
-        timeout_s = 3.2
-    timeout_s = max(0.4, min(timeout_s, DEFAULT_LLM_HTTP_TIMEOUT_S))
-    try:
-        max_tokens = int(gemini_cfg.get("max_tokens", 220))
-    except Exception:
-        max_tokens = 220
-    max_tokens = max(64, min(max_tokens, 384))
-    try:
-        memory_items = int(gemini_cfg.get("memory_items", 6))
-    except Exception:
-        memory_items = 6
-    memory_items = max(0, min(memory_items, 20))
-    try:
-        memory_max_bytes = int(gemini_cfg.get("memory_max_bytes", 262144))
-    except Exception:
-        memory_max_bytes = 262144
-    memory_max_bytes = max(16384, min(memory_max_bytes, 2 * 1024 * 1024))
-    base_url = str(
-        gemini_cfg.get("base_url", "https://generativelanguage.googleapis.com/v1beta")
-    ).strip().rstrip("/")
-    model = str(gemini_cfg.get("model", "gemini-1.5-flash")).strip()
-    memory_path = str(
-        gemini_cfg.get("memory_path", _GEMINI_BOOST_MEMORY_PATH_DEFAULT)
-    ).strip() or _GEMINI_BOOST_MEMORY_PATH_DEFAULT
-    api_key = (
-        str(os.getenv("DIDIER_GEMINI_API_KEY", "")).strip()
-        or str(gemini_cfg.get("api_key", "")).strip()
-    )
-    return {
-        "enabled": _flag_enabled(gemini_cfg.get("enabled", False)),
-        "api_key": api_key,
-        "base_url": base_url,
-        "model": model,
-        "timeout_s": timeout_s,
-        "max_tokens": max_tokens,
-        "memory_enabled": _flag_enabled(gemini_cfg.get("memory_enabled", True)),
-        "memory_items": memory_items,
-        "memory_path": memory_path,
-        "memory_max_bytes": memory_max_bytes,
-    }
-
 
 def _resolve_repo_path(path_str: str) -> Path:
     raw = Path(str(path_str or "").strip()).expanduser()
@@ -642,7 +589,8 @@ async def _try_gemini_boost_chat(
     max_tokens: int,
     timeout_s: float,
 ) -> tuple[str | None, str | None]:
-    config = _resolve_gemini_boost_config(orchestrator)
+    ollama_cfg = _ollama_cfg(orchestrator)
+    config = resolve_gemini_boost_config(_picobot_cfg(orchestrator))
     if not config.get("enabled", False):
         return None, "gemini_boost_disabled"
     api_key = str(config.get("api_key", "")).strip()
@@ -672,7 +620,7 @@ async def _try_gemini_boost_chat(
     body = {
         "contents": [{"parts": [{"text": prompt_text}]}],
         "generationConfig": {
-            "temperature": float(orchestrator.config.get("ollama.temperature", 0.35)),
+            "temperature": float(ollama_cfg.temperature),
             "maxOutputTokens": max(64, min(int(max_tokens or 128), 384)),
         },
     }
@@ -712,15 +660,14 @@ async def _try_pixel_openai_chat(
     max_tokens: int,
     timeout_s: float,
 ) -> tuple[str | None, str | None]:
-    picobot_cfg = orchestrator.config.get("picobot", {}) if orchestrator else {}
-    if not isinstance(picobot_cfg, dict):
-        picobot_cfg = {}
-    base_url = str(picobot_cfg.get("llm_endpoint", "")).strip().rstrip("/")
-    model = str(picobot_cfg.get("llm_model", "")).strip()
+    ollama_cfg = _ollama_cfg(orchestrator)
+    picobot_cfg = _picobot_cfg(orchestrator)
+    base_url = str(picobot_cfg.llm_endpoint).strip().rstrip("/")
+    model = str(picobot_cfg.llm_model).strip()
     if not base_url or not model:
         return None, "pixel_openai_config_missing"
 
-    api_key = str(picobot_cfg.get("llm_api_key", "")).strip() or "sk-dummy"
+    api_key = str(picobot_cfg.llm_api_key).strip() or "sk-dummy"
     endpoint = f"{base_url}/chat/completions"
     messages: list[dict[str, str]] = []
     if system_prompt:
@@ -729,7 +676,7 @@ async def _try_pixel_openai_chat(
     body = {
         "model": model,
         "messages": messages,
-        "temperature": float(orchestrator.config.get("ollama.temperature", 0.4)),
+        "temperature": float(ollama_cfg.temperature),
         "max_tokens": max(48, min(int(max_tokens or 96), 220)),
     }
     headers = {
@@ -758,14 +705,16 @@ async def _resolve_ollama_base_for_backend(
     backend_choice: dict[str, Any],
     payload: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any], list[str]]:
-    base_url = str(orchestrator.config.get("ollama.base_url", "http://localhost:11434")).strip().rstrip("/")
+    base_url = str(_ollama_cfg(orchestrator).base_url).strip().rstrip("/")
+    routing_cfg = _routing_cfg(orchestrator)
+    config_view = getattr(orchestrator, "loaded_config", None) or getattr(orchestrator, "config", None)
     routing = dict(backend_choice or {})
     execution_backend = str(routing.get("execution_backend", "local_ollama")).strip() or "local_ollama"
     if execution_backend != "pixel_ollama":
         return base_url, routing, []
 
     root_cfg = {
-        "routing": orchestrator.config.get("routing", {}) or {},
+        "routing": config_view.get("routing", {}) if config_view is not None else {},
         "hardware": {
             "discovery": {
                 "pixel_ip_hints": orchestrator.config.get("hardware.discovery.pixel_ip_hints", []) or []
@@ -783,7 +732,7 @@ async def _resolve_ollama_base_for_backend(
         routing["fallback_reason"] = "pixel_ollama_url_unresolved"
         return base_url, routing, []
 
-    health_timeout_s = float(orchestrator.config.get("routing.pixel_ollama.health_timeout_s", DEFAULT_HTTP_TIMEOUT_S))
+    health_timeout_s = float(routing_cfg.pixel_ollama_health_timeout_s)
     health_timeout_s = max(0.1, min(health_timeout_s, DEFAULT_HTTP_TIMEOUT_S))
     ok, reason, models = await probe_ollama_endpoint(pixel_base, timeout_s=health_timeout_s)
     if not ok:
@@ -803,7 +752,7 @@ async def _relay_picobot_react(
     _ = api_module
     if not _should_react_filter(payload, prompt, orchestrator):
         return None
-    default_react_timeout_s = float(orchestrator.config.get("picobot.react_timeout_s", 5.0))
+    default_react_timeout_s = float(_picobot_cfg(orchestrator).react_timeout_s)
     timeout_s = _http_timeout(
         float(payload.get("react_timeout_s", default_react_timeout_s)),
         upper=7.0,
@@ -817,24 +766,24 @@ async def _relay_picobot_react(
         value = payload.get(key)
         if value is not None and str(value).strip():
             react_payload[key] = value
-    picobot_result = await _picobot_http_call(
-        orchestrator=orchestrator,
-        method="POST",
-        paths=("/agent/react",),
+    picobot_result = await react_from_picobot(
+        picobot_config=_picobot_cfg(orchestrator),
         payload=react_payload,
         timeout_s=timeout_s,
     )
     if picobot_result.get("ok", False):
         return picobot_result
-    brain_fallback_enabled = bool(
-        orchestrator.config.get("picobot.brain_fallback_enabled", False)
-    )
+    brain_fallback_enabled = bool(_picobot_cfg(orchestrator).brain_fallback_enabled)
     if not brain_fallback_enabled:
         return {
             "ok": False,
             "error": f"picobot unavailable: {picobot_result.get('error', 'unknown')}",
         }
-    brain_result = await _relay_brain_react(prompt, timeout_s=timeout_s)
+    brain_result = await generate_from_brain(
+        prompt=prompt,
+        task_type="react_task",
+        timeout_s=timeout_s,
+    )
     if brain_result.get("ok", False):
         brain_result["degraded"] = True
         brain_result["picobot_error"] = picobot_result.get("error", "picobot unavailable")
@@ -847,50 +796,6 @@ async def _relay_picobot_react(
         ),
     }
 
-
-def _is_local_didier_api_url(base_url: str) -> bool:
-    parsed = urlparse(str(base_url or "").strip())
-    if not (parsed.hostname or "").strip():
-        return False
-    port = parsed.port
-    if port is None:
-        port = 443 if parsed.scheme == "https" else 80
-    return port in {5003, 5010}
-
-
-def _candidate_picobot_bases(orchestrator: Any) -> list[str]:
-    cfg = orchestrator.config.get("picobot", {}) if orchestrator else {}
-    if not isinstance(cfg, dict):
-        cfg = {}
-    candidates: list[str] = []
-    for key in (
-        "base_url",
-        "url",
-        "agent_url",
-        "service_url",
-        "worker_url",
-        "runtime_url",
-        "api_url",
-    ):
-        value = str(cfg.get(key, "")).strip()
-        if value:
-            candidates.append(value.rstrip("/"))
-    candidates.extend(_PICOBOT_DEFAULT_BASES)
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for base in candidates:
-        clean = str(base or "").strip().rstrip("/")
-        if not clean:
-            continue
-        if _is_local_didier_api_url(clean):
-            continue
-        if clean in seen:
-            continue
-        seen.add(clean)
-        deduped.append(clean)
-    return deduped
-
-
 def _agent_shared_snapshot() -> dict[str, Any]:
     snapshot = read_shared_state()
     return {
@@ -898,155 +803,6 @@ def _agent_shared_snapshot() -> dict[str, Any]:
         "hardware_profile": snapshot.get("hardware_profile", {}),
         "workers": snapshot.get("workers", {}),
     }
-
-
-async def _picobot_http_call(
-    *,
-    orchestrator: Any,
-    method: str,
-    paths: tuple[str, ...],
-    payload: dict[str, Any] | None,
-    timeout_s: float,
-) -> dict[str, Any]:
-    timeout = _http_timeout(timeout_s, upper=max(float(timeout_s), DEFAULT_HTTP_TIMEOUT_S))
-    method_up = str(method or "GET").upper()
-    last_error = "picobot endpoint unavailable"
-    bases = _candidate_picobot_bases(orchestrator)
-    for base in bases:
-        for path in paths:
-            endpoint = f"{base}{path}"
-            try:
-                async with httpx.AsyncClient(timeout=timeout) as client:
-                    if method_up == "GET":
-                        response = await client.get(endpoint, params=payload or {})
-                    else:
-                        response = await client.request(method_up, endpoint, json=payload or {})
-                if not response.is_success:
-                    last_error = f"http {response.status_code} on {endpoint}"
-                    continue
-                try:
-                    body: Any = response.json()
-                except Exception:
-                    body = {"response": response.text.strip()}
-                if isinstance(body, dict):
-                    data = dict(body)
-                else:
-                    data = {"response": str(body)}
-                data.setdefault("ok", True)
-                data.setdefault("source", "picobot")
-                data.setdefault("endpoint", endpoint)
-                return data
-            except Exception as exc:
-                last_error = f"{type(exc).__name__} on {endpoint}: {exc}"
-    return {"ok": False, "error": last_error}
-
-
-async def _relay_brain_react(prompt: str, *, timeout_s: float) -> dict[str, Any]:
-    timeout = _http_timeout(timeout_s, upper=max(float(timeout_s), DEFAULT_HTTP_TIMEOUT_S))
-    request_payload = {"prompt": prompt, "task_type": "react_task"}
-    try:
-        response = await ipc_request(
-            "POST",
-            "/generate",
-            service="brain",
-            payload=request_payload,
-            timeout=timeout,
-        )
-    except Exception as exc:
-        return {"ok": False, "error": f"brain relay exception: {exc}"}
-    if not response.is_success:
-        return {"ok": False, "error": f"brain relay http {response.status_code}"}
-    try:
-        payload = response.json()
-    except Exception:
-        payload = {}
-    if not isinstance(payload, dict):
-        payload = {}
-    text = str(payload.get("response", "")).strip()
-    return {
-        "ok": True,
-        "source": "brain_worker",
-        "endpoint": "unix://brain/generate",
-        "response": text,
-        "data": payload,
-    }
-
-
-async def _metrics_from_picobot(orchestrator: Any, timeout_s: float) -> dict[str, Any]:
-    return await _picobot_http_call(
-        orchestrator=orchestrator,
-        method="GET",
-        paths=("/agent/metrics", "/metrics", "/health"),
-        payload={},
-        timeout_s=timeout_s,
-    )
-
-
-async def _tasks_from_picobot(orchestrator: Any, timeout_s: float) -> dict[str, Any]:
-    return await _picobot_http_call(
-        orchestrator=orchestrator,
-        method="GET",
-        paths=("/agent/tasks", "/tasks"),
-        payload={},
-        timeout_s=timeout_s,
-    )
-
-
-async def _route_from_picobot(
-    orchestrator: Any,
-    *,
-    prompt: str,
-    task_type: str,
-    payload: dict[str, Any] | None,
-    timeout_s: float,
-) -> dict[str, Any]:
-    request_payload: dict[str, Any] = {
-        "prompt": str(prompt or ""),
-        "task_type": str(task_type or "chat"),
-    }
-    if isinstance(payload, dict):
-        request_payload["context"] = dict(payload)
-    return await _picobot_http_call(
-        orchestrator=orchestrator,
-        method="POST",
-        paths=("/agent/route",),
-        payload=request_payload,
-        timeout_s=timeout_s,
-    )
-
-
-async def _memory_from_picobot(
-    orchestrator: Any,
-    *,
-    include_content: bool,
-    timeout_s: float,
-) -> dict[str, Any]:
-    return await _picobot_http_call(
-        orchestrator=orchestrator,
-        method="GET",
-        paths=("/agent/memory", "/memory"),
-        payload={"include_content": bool(include_content)},
-        timeout_s=timeout_s,
-    )
-
-
-async def _memory_write_picobot(
-    orchestrator: Any,
-    *,
-    path: str,
-    content: str,
-    append: bool,
-    timeout_s: float,
-) -> dict[str, Any]:
-    return await _picobot_http_call(
-        orchestrator=orchestrator,
-        method="POST",
-        paths=("/agent/memory", "/memory"),
-        payload={"path": path, "content": content, "append": bool(append)},
-        timeout_s=timeout_s,
-    )
-
-
 def _resolve_actuator_target(
     prompt_norm: str, devices: list[dict[str, Any]]
 ) -> tuple[str, str] | None:
@@ -1317,6 +1073,35 @@ def _looks_like_web_query(text: str) -> bool:
     return True
 
 
+def _looks_like_identity_query(text: str) -> bool:
+    norm = _normalize_text(text)
+    if not norm:
+        return False
+    hints = (
+        "tu es quel modele",
+        "quel modele",
+        "quel modèle",
+        "modele utilises",
+        "modèle utilises",
+        "quel backend",
+        "quelle route",
+        "qui es tu",
+        "tu es qui",
+    )
+    return any(hint in norm for hint in hints)
+
+
+def _looks_like_local_status_query(text: str) -> bool:
+    norm = _normalize_text(text)
+    if not norm:
+        return False
+    status_hints = ("statut", "status", "etat", "etat rapide")
+    scope_hints = ("didier", "systeme", "système", "runtime", "backend")
+    if not any(hint in norm for hint in status_hints):
+        return False
+    return any(hint in norm for hint in scope_hints)
+
+
 def _extract_agent_reply(result: dict[str, Any] | None) -> str:
     if not isinstance(result, dict):
         return ""
@@ -1408,57 +1193,6 @@ def _prepend_glance(response: str, glance_text: str) -> str:
         return base
     return f"{intro} {base}".strip()
 
-
-def _prepare_tts_text(
-    text: str,
-    orchestrator: Any,
-    *,
-    qos: dict[str, Any] | None = None,
-) -> str:
-    spoken = str(text or "").strip()
-    if not spoken:
-        return ""
-    spoken = re.sub(r"https?://\S+", "", spoken, flags=re.IGNORECASE)
-    spoken = re.sub(r"\bsource\s*:\s*[^.]+\.?", "", spoken, flags=re.IGNORECASE)
-    spoken = re.sub(r"\s+", " ", spoken).strip()
-    try:
-        max_sentences = int(orchestrator.config.get("tts.response_max_sentences", 2))
-    except Exception:
-        max_sentences = 2
-    try:
-        max_chars = int(orchestrator.config.get("tts.response_max_chars", 180))
-    except Exception:
-        max_chars = 180
-    max_sentences = max(1, min(max_sentences, 3))
-    max_chars = max(40, min(max_chars, 320))
-    qos_data = qos if isinstance(qos, dict) else {}
-    mode = str(qos_data.get("mode", "NOMINAL")).upper()
-    llm_profile = str(qos_data.get("llm_profile", "full")).lower()
-    try:
-        queue_size = int(qos_data.get("audio_queue_size", 0) or 0)
-    except Exception:
-        queue_size = 0
-    speaking = bool(qos_data.get("audio_speaking", False))
-    if mode == "SURVIE" or llm_profile == "compact":
-        max_sentences = 1
-        max_chars = min(max_chars, 95)
-    elif mode == "TENDU":
-        max_sentences = min(max_sentences, 2)
-        max_chars = min(max_chars, 130)
-    if queue_size > 0 or speaking:
-        max_sentences = 1
-        max_chars = min(max_chars, 105)
-    chunks = [part.strip() for part in re.split(r"(?<=[.!?])\s+", spoken) if part.strip()]
-    if chunks:
-        spoken = " ".join(chunks[:max_sentences]).strip()
-    if len(spoken) > max_chars:
-        clipped = spoken[:max_chars].rstrip()
-        if " " in clipped:
-            clipped = clipped.rsplit(" ", 1)[0]
-        spoken = clipped.rstrip(" ,;:") + "."
-    return spoken
-
-
 async def _queue_audio_worker_speak(
     text: str,
     timeout_s: float = 1.0,
@@ -1498,35 +1232,59 @@ async def _deliver_dual_response(
     *,
     orchestrator: Any,
     api_module: Any,
+    is_voice_request: bool = False,
 ) -> dict[str, Any]:
     text = str(response_text or "").strip()
+    response_metrics = text_stats(text)
     delivery: dict[str, Any] = {
         "audio": False,
         "audio_status": "written_only",
         "audio_note": "Audio indisponible: reponse ecrite uniquement.",
+        "diagnostics": {
+            "response": response_metrics,
+            "tts": {"chars": 0, "words": 0, "sentences": 0},
+            "audio_queue_ms": 0,
+        },
     }
     if not text:
         return delivery
     qos = _runtime_qos_snapshot()
     tts_text = _prepare_tts_text(text, orchestrator, qos=qos)
+    tts_metrics = text_stats(tts_text)
+    diagnostics = delivery.get("diagnostics", {})
+    if isinstance(diagnostics, dict):
+        diagnostics["tts"] = tts_metrics
     if not tts_text:
         return delivery
     mode = str(qos.get("mode", "NOMINAL")).upper()
     queue_size = int(qos.get("audio_queue_size", 0) or 0)
     speaking = bool(qos.get("audio_speaking", False))
     audio_busy = speaking or queue_size > 0
+    if not bool(is_voice_request) and audio_busy:
+        return {
+            "audio": False,
+            "audio_status": "skipped_busy",
+            "audio_detail": "audio_busy_non_voice",
+            "audio_note": "Audio saute: sortie texte priorisee pendant la lecture.",
+            "diagnostics": delivery.get("diagnostics"),
+        }
     interrupt_current = bool(audio_busy and mode in {"TENDU", "SURVIE"})
-    queue_timeout_s = 0.6
+    queue_timeout_s = 1.2
     if mode == "SURVIE":
-        queue_timeout_s = 0.45
+        queue_timeout_s = 0.9
     elif mode == "TENDU":
-        queue_timeout_s = 0.5
+        queue_timeout_s = 1.0
+    queue_started = time.perf_counter()
     queued, queue_detail = await _queue_audio_worker_speak(
         tts_text,
         timeout_s=queue_timeout_s,
         drop_pending=True,
         interrupt_current=interrupt_current,
     )
+    queue_elapsed_ms = int(max(0.0, (time.perf_counter() - queue_started) * 1000))
+    diagnostics = delivery.get("diagnostics", {})
+    if isinstance(diagnostics, dict):
+        diagnostics["audio_queue_ms"] = queue_elapsed_ms
     if queued:
         return {
             "audio": True,
@@ -1534,13 +1292,21 @@ async def _deliver_dual_response(
             "audio_detail": "audio_worker",
             "audio_interrupt": bool(interrupt_current),
             "audio_note": "",
+            "diagnostics": delivery.get("diagnostics"),
         }
     return {
         "audio": False,
         "audio_status": "queue_failed",
         "audio_detail": queue_detail,
         "audio_note": "Audio non disponible pour cette reponse.",
+        "diagnostics": delivery.get("diagnostics"),
     }
+
+
+def _stamp_server_elapsed(result: dict[str, Any], started_at: float) -> dict[str, Any]:
+    payload = dict(result or {})
+    payload["server_elapsed_ms"] = int(max(0.0, (time.perf_counter() - started_at) * 1000))
+    return payload
 
 
 async def _generate_conversation_response(
@@ -1554,280 +1320,37 @@ async def _generate_conversation_response(
     orchestrator: Any,
     api_module: Any,
 ) -> dict[str, Any]:
-    qos = _runtime_qos_snapshot()
-    mode = str(qos.get("mode", "NOMINAL")).upper()
-    llm_profile = str(qos.get("llm_profile", "full")).lower()
-    compact_mode = mode == "SURVIE" or llm_profile == "compact"
-    ask_profile_model = orchestrator.config.get(
-        "ollama.model_profiles.ask",
-        orchestrator.config.get("ollama.ask_model", None),
+    deps = ConversationGenerationDeps(
+        runtime_qos_snapshot=_runtime_qos_snapshot,
+        flag_enabled=_flag_enabled,
+        try_gemini_boost_chat=_try_gemini_boost_chat,
+        try_pixel_openai_chat=_try_pixel_openai_chat,
+        resolve_ollama_base_for_backend=_resolve_ollama_base_for_backend,
+        list_ollama_models=_list_ollama_models,
+        pick_model=_pick_model,
+        finalize_model_response=_finalize_model_response,
+        is_listening_only_response=_is_listening_only_response,
+        llm_http_timeout=_llm_http_timeout,
+        http_error_brief=_http_error_brief,
+        resolve_gemini_boost_config=resolve_gemini_boost_config,
     )
-    default_model = orchestrator.config.get("ollama.model", None)
-    ask_num_predict = int(
-        orchestrator.config.get(
-            "ollama.ask_num_predict",
-            orchestrator.config.get("ollama.num_predict", 96),
-        )
-    )
-    if ask_num_predict <= 0:
-        ask_num_predict = 96
-    ask_num_predict = max(48, min(ask_num_predict, 256))
-    if compact_mode:
-        ask_num_predict = min(ask_num_predict, 72)
-    elif mode == "TENDU":
-        ask_num_predict = min(ask_num_predict, 120)
-    execution_backend = str(backend_choice.get("execution_backend", "")).strip()
-    preferred_backend = str(backend_choice.get("preferred_backend", "")).strip()
-    boost_requested = _flag_enabled((payload or {}).get("boost", False))
-    gemini_cfg = _resolve_gemini_boost_config(orchestrator)
-    if boost_requested:
-        backend_choice["boost_requested"] = True
-        if mode == "SURVIE":
-            backend_choice["boost_active"] = False
-            backend_choice["boost_error"] = "survie_mode"
-            backend_choice["fallback_active"] = True
-            backend_choice["fallback_reason"] = "gemini_boost_skipped_survie_mode"
-        else:
-            gemini_timeout_s = min(
-                float(gemini_cfg.get("timeout_s", 3.2) or 3.2),
-                3.4 if mode == "NOMINAL" else 2.8,
-            )
-            gemini_max_tokens = int(gemini_cfg.get("max_tokens", 220) or 220)
-            gemini_text, gemini_error = await _try_gemini_boost_chat(
-                orchestrator=orchestrator,
-                prompt=clean_prompt,
-                system_prompt=expert_system,
-                max_tokens=max(64, min(gemini_max_tokens, 320)),
-                timeout_s=gemini_timeout_s,
-            )
-            if gemini_text:
-                response = _finalize_model_response(str(gemini_text).strip())
-                if not response:
-                    response = "Je t'ecoute."
-                if _is_listening_only_response(response):
-                    response = "Salut. Dis-moi l'action precise que tu veux lancer."
-                backend_choice["execution_backend"] = "gemini_boost"
-                backend_choice["boost_active"] = True
-                backend_choice["fallback_active"] = False
-                backend_choice["boost_error"] = ""
-                api_module.update_status(
-                    thinking=False,
-                    state="IDLE",
-                    last_response=response,
-                    last_response_at=api_module.time.time(),
-                )
-                return {
-                    "response": response,
-                    "model": str(gemini_cfg.get("model", "")).strip() or "gemini",
-                    "task": False,
-                    "route": "gemini_boost",
-                    "task_type": task_type,
-                    "routing": backend_choice,
-                }
-            backend_choice["boost_active"] = False
-            backend_choice["boost_error"] = gemini_error or "unknown"
-            backend_choice["fallback_active"] = True
-            backend_choice["fallback_reason"] = f"gemini_boost_failed:{gemini_error or 'unknown'}"
-    should_try_pixel_openai = execution_backend == "pixel_ollama" or preferred_backend == "pixel_tpu"
-    if mode == "TENDU" and should_try_pixel_openai:
-        backend_choice["execution_backend"] = "local_ollama"
-        backend_choice["fallback_active"] = True
-        backend_choice["fallback_reason"] = "arbitration_tendu_local_only"
-        should_try_pixel_openai = False
-    if compact_mode and should_try_pixel_openai:
-        backend_choice["execution_backend"] = "local_ollama"
-        backend_choice["fallback_active"] = True
-        backend_choice["fallback_reason"] = "arbitration_compact_mode"
-        should_try_pixel_openai = False
-    backend_choice["arbitration_mode"] = mode
-    backend_choice["llm_profile"] = llm_profile
-    if should_try_pixel_openai:
-        pixel_timeout_s = _resolve_generate_timeout_s(orchestrator, backend_choice)
-        if compact_mode:
-            pixel_timeout_s = min(pixel_timeout_s, 2.4)
-        elif mode == "TENDU":
-            pixel_timeout_s = min(pixel_timeout_s, 3.0)
-        else:
-            pixel_timeout_s = min(pixel_timeout_s, 3.4)
-        pixel_max_tokens = int(
-            orchestrator.config.get("routing.pixel_openai.max_tokens", 128)
-        )
-        pixel_text, pixel_error = await _try_pixel_openai_chat(
-            orchestrator=orchestrator,
-            prompt=clean_prompt,
-            system_prompt=expert_system,
-            max_tokens=max(64, min(pixel_max_tokens, 220)),
-            timeout_s=pixel_timeout_s,
-        )
-        if pixel_text:
-            response = _finalize_model_response(str(pixel_text).strip())
-            if _is_listening_only_response(response):
-                response = "Salut. Dis-moi l'action precise que tu veux lancer."
-            backend_choice["execution_backend"] = "pixel_openai"
-            api_module.update_status(
-                thinking=False,
-                state="IDLE",
-                last_response=response,
-                last_response_at=api_module.time.time(),
-            )
-            return {
-                "response": response,
-                "model": str(orchestrator.config.get("picobot.llm_model", "")).strip() or "pixel_openai",
-                "task": False,
-                "route": "pixel_openai",
-                "task_type": task_type,
-                "routing": backend_choice,
-            }
-        backend_choice["execution_backend"] = "local_ollama"
-        backend_choice["fallback_active"] = True
-        backend_choice["fallback_reason"] = f"pixel_openai_failed:{pixel_error or 'unknown'}"
-
-    base_url, backend_choice, preloaded_models = await _resolve_ollama_base_for_backend(
-        orchestrator=orchestrator,
-        backend_choice=backend_choice,
-        payload=payload,
-    )
-    skip_model_discovery = compact_mode or mode == "TENDU"
-    if preloaded_models:
-        available_models = preloaded_models
-    elif skip_model_discovery:
-        available_models = []
-    else:
-        available_models = await _list_ollama_models(base_url)
-    resolved_model = _pick_model(
-        available_models,
-        [
-            expert_model,
-            str(backend_choice.get("recommended_model", "")).strip(),
-            ask_profile_model,
-            default_model,
-        ],
-    )
-    if not resolved_model:
-        raise HTTPException(status_code=503, detail="Ollama unavailable: no model configured")
-
-    if compact_mode:
-        full_prompt = f"Reponds en francais en une phrase courte et concrete.\n{clean_prompt}"
-    else:
-        full_prompt = f"Reponds en francais, brievement.\n{clean_prompt}"
-    if expert_system:
-        prompt_prefix = (
-            "Reponds en francais en une phrase courte et concrete."
-            if compact_mode
-            else "Reponds en francais, brievement."
-        )
-        full_prompt = f"{prompt_prefix}\n{str(expert_system).strip()}\n\n{clean_prompt}"
-    payload_data: dict[str, Any] = {
-        "model": resolved_model,
-        "prompt": full_prompt,
-        "stream": False,
-        "options": {
-            "num_predict": ask_num_predict,
-            "temperature": float(orchestrator.config.get("ollama.temperature", 0.4)),
-        },
-    }
-    keep_alive = orchestrator.config.get("ollama.keep_alive", None)
-    if keep_alive:
-        payload_data["keep_alive"] = keep_alive
-
-    timeout_s = _resolve_generate_timeout_s(orchestrator, backend_choice)
-    fallback_timeout_s = _resolve_local_fallback_timeout_s(orchestrator, timeout_s)
-    if compact_mode:
-        timeout_s = min(timeout_s, 3.2)
-        fallback_timeout_s = min(fallback_timeout_s, 1.6)
-    elif mode == "TENDU":
-        timeout_s = min(timeout_s, 2.6)
-        fallback_timeout_s = min(fallback_timeout_s, 1.4)
-    else:
-        timeout_s = min(timeout_s, 4.2)
-        fallback_timeout_s = min(fallback_timeout_s, 2.2)
-    url = f"{base_url}/api/generate"
     try:
-        api_module.update_status(
-            thinking=True,
-            state="THINKING",
-            last_prompt=clean_prompt,
-            last_prompt_at=api_module.time.time(),
+        return await generate_conversation_response_service(
+            clean_prompt=clean_prompt,
+            task_type=task_type,
+            expert_model=expert_model,
+            expert_system=expert_system,
+            backend_choice=backend_choice,
+            payload=payload,
+            orchestrator=orchestrator,
+            api_module=api_module,
+            ollama_config=_ollama_cfg(orchestrator),
+            picobot_config=_picobot_cfg(orchestrator),
+            routing_config=_routing_cfg(orchestrator),
+            deps=deps,
         )
-        async with httpx.AsyncClient(timeout=_llm_http_timeout(timeout_s)) as client:
-            ollama_response = await client.post(url, json=payload_data)
-            ollama_response.raise_for_status()
-            data = ollama_response.json()
-        response = _finalize_model_response(str(data.get("response", "")).strip())
-        if not response:
-            response = "Je t'ecoute."
-        if _is_listening_only_response(response):
-            response = "Salut. Dis-moi l'action precise que tu veux lancer."
-        api_module.update_status(
-            thinking=False,
-            state="IDLE",
-            last_response=response,
-            last_response_at=api_module.time.time(),
-        )
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        # Safety fallback: if Pixel Ollama is slow/unreachable, retry once on local Pi.
-        local_base_url = str(orchestrator.config.get("ollama.base_url", "http://localhost:11434")).strip().rstrip("/")
-        can_retry_local = (
-            str(backend_choice.get("execution_backend", "")).strip() == "pixel_ollama"
-            and base_url != local_base_url
-        )
-        if can_retry_local:
-            fallback_url = f"{local_base_url}/api/generate"
-            try:
-                async with httpx.AsyncClient(timeout=_llm_http_timeout(fallback_timeout_s)) as client:
-                    fallback_response = await client.post(fallback_url, json=payload_data)
-                    fallback_response.raise_for_status()
-                    fallback_data = fallback_response.json()
-                response = _finalize_model_response(str(fallback_data.get("response", "")).strip())
-                if not response:
-                    response = "Je t'ecoute."
-                if _is_listening_only_response(response):
-                    response = "Salut. Dis-moi l'action precise que tu veux lancer."
-                backend_choice["execution_backend"] = "local_ollama"
-                backend_choice["fallback_active"] = True
-                backend_choice["fallback_reason"] = f"pixel_generate_failed:{_http_error_brief(exc)}"
-                api_module.update_status(
-                    thinking=False,
-                    state="IDLE",
-                    last_response=response,
-                    last_response_at=api_module.time.time(),
-                )
-                return {
-                    "response": response,
-                    "model": resolved_model,
-                    "task": False,
-                    "route": "ollama",
-                    "task_type": task_type,
-                    "routing": backend_choice,
-                }
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                pass
-        backend_choice["fallback_active"] = True
-        backend_choice["fallback_reason"] = (
-            backend_choice.get("fallback_reason")
-            or f"ollama_generate_failed:{_http_error_brief(exc)}"
-        )
-        api_module.update_status(thinking=False, state="IDLE", error=f"{_http_error_brief(exc)}")
-        return {
-            "response": "Je suis encore en charge. Reessaie dans quelques secondes.",
-            "model": resolved_model,
-            "task": False,
-            "route": "stub",
-            "task_type": task_type,
-            "routing": backend_choice,
-        }
-    return {
-        "response": response,
-        "model": resolved_model,
-        "task": False,
-        "route": "ollama",
-        "task_type": task_type,
-        "routing": backend_choice,
-    }
+    except ConversationServiceError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
 
 
 async def process_input(
@@ -1841,8 +1364,6 @@ async def process_input(
 ) -> dict[str, Any]:
     from core import runtime_bridge as runtime_api
 
-    _ = image_bytes  # Reserved for the vision-aware path (step 2).
-    payload = payload or {}
     api_module = api_module or runtime_api
     orchestrator = orchestrator or api_module._require_orchestrator()
 
@@ -1850,68 +1371,29 @@ async def process_input(
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt required")
 
-    clean_prompt, expert_model, expert_system, _expert = api_module._resolve_expert_prompt(
-        prompt, orchestrator.config
+    deps = ProcessInputDeps(
+        resolve_expert_prompt=api_module._resolve_expert_prompt,
+        vision_see_user=_vision_see_user,
+        vision_glance_text=_vision_glance_text,
+        looks_like_web_query=_looks_like_web_query,
+        looks_like_task_request=_looks_like_task_request,
+        infer_task_type=_infer_task_type,
+        choose_backend=choose_backend,
+        relay_picobot_react=_relay_picobot_react,
+        extract_agent_reply=_extract_agent_reply,
+        build_task_apology=_build_task_apology,
+        prepend_glance=_prepend_glance,
+        generate_conversation_response=_generate_conversation_response,
     )
-    vision_glance_payload: dict[str, Any] | None = None
-    if bool(payload.get("vision_glance", True)):
-        vision_timeout_s = float(payload.get("vision_timeout_s", 0.8))
-        vision_glance_payload = await _vision_see_user(vision_timeout_s)
-    glance_text = _vision_glance_text(vision_glance_payload)
-
-    force_task = bool(payload.get("force_task", False))
-    web_query = bool(payload.get("web_query", False)) or _looks_like_web_query(clean_prompt)
-    is_task = force_task or web_query or _looks_like_task_request(clean_prompt, is_voice=is_voice)
-    task_type = _infer_task_type(clean_prompt, payload, is_task=is_task)
-    backend_choice = choose_backend(clean_prompt, task_type, payload)
-
-    if is_task:
-        react_payload = dict(payload)
-        react_payload["react_filter"] = True
-        react_payload["task_type"] = task_type
-        react_payload["web_query"] = bool(web_query)
-        react_result = await _relay_picobot_react(
-            payload=react_payload,
-            prompt=clean_prompt,
-            orchestrator=orchestrator,
-            api_module=api_module,
-        )
-        react_text = _extract_agent_reply(react_result)
-        if not react_text and isinstance(react_result, dict) and react_result.get("ok", False):
-            react_text = "Tache Picobot en cours."
-        if not react_text:
-            error_msg = (
-                str((react_result or {}).get("error", "")).strip()
-                if isinstance(react_result, dict)
-                else ""
-            )
-            react_text = _build_task_apology(error_msg)
-        react_text = _prepend_glance(react_text, glance_text)
-        return {
-            "response": react_text,
-            "task": True,
-            "route": "picobot",
-            "task_type": task_type,
-            "routing": backend_choice,
-            "react": react_result,
-            "vision": vision_glance_payload,
-            "source": "process_input",
-        }
-
-    result = await _generate_conversation_response(
-        clean_prompt=clean_prompt,
-        task_type=task_type,
-        expert_model=expert_model,
-        expert_system=expert_system,
-        backend_choice=backend_choice,
+    return await process_input_service(
+        prompt=prompt,
+        is_voice=is_voice,
+        image_bytes=image_bytes,
         payload=payload,
         orchestrator=orchestrator,
         api_module=api_module,
+        deps=deps,
     )
-    result["response"] = _prepend_glance(str(result.get("response", "")), glance_text)
-    result["vision"] = vision_glance_payload
-    result["source"] = "process_input"
-    return result
 
 
 @router.post("/speak")
@@ -2063,8 +1545,8 @@ async def agent_route(payload: dict[str, Any]) -> dict[str, Any]:
     task_type = str(payload.get("task_type", "chat")).strip() or "chat"
     timeout_s = _http_timeout(float(payload.get("timeout_s", DEFAULT_HTTP_TIMEOUT_S)))
     orchestrator = api_module._require_orchestrator()
-    result = await _route_from_picobot(
-        orchestrator,
+    result = await route_from_picobot(
+        picobot_config=_picobot_cfg(orchestrator),
         prompt=prompt,
         task_type=task_type,
         payload=payload,
@@ -2089,7 +1571,10 @@ async def agent_metrics(timeout_s: float = DEFAULT_HTTP_TIMEOUT_S) -> dict[str, 
 
     timeout_s = _http_timeout(timeout_s)
     orchestrator = api_module._require_orchestrator()
-    result = await _metrics_from_picobot(orchestrator, timeout_s)
+    result = await metrics_from_picobot(
+        picobot_config=_picobot_cfg(orchestrator),
+        timeout_s=timeout_s,
+    )
     if result.get("ok", False):
         return result
     return {
@@ -2106,7 +1591,10 @@ async def agent_tasks(timeout_s: float = DEFAULT_HTTP_TIMEOUT_S) -> dict[str, An
 
     timeout_s = _http_timeout(timeout_s)
     orchestrator = api_module._require_orchestrator()
-    result = await _tasks_from_picobot(orchestrator, timeout_s)
+    result = await tasks_from_picobot(
+        picobot_config=_picobot_cfg(orchestrator),
+        timeout_s=timeout_s,
+    )
     if result.get("ok", False):
         return result
     return {
@@ -2123,8 +1611,8 @@ async def agent_memory(include_content: bool = False) -> dict[str, Any]:
     from core import runtime_bridge as api_module
 
     orchestrator = api_module._require_orchestrator()
-    result = await _memory_from_picobot(
-        orchestrator,
+    result = await memory_from_picobot(
+        picobot_config=_picobot_cfg(orchestrator),
         include_content=bool(include_content),
         timeout_s=DEFAULT_HTTP_TIMEOUT_S,
     )
@@ -2149,8 +1637,8 @@ async def agent_memory_write(payload: dict[str, Any]) -> dict[str, Any]:
     content = str(payload.get("content", ""))
     append = bool(payload.get("append", False))
     orchestrator = api_module._require_orchestrator()
-    result = await _memory_write_picobot(
-        orchestrator,
+    result = await memory_write_picobot(
+        picobot_config=_picobot_cfg(orchestrator),
         path=path,
         content=content,
         append=append,
@@ -2164,56 +1652,29 @@ async def agent_memory_write(payload: dict[str, Any]) -> dict[str, Any]:
 @router.post("/coding")
 @circuit_breaker("ai.coding")
 async def coding(payload: dict[str, Any]) -> dict[str, Any]:
-    from core import runtime_bridge as api_module
-
     arbitrator = get_resource_arbitrator()
     if not arbitrator.request_resource("llm_generation"):
         raise HTTPException(status_code=503, detail="arbitration_denied:llm_generation")
     prompt = str(payload.get("prompt", "")).strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt required")
+    from core import runtime_bridge as api_module
+
     orchestrator = api_module._require_orchestrator()
-    base_url = orchestrator.config.get("ollama.base_url", "http://localhost:11434")
-    coding_profile_model = orchestrator.config.get(
-        "ollama.model_profiles.coding", None
+    deps = CodingGenerationDeps(
+        list_ollama_models=_list_ollama_models,
+        pick_model=_pick_model,
+        request_timeout=lambda: _http_timeout(120, upper=15.0),
     )
-    model = orchestrator.config.get("coding.model", orchestrator.config.get("ollama.model"))
-    available_models = await _list_ollama_models(base_url)
-    resolved_model = _pick_model(
-        available_models,
-        [model, coding_profile_model, orchestrator.config.get("ollama.model", None)],
-    )
-    if not resolved_model:
-        raise HTTPException(status_code=503, detail="Ollama unavailable: no model configured")
-    num_predict = orchestrator.config.get("coding.num_predict", 400)
-    temperature = orchestrator.config.get("coding.temperature", 0.2)
-    system_prompt = orchestrator.config.get("coding.system_prompt", "").strip()
-
-    full_prompt = prompt
-    if system_prompt:
-        full_prompt = f"{system_prompt}\n\nUser: {prompt}\nAssistant:"
-
-    payload_data = {
-        "model": resolved_model,
-        "prompt": full_prompt,
-        "stream": False,
-        "options": {
-            "num_predict": num_predict,
-            "temperature": temperature,
-        },
-    }
-    keep_alive = orchestrator.config.get("ollama.keep_alive", None)
-    if keep_alive:
-        payload_data["keep_alive"] = keep_alive
-    url = f"{base_url}/api/generate"
     try:
-        async with httpx.AsyncClient(timeout=_http_timeout(120, upper=15.0)) as client:
-            response = await client.post(url, json=payload_data)
-            response.raise_for_status()
-            data = response.json()
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Ollama unavailable: {exc}")
-    return {"response": str(data.get("response", "")).strip()}
+        return await generate_coding_response(
+            prompt=prompt,
+            ollama_config=_ollama_cfg(orchestrator),
+            coding_config=_coding_cfg(orchestrator),
+            deps=deps,
+        )
+    except CodingServiceError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
 
 
 @router.get("/ollama/models")
@@ -2239,7 +1700,7 @@ async def ollama_models() -> dict[str, Any]:
             return dict(_OLLAMA_MODELS_CACHE)
 
         orchestrator = api_module._require_orchestrator()
-        base_url = orchestrator.config.get("ollama.base_url", "http://localhost:11434")
+        base_url = str(_ollama_cfg(orchestrator).base_url).strip().rstrip("/")
         url = f"{base_url}/api/tags"
         try:
             async with httpx.AsyncClient(timeout=_http_timeout(10, upper=10.0)) as client:
@@ -2470,209 +1931,37 @@ async def asr_wake_test(payload: dict[str, Any] | None = None) -> dict[str, Any]
 async def ask_and_speak(payload: dict[str, Any]) -> dict[str, Any]:
     from core import runtime_bridge as api_module
 
+    request_started_at = time.perf_counter()
     prompt = str(payload.get("prompt", "")).strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt required")
     arbitrator = get_resource_arbitrator()
     orchestrator = api_module._require_orchestrator()
-    music = orchestrator.get_tentacle("music")
-    is_web_request = _looks_like_web_query(prompt)
-    is_task_request = (
-        bool(payload.get("force_task", False))
-        or _looks_like_task_request(
-            prompt,
-            is_voice=True,
-        )
-        or is_web_request
+    deps = AskAndSpeakDeps(
+        looks_like_web_query=_looks_like_web_query,
+        looks_like_task_request=_looks_like_task_request,
+        process_input=process_input,
+        prepare_chat_text=_prepare_chat_text,
+        runtime_qos_snapshot=_runtime_qos_snapshot,
+        resolve_expert_prompt=api_module._resolve_expert_prompt,
+        infer_task_type=_infer_task_type,
+        choose_backend=choose_backend,
+        normalize_text=_normalize_text,
+        looks_like_identity_query=_looks_like_identity_query,
+        looks_like_local_status_query=_looks_like_local_status_query,
+        deliver_dual_response=_deliver_dual_response,
+        parse_switch_action=_parse_switch_action,
+        resolve_actuator_target=_resolve_actuator_target,
+        is_music_prompt=api_module._is_music_prompt,
+        generate_conversation_response=_generate_conversation_response,
     )
-    routed_payload = dict(payload)
-    if is_task_request:
-        min_timeout_s = 6.5 if is_web_request else 5.8
-        try:
-            current_timeout_s = float(routed_payload.get("react_timeout_s", 0.0) or 0.0)
-        except Exception:
-            current_timeout_s = 0.0
-        routed_payload["react_timeout_s"] = max(current_timeout_s, min_timeout_s)
-    if is_web_request:
-        routed_payload["web_query"] = True
-    if is_task_request:
-        routed = await process_input(
-            prompt,
-            is_voice=True,
-            payload=routed_payload,
-            orchestrator=orchestrator,
-            api_module=api_module,
-        )
-        routed_response = str(routed.get("response", "")).strip()
-        routed.update(
-            await _deliver_dual_response(
-                routed_response,
-                orchestrator=orchestrator,
-                api_module=api_module,
-            )
-        )
-        return routed
-
-    task_type = _infer_task_type(prompt, payload, is_task=False)
-    if not arbitrator.request_resource("llm_generation"):
-        response = "Je suis en surcharge temporaire. Reessaie dans quelques secondes."
-        result = {"response": response, "task_type": task_type}
-        result.update(
-            await _deliver_dual_response(
-                response,
-                orchestrator=orchestrator,
-                api_module=api_module,
-            )
-        )
-        result["routing"] = {
-            "task_type": task_type,
-            "route_hint": "arbitration_guard",
-            "execution_backend": "none",
-            "fallback_active": True,
-            "fallback_reason": "arbitration_denied:llm_generation",
-        }
-        return result
-
-    clean_prompt, expert_model, expert_system, _expert = api_module._resolve_expert_prompt(
-        prompt,
-        orchestrator.config
+    result = await handle_ask_and_speak(
+        prompt=prompt,
+        payload=payload,
+        orchestrator=orchestrator,
+        api_module=api_module,
+        arbitrator=arbitrator,
+        ollama_config=_ollama_cfg(orchestrator),
+        deps=deps,
     )
-    task_type = _infer_task_type(clean_prompt, payload, is_task=False)
-    backend_choice = choose_backend(clean_prompt, task_type, payload)
-    react_result = None
-    prompt_norm = _normalize_text(clean_prompt)
-    if any(
-        key in prompt_norm
-        for key in ("parle moi en francais", "reponds en francais", "en francais")
-    ):
-        response = "D'accord, je te reponds en francais."
-        result = {"response": response}
-        result.update(
-            await _deliver_dual_response(
-                response,
-                orchestrator=orchestrator,
-                api_module=api_module,
-            )
-        )
-        if react_result is not None:
-            result["react"] = react_result
-        result["task_type"] = task_type
-        result["routing"] = backend_choice
-        return result
-
-    actuators = orchestrator.get_tentacle("actuators")
-    action = _parse_switch_action(prompt_norm)
-    if actuators and action:
-        try:
-            devices = list(actuators.list_devices())
-        except Exception:
-            devices = []
-        target = _resolve_actuator_target(prompt_norm, devices)
-        if target:
-            actuator_id, actuator_name = target
-            try:
-                result = await api_module.asyncio.to_thread(
-                    actuators.command, actuator_id, action, {}
-                )
-            except Exception as exc:
-                result = {"ok": False, "error": str(exc)}
-            ok = bool(result.get("ok", False))
-            if ok:
-                verb = "allumee" if action == "on" else "eteinte"
-                response = f"{actuator_name} {verb}."
-            else:
-                response = (
-                    f"Action impossible sur {actuator_name}: "
-                    f"{result.get('error', 'erreur inconnue')}"
-                )
-            result = {
-                "response": response,
-                "actuator": {"id": actuator_id, "name": actuator_name, "action": action, "ok": ok},
-            }
-            result.update(
-                await _deliver_dual_response(
-                    response,
-                    orchestrator=orchestrator,
-                    api_module=api_module,
-                )
-            )
-            if react_result is not None:
-                result["react"] = react_result
-            result["task_type"] = task_type
-            result["routing"] = backend_choice
-            return result
-
-    if music and api_module._is_music_prompt(prompt):
-        await music.play(prompt)
-        response = "Musique lancée."
-        result = {"response": response, "music": True}
-        result.update(
-            await _deliver_dual_response(
-                response,
-                orchestrator=orchestrator,
-                api_module=api_module,
-            )
-        )
-        if react_result is not None:
-            result["react"] = react_result
-        result["task_type"] = task_type
-        result["routing"] = backend_choice
-        return result
-    qos = _runtime_qos_snapshot()
-    mode = str(qos.get("mode", "NOMINAL")).upper()
-    llm_budget_s = 4.0
-    if mode == "SURVIE":
-        llm_budget_s = 3.2
-    elif mode == "TENDU":
-        llm_budget_s = 3.2
-    try:
-        generated = await asyncio.wait_for(
-            _generate_conversation_response(
-                clean_prompt=clean_prompt,
-                task_type=task_type,
-                expert_model=expert_model,
-                expert_system=expert_system,
-                backend_choice=backend_choice,
-                payload=payload,
-                orchestrator=orchestrator,
-                api_module=api_module,
-            ),
-            timeout=llm_budget_s,
-        )
-    except asyncio.TimeoutError:
-        response = "Je suis en charge. Reessaie dans quelques secondes."
-        result = {"response": response, "route": "stub"}
-        result.update(
-            await _deliver_dual_response(
-                response,
-                orchestrator=orchestrator,
-                api_module=api_module,
-            )
-        )
-        result["task_type"] = task_type
-        backend_choice["fallback_active"] = True
-        backend_choice["fallback_reason"] = f"ask_and_speak_budget_timeout:{llm_budget_s:.1f}s"
-        backend_choice["arbitration_mode"] = mode
-        result["routing"] = backend_choice
-        return result
-    response = str(generated.get("response", "")).strip() or "Je suis encore en charge. Reessaie dans quelques secondes."
-    backend_choice = generated.get("routing", backend_choice)
-    route = str(generated.get("route", "")).strip()
-    model = str(generated.get("model", "")).strip()
-    result = {"response": response}
-    result.update(
-        await _deliver_dual_response(
-            response,
-            orchestrator=orchestrator,
-            api_module=api_module,
-        )
-    )
-    if react_result is not None:
-        result["react"] = react_result
-    result["task_type"] = task_type
-    result["routing"] = backend_choice
-    if route:
-        result["route"] = route
-    if model:
-        result["model"] = model
-    return result
+    return _stamp_server_elapsed(result, request_started_at)

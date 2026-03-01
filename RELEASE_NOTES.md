@@ -70,3 +70,6 @@
 ## didier-v4r26-disable-gemini-boost-temp-2026-02-25 - 2026-02-25 21:48:52 UTC
 - Disabled picobot.gemini boost path by default to avoid quota errors; fallback remains transparent via existing routes.
 
+## didier-v4r27-checkpoint-rationalization-yolo26-prehef-2026-03-01 - 2026-03-01 01:59:03 UTC
+- Checkpoint: architecture rationalization, E2E chat green on 5010, YOLO26 artifacts generated to ONNX and ready for external HEF build.
+

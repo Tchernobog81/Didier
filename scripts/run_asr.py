@@ -567,22 +567,85 @@ async def _process_loop() -> None:
 
 async def _publish_shared_state_loop() -> None:
     while True:
-        capture_up = _capture_task is not None and not _capture_task.done()
-        process_up = _process_task is not None and not _process_task.done()
-        healthy = bool(asr_state["ready"] and capture_up and process_up)
-        payload = {
-            "status": "ok" if healthy else "degraded",
-            "service": "didier-asr",
-            "uptime_s": round(time.time() - APP_STARTED_AT, 3),
-            "detail": "ready" if healthy else str(asr_state.get("detail") or asr_state.get("last_error") or "not_ready"),
-            "queue_size": int(asr_state["queue_size"]),
-            "idle_chunk_count": int(asr_state["idle_chunk_count"]),
-            "armed": bool(asr_state["armed"]),
-            "capture_failures": int(asr_state["capture_failures"]),
-            "last_asr_ms": float(asr_state["last_asr_ms"]),
-        }
+        await _ensure_runtime_tasks()
+        payload = _asr_health_payload()
+        payload.update(
+            {
+                "queue_size": int(asr_state["queue_size"]),
+                "idle_chunk_count": int(asr_state["idle_chunk_count"]),
+                "armed": bool(asr_state["armed"]),
+                "capture_failures": int(asr_state["capture_failures"]),
+                "last_asr_ms": float(asr_state["last_asr_ms"]),
+            }
+        )
         await asyncio.to_thread(update_worker_metrics, "asr", payload)
         await asyncio.sleep(ASR_SHARED_STATE_INTERVAL_S)
+
+
+def _task_health_detail(name: str, task: asyncio.Task[Any] | None) -> str:
+    if task is None:
+        return f"{name}_missing"
+    if not task.done():
+        return "ready"
+    if task.cancelled():
+        return f"{name}_cancelled"
+    try:
+        exc = task.exception()
+    except Exception:
+        exc = None
+    if exc is None:
+        return f"{name}_stopped"
+    return f"{name}_failed:{exc}"
+
+
+async def _ensure_runtime_tasks() -> None:
+    global _capture_task, _process_task
+    if not asr_state["ready"] or _stop_event.is_set():
+        return
+
+    if _capture_task is None or _capture_task.done():
+        detail = _task_health_detail("capture", _capture_task)
+        logger.warning("Restarting ASR capture loop (%s)", detail)
+        asr_state["last_error"] = detail
+        _capture_task = asyncio.create_task(_capture_loop())
+
+    if _process_task is None or _process_task.done():
+        detail = _task_health_detail("process", _process_task)
+        logger.warning("Restarting ASR process loop (%s)", detail)
+        asr_state["last_error"] = detail
+        _process_task = asyncio.create_task(_process_loop())
+
+
+def _asr_health_payload() -> dict[str, Any]:
+    capture_up = _capture_task is not None and not _capture_task.done()
+    process_up = _process_task is not None and not _process_task.done()
+    healthy = bool(asr_state["ready"] and capture_up and process_up)
+
+    if healthy:
+        detail = "ready"
+    elif not asr_state["ready"]:
+        detail = str(asr_state.get("detail") or asr_state.get("last_error") or "not_ready")
+    else:
+        failures = []
+        if not capture_up:
+            failures.append(_task_health_detail("capture", _capture_task))
+        if not process_up:
+            failures.append(_task_health_detail("process", _process_task))
+        detail = ",".join(failures) or str(
+            asr_state.get("last_error") or asr_state.get("detail") or "not_ready"
+        )
+
+    return {
+        "status": "ok" if healthy else "degraded",
+        "service": "didier-asr",
+        "uptime_s": round(time.time() - APP_STARTED_AT, 3),
+        "ts": time.time(),
+        "detail": detail,
+        "queue_size": int(asr_state["queue_size"]),
+        "armed": bool(asr_state["armed"]),
+        "capture_up": bool(capture_up),
+        "process_up": bool(process_up),
+    }
 
 
 def _validate_prerequisites() -> tuple[bool, str]:
@@ -651,18 +714,7 @@ async def _shutdown() -> None:
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
-    capture_up = _capture_task is not None and not _capture_task.done()
-    process_up = _process_task is not None and not _process_task.done()
-    healthy = bool(asr_state["ready"] and capture_up and process_up)
-    return {
-        "status": "ok" if healthy else "degraded",
-        "service": "didier-asr",
-        "uptime_s": round(time.time() - APP_STARTED_AT, 3),
-        "ts": time.time(),
-        "detail": "ready" if healthy else str(asr_state.get("detail") or asr_state.get("last_error") or "not_ready"),
-        "queue_size": int(asr_state["queue_size"]),
-        "armed": bool(asr_state["armed"]),
-    }
+    return _asr_health_payload()
 
 
 @app.get("/metrics")

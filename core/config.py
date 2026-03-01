@@ -1,3 +1,4 @@
+import copy
 import json
 from pathlib import Path
 from typing import Any, Dict
@@ -5,7 +6,7 @@ from typing import Any, Dict
 
 class DidierConfig:
     def __init__(self, data: Dict[str, Any], source_path: Path) -> None:
-        self._data = data
+        self._data = copy.deepcopy(data)
         self._source_path = source_path
 
     @property
@@ -25,6 +26,17 @@ class DidierConfig:
         if value is None:
             raise KeyError(f"Missing required config key: {dotted_path}")
         return value
+
+    def to_dict(self) -> Dict[str, Any]:
+        return copy.deepcopy(self._data)
+
+    @classmethod
+    def from_mapping(
+        cls,
+        data: Dict[str, Any],
+        source_path: str | Path = "<memory>",
+    ) -> "DidierConfig":
+        return cls(data=copy.deepcopy(data), source_path=Path(source_path))
 
     @classmethod
     def load(cls, path: str | Path) -> "DidierConfig":

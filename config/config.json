@@ -8,16 +8,18 @@
   },
   "npu": {
     "device": "/dev/hailo0",
-    "pcie_address": "0001:01:00.0"
+    "pcie_address": "0001:01:00.0",
+    "required_for_vision": true
   },
   "ollama": {
     "base_url": "http://localhost:11434",
     "model": "qwen2.5:1.5b",
     "model_profiles": {
-      "ask": "deepseek-r1:1.5b",
-      "coding": "deepseek-coder:1.3b"
+      "ask": "qwen2.5:1.5b",
+      "coding": "qwen2.5-coder:1.5b"
     },
     "timeout_seconds": 120,
+    "ask_and_speak_budget_seconds": 3.0,
     "num_predict": 48,
     "temperature": 0.4,
     "autotune_enabled": true,
@@ -61,7 +63,7 @@
         "system_prompt": "Tu es créatif et amusant. Réponses courtes, ton léger."
       }
     },
-    "model_selected_at": 1771407770.378275
+    "model_selected_at": 1772209018.2841482
   },
   "picobot": {
     "enabled": true,
@@ -131,6 +133,11 @@
         "backend": "audio-worker",
         "model": "kokoro-v1.0.onnx",
         "score": "good"
+      },
+      "react_task": {
+        "model": "qwen2.5:1.5b",
+        "backend": "ollama",
+        "score": "marginal"
       }
     },
     "allowed_models": {
@@ -242,6 +249,10 @@
     "max_items": 1200,
     "max_chars": 24000
   },
+  "chat": {
+    "response_max_sentences": 2,
+    "response_max_chars": 150
+  },
   "asr": {
     "enabled": true,
     "alsa_device": "hw:2,0",
@@ -295,14 +306,16 @@
     "voices_path": "/mnt/didier_ssd/didier/models/tts/voices-v1.0.bin",
     "voice": "ff_siwis",
     "lang": "fr-fr",
-    "output_path": "data/didier_speaks.wav"
+    "output_path": "data/didier_speaks.wav",
+    "response_max_sentences": 1,
+    "response_max_chars": 110
   },
   "vision": {
     "camera_index": 0,
     "camera_device": "/dev/video0",
     "capture_backend": "opencv",
     "api_local_capture_enabled": true,
-    "primary_fallback_secondary": false,
+    "primary_fallback_secondary": true,
     "usb_id_vendor": "1415",
     "usb_id_product": "2000",
     "enable_live": true,

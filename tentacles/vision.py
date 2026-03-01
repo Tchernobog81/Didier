@@ -14,9 +14,11 @@ from typing import Any, List
 import cv2
 import numpy as np
 
+from core.config_access import npu_settings
 from tentacles.base import BaseTentacle
 from core.config import DidierConfig
 from core.hardware_gatekeeper import HardwareLease, get_hardware_gatekeeper
+from core.vision_npu_policy import vision_npu_status
 
 DEFAULT_SUBPROCESS_TIMEOUT_S = 2.0
 
@@ -51,6 +53,8 @@ class HailoDetector:
         self._score_threshold = max(0.05, min(float(score_threshold), 0.95))
         self._nms_threshold = max(0.1, min(float(nms_threshold), 0.95))
         self._max_detections = max(1, int(max_detections))
+        self._model_key = str(self._model_path.name).strip().lower()
+        self._e2e_nms_free = "yolo26" in self._model_key
         self._init_detector()
 
     def _ensure_hailo_pythonpath(self) -> None:
@@ -272,10 +276,10 @@ class HailoDetector:
                 if det is not None:
                     detections.append(det)
         if hailo_nms_handled:
-            detections = self._apply_nms(detections)
             detections.sort(key=lambda item: float(item.get("confidence", 0.0)), reverse=True)
             return detections[: self._max_detections]
-        detections = self._apply_nms(detections)
+        if not self._e2e_nms_free:
+            detections = self._apply_nms(detections)
         detections.sort(key=lambda item: float(item.get("confidence", 0.0)), reverse=True)
         return detections[: self._max_detections]
 
@@ -485,7 +489,13 @@ class HailoDetector:
 
         class_id = -1
         score = 0.0
-        if values.size > 6:
+        if self._e2e_nms_free and values.size >= 6 and self._looks_like_end_to_end_row(values):
+            score = float(values[4])
+            try:
+                class_id = int(round(float(values[5])))
+            except Exception:
+                class_id = -1
+        elif values.size > 6:
             objectness = float(values[4])
             class_scores = values[5:]
             if (
@@ -533,6 +543,20 @@ class HailoDetector:
             "bbox": bbox,
             "class_id": class_id if class_id >= 0 else None,
         }
+
+    def _looks_like_end_to_end_row(self, values: np.ndarray) -> bool:
+        if values.size < 6:
+            return False
+        try:
+            score = float(values[4])
+            class_token = float(values[5])
+        except Exception:
+            return False
+        if not np.isfinite(score) or not (0.0 <= score <= 1.0):
+            return False
+        if not np.isfinite(class_token) or class_token < 0.0:
+            return False
+        return abs(class_token - round(class_token)) <= 1e-3
 
     def _apply_nms(self, detections: List[dict]) -> List[dict]:
         if len(detections) <= 1:
@@ -779,6 +803,20 @@ class OpenCVShapeDetector:
             return []
 
 
+class DisabledDetector:
+    def __init__(self, name: str, reason: str) -> None:
+        self.name = str(name or "disabled")
+        self.ready = False
+        self.reason = str(reason or "disabled")
+
+    def detect(self, frame: Any) -> List[dict]:
+        _ = frame
+        return []
+
+    def read_npu_load(self) -> None:
+        return None
+
+
 class Tentacle(BaseTentacle):
     name = "vision"
 
@@ -786,6 +824,7 @@ class Tentacle(BaseTentacle):
         super().__init__(config, orchestrator)
         self._logger = logging.getLogger(f"Tentacle.{self.name}")
         self._camera_index = int(self.config.get("vision.camera_index", 0))
+        self._npu_required_for_vision = bool(npu_settings(self.config).required_for_vision)
         self._camera_device = self.config.get("vision.camera_device", None)
         self._capture_backend = str(self.config.get("vision.capture_backend", "auto")).lower()
         self._width = self.config.get("vision.width", None)
@@ -937,8 +976,6 @@ class Tentacle(BaseTentacle):
         if not raw:
             return Path("config/hailo_model.hef")
         candidate = Path(raw)
-        if candidate.is_absolute() and candidate.exists():
-            return candidate
 
         repo_root = Path(__file__).resolve().parents[1]
         host_root = repo_root.parent.parent
@@ -948,6 +985,9 @@ class Tentacle(BaseTentacle):
             Path("/mnt/didier_ssd/didier"),
         ]
         candidates: list[Path] = []
+        if candidate.suffix.lower() == ".hef":
+            for root in search_roots:
+                candidates.append((root / "models" / "hailo" / "yolo26n.hef").resolve())
         if candidate.is_absolute():
             candidates.append(candidate)
         else:
@@ -986,6 +1026,10 @@ class Tentacle(BaseTentacle):
                 "Hailo detector requested but unavailable (model=%s). Fallback to OpenCV shape detector.",
                 self._model_path,
             )
+            if self._npu_required_for_vision:
+                reason = "hailo_requested_but_unavailable"
+                self._logger.error("Vision requires NPU; disabling CPU fallback (%s).", reason)
+                return DisabledDetector("hailo-required", reason)
             return OpenCVShapeDetector(self._logger)
         if mode in {"opencv", "opencv_haar", "haar", "face"}:
             return OpenCVFaceDetector(self._logger)
@@ -994,6 +1038,10 @@ class Tentacle(BaseTentacle):
         detector = _hailo()
         if detector.ready:
             return detector
+        if self._npu_required_for_vision:
+            reason = "hailo_auto_unavailable"
+            self._logger.error("Vision requires NPU; disabling CPU fallback (%s).", reason)
+            return DisabledDetector("hailo-required", reason)
         return OpenCVShapeDetector(self._logger)
 
     def _load_class_labels(self) -> list[str]:
@@ -1695,6 +1743,12 @@ class Tentacle(BaseTentacle):
 
     def get_status(self) -> dict[str, Any]:
         detector_name = getattr(self._detector, "name", "unknown")
+        detector_ready = bool(getattr(self._detector, "ready", False))
+        npu_status = vision_npu_status(
+            detector_name=detector_name,
+            detector_ready=detector_ready,
+            required_for_vision=self._npu_required_for_vision,
+        )
         if self._model_name:
             model_name = self._model_name
         elif detector_name == "opencv-haar":
@@ -1706,7 +1760,11 @@ class Tentacle(BaseTentacle):
         return {
             "detector": detector_name,
             "model": model_name,
-            "ready": bool(getattr(self._detector, "ready", False)),
+            "ready": detector_ready,
+            "npu_required": npu_status["required"],
+            "npu_active": npu_status["active"],
+            "execution_target": npu_status["execution_target"],
+            "npu_reason": npu_status["reason"],
             "last_ts": self._last_ts,
             "last_frame_ts": self._last_frame_ts,
             "last_count": len(self._last_detections),

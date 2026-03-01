@@ -233,9 +233,29 @@
 
     <main class="docker-panel" id="docker-panel" data-tab-panel="docker" hidden>
       <section class="card docker-diagram">
-        <h2>Workers Edge</h2>
-        <div class="docker-meta" id="docker-meta">--</div>
-        <div class="docker-graph" id="docker-graph"></div>
+        <div class="docker-header">
+          <div>
+            <h2>Workers Edge</h2>
+            <p class="hint">Gateway, workers, flux critiques, intégrations et runtime.</p>
+          </div>
+          <div class="docker-meta" id="docker-meta">--</div>
+        </div>
+        <div class="docker-summary" id="docker-summary"></div>
+        <div class="docker-board">
+          <div class="docker-graph-wrap">
+            <div class="docker-graph" id="docker-graph"></div>
+          </div>
+          <div class="docker-side">
+            <section class="docker-stack">
+              <h3>Workers</h3>
+              <div class="docker-workers-list" id="docker-workers-list"></div>
+            </section>
+            <section class="docker-stack">
+              <h3>Flux clés</h3>
+              <div class="docker-links-list" id="docker-links-list"></div>
+            </section>
+          </div>
+        </div>
       </section>
     </main>
 

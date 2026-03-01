@@ -1,0 +1,120 @@
+{
+  "schema": "didier.technical_registry.v1",
+  "updated_at": "2026-02-28",
+  "status": "active",
+  "canonical_sources": {
+    "static_config": {
+      "path": "config/config.json",
+      "status": "canonical",
+      "notes": "Canonical instance input file; typed config modules now load and validate it."
+    },
+    "runtime_state": {
+      "path": "data/shared_state.json",
+      "status": "canonical",
+      "owner_module": "core/shared_state.py",
+      "notes": "Authoritative runtime projection for workers, arbitration, and hardware profile."
+    },
+    "technical_memory": {
+      "path": "memory/technical/",
+      "status": "canonical",
+      "notes": "Architecture, invariants, debt, and source-of-truth registry."
+    },
+    "operational_memory": {
+      "path": "memory/operations/",
+      "status": "canonical",
+      "notes": "Incidents, benchmarks, and runbook-linked operational history."
+    },
+    "conversation_memory": {
+      "path": "data/memory.json",
+      "status": "canonical_for_conversation_only",
+      "notes": "Must not be reused as technical or operational memory."
+    },
+    "boost_memory": {
+      "path": "data/gemini_boost_memory.jsonl",
+      "status": "feature_local_cache",
+      "notes": "LLM feature cache; not a system-wide memory source."
+    }
+  },
+  "transitional_documents": [
+    {
+      "path": "fondation_didier.md",
+      "status": "transitional",
+      "notes": "Runtime notebook to be decomposed into architecture and operations."
+    },
+    {
+      "path": "fondation_didier_export.md",
+      "status": "derived",
+      "notes": "Export view of the foundation document; avoid using as canonical runtime truth."
+    }
+  ],
+  "legacy_documents": [
+    {
+      "path": "ARCHITECTURE.md",
+      "status": "archive",
+      "notes": "Describes an obsolete Docker-centric topology."
+    },
+    {
+      "path": "fondation_dider.md",
+      "status": "archive",
+      "notes": "Legacy typo-named archive; do not use for active runtime decisions."
+    }
+  ],
+  "planned_followups": [
+    {
+      "area": "web/workers-edge",
+      "timing": "in progress",
+      "notes": "The backend rationalization is now reflected by an initial UI refresh of the 'Workers Edge' tab (summary, workers, and critical flows). Further polish can build on the new structure."
+    },
+    {
+      "area": "validation/final-e2e",
+      "timing": "after current optimization pass",
+      "notes": "Run a final end-to-end check covering: written question, visible thinking phase, written response, and audio response. The validation harness now lives in scripts/validate_chat_e2e.py."
+    }
+  ],
+  "recent_changes": [
+    {
+      "date": "2026-02-28",
+      "area": "asr-health",
+      "notes": "scripts/run_asr.py now centralizes health payload generation, exposes capture/process loop state, and restarts dead runtime tasks before publishing shared metrics. This prevents the false 'degraded + detail=ready' health state once the worker is restarted."
+    },
+    {
+      "date": "2026-02-28",
+      "area": "vision-yolo26-overlay",
+      "notes": "core/api_impl.py HailoDetector now prefers models/hailo/yolo26n.hef and adds a direct NMS-free decoder for YOLO26 raw outputs (structured boxes/scores/classes or flat rows) while keeping the dedicated detection thread and the >0.6 confidence filter."
+    },
+    {
+      "date": "2026-02-28",
+      "area": "vision-yolo26-active-runtime",
+      "notes": "tentacles/vision.py now treats YOLO26 as an end-to-end NMS-free model in the active Hailo runtime path. The tentacle auto-prefers models/hailo/yolo26n.hef when present, but keeps the currently working HEF when that artifact is absent so NPU vision stays available."
+    },
+    {
+      "date": "2026-02-28",
+      "area": "e2e-runtime-validation",
+      "notes": "validate_chat_e2e.py now targets the canonical local API on port 5010. After reloading didier-api and didier-asr, the final written-question -> thinking -> written-response -> audio validation passed against 127.0.0.1:5010."
+    },
+    {
+      "date": "2026-02-28",
+      "area": "audio-queue-ipc",
+      "notes": "core/routers/ai.py now uses less aggressive audio queue IPC timeouts (1.2s nominal, 1.0s TENDU, 0.9s SURVIE). This removes false queue_failed results when the audio worker is healthy on the Unix socket."
+    },
+    {
+      "date": "2026-03-01",
+      "area": "session-handoff",
+      "notes": "A restart-ready checkpoint handoff now lives in memory/technical/next-session.md, including the active runtime state, the generated YOLO26 artifacts, the missing-DFC blocker, and the first-step plan for resuming with a compiled yolo26n.hef."
+    }
+  ],
+  "hotspots": [
+    {
+      "path": "core/routers/ai.py",
+      "issue": "still a hotspot; chat/tts/ollama/picobot/routing/coding config access, backend policy, ask-and-speak orchestration, conversation orchestration, input orchestration, Picobot HTTP adapter, and brain IPC adapter are partly extracted into core/ai_config.py, core/ai_backend_policy.py, core/ai_ask_and_speak_service.py, core/ai_conversation_service.py, core/ai_process_service.py, core/ai_coding_service.py, core/picobot_client.py, and core/brain_client.py"
+    },
+    {
+      "path": "core/routers/vision.py",
+      "issue": "stream, detection, and fallback policy mixed in one layer; NPU-required inference is now enforced explicitly, route guards moved into core/vision_route_support.py, passive remote stream status moved into core/vision_remote_status_service.py, vision describe moved into core/vision_describe_service.py, primary detection cache moved into core/vision_primary_service.py, secondary detection state/cache moved into core/vision_secondary_service.py, secondary detection refresh orchestration moved into core/vision_secondary_detection_service.py, and primary/secondary stream routing policy moved into core/vision_stream_service.py, but route I/O is still broad"
+    },
+    {
+      "path": "core/routers/system.py",
+      "issue": "most major diagnostics logic is now extracted; hardware model selection validation/config mutation moved into core/system_model_selection_service.py, integrations probes/rollup/cache moved into core/system_integrations_service.py, device-status cache/hardware aggregation moved into core/system_device_status_service.py, llmfit report sampling/rollup/cache moved into core/system_llmfit_service.py, camera utility config extraction/control payload shaping moved into core/system_camera_service.py, systemctl/service-state primitives moved into core/system_service_control.py, peripheral inventory/toggle orchestration moved into core/system_peripherals_service.py, workers-edge health probing/payload shaping moved into core/system_workers_service.py, terminal command policy moved into core/system_terminal_service.py; the route is now mostly HTTP wrappers and dependency wiring, with broader diagnostics still concentrated in remaining endpoints"
+    }
+  ]
+}

@@ -122,6 +122,20 @@ class HailoDetector:
             )
         except Exception:
             self._polygon_refine_min_area = 120
+        try:
+            self._model_input_width = max(
+                32,
+                min(int(os.getenv("DIDIER_HAILO_INPUT_WIDTH", "640")), 4096),
+            )
+        except Exception:
+            self._model_input_width = 640
+        try:
+            self._model_input_height = max(
+                32,
+                min(int(os.getenv("DIDIER_HAILO_INPUT_HEIGHT", "640")), 4096),
+            )
+        except Exception:
+            self._model_input_height = 640
         self._init_backend()
 
     @property
@@ -147,6 +161,8 @@ class HailoDetector:
             candidates.append(Path(model_path))
         candidates.extend(
             [
+                Path("models/hailo/yolo26n.hef"),
+                Path("/mnt/didier_ssd/didier/models/hailo/yolo26n.hef"),
                 Path("models/hailo/yolov8s_hailo8l.hef"),
                 Path("/mnt/didier_ssd/didier/models/hailo/yolov8s_hailo8l.hef"),
                 Path("models/hailo/hailo_model.hef"),
@@ -178,7 +194,7 @@ class HailoDetector:
             return
 
         if self._model_path is None:
-            reason = "hef_not_found(yolov8s_hailo8l.hef)"
+            reason = "hef_not_found(yolo26n.hef)"
             _state_update(
                 vision_enabled=False,
                 vision_reason=reason,
@@ -351,6 +367,10 @@ class HailoDetector:
             return None
 
     def _normalize_and_filter(self, raw: Any, frame: Any | None = None) -> list[dict[str, Any]]:
+        direct = self._decode_yolo26_outputs(raw, frame)
+        if direct is not None:
+            return direct
+
         items: list[Any]
         if isinstance(raw, dict):
             maybe = raw.get("detections")
@@ -403,6 +423,294 @@ class HailoDetector:
                 continue
             filtered.append(det)
         return filtered
+
+    def _decode_yolo26_outputs(
+        self,
+        raw: Any,
+        frame: Any | None,
+    ) -> list[dict[str, Any]] | None:
+        if frame is None:
+            return None
+        if isinstance(raw, dict) and isinstance(raw.get("detections"), list):
+            return None
+        if isinstance(raw, (list, tuple)) and raw and isinstance(raw[0], dict):
+            return None
+
+        structured = self._decode_yolo26_structured(raw, frame)
+        if structured is not None:
+            return structured
+
+        rows = self._coerce_yolo26_rows(raw)
+        if rows is None:
+            return None
+        return self._yolo26_rows_to_detections(rows, frame)
+
+    def _decode_yolo26_structured(
+        self,
+        raw: Any,
+        frame: Any,
+    ) -> list[dict[str, Any]] | None:
+        if not isinstance(raw, dict):
+            return None
+
+        boxes = raw.get("boxes")
+        if boxes is None:
+            boxes = raw.get("bboxes")
+        if boxes is None:
+            boxes = raw.get("bbox")
+        scores = raw.get("scores")
+        if scores is None:
+            scores = raw.get("confidences")
+        if scores is None:
+            scores = raw.get("confidence")
+        classes = raw.get("classes")
+        if classes is None:
+            classes = raw.get("class_ids")
+        labels = raw.get("labels")
+
+        if boxes is None or scores is None:
+            return None
+
+        try:
+            boxes_arr = np.asarray(boxes)
+            scores_arr = np.asarray(scores).reshape(-1)
+            classes_arr = None if classes is None else np.asarray(classes).reshape(-1)
+            labels_arr = None if labels is None else np.asarray(labels).reshape(-1)
+        except Exception:
+            return None
+
+        while boxes_arr.ndim > 2 and boxes_arr.shape[0] == 1:
+            boxes_arr = boxes_arr[0]
+        if boxes_arr.ndim != 2 or boxes_arr.shape[1] < 4:
+            return None
+
+        count = min(int(boxes_arr.shape[0]), int(scores_arr.size))
+        if classes_arr is not None:
+            count = min(count, int(classes_arr.size))
+        if labels_arr is not None:
+            count = min(count, int(labels_arr.size))
+        if count <= 0:
+            return []
+
+        filtered: list[dict[str, Any]] = []
+        refined = 0
+        for idx in range(count):
+            try:
+                score = float(scores_arr[idx])
+            except Exception:
+                continue
+            if score <= self._threshold:
+                continue
+
+            bbox = self._decode_yolo26_bbox(boxes_arr[idx], frame)
+            if bbox is None:
+                continue
+
+            class_id = None
+            if classes_arr is not None:
+                try:
+                    class_id = int(round(float(classes_arr[idx])))
+                except Exception:
+                    class_id = None
+
+            label = None
+            if labels_arr is not None:
+                label = str(labels_arr[idx]).strip() or None
+
+            det = self._build_detection_entry(
+                label=label,
+                class_id=class_id,
+                score=score,
+                bbox=bbox,
+                frame=frame,
+                refined_count=refined,
+            )
+            if det is None:
+                continue
+            if bool(det.pop("_refined_poly", False)):
+                refined += 1
+            filtered.append(det)
+        return filtered
+
+    def _coerce_yolo26_rows(self, raw: Any) -> np.ndarray | None:
+        candidate: Any = None
+        if isinstance(raw, np.ndarray):
+            candidate = raw
+        elif isinstance(raw, dict):
+            for value in raw.values():
+                if isinstance(value, np.ndarray):
+                    candidate = value
+                    break
+        elif isinstance(raw, (list, tuple)):
+            for value in raw:
+                if isinstance(value, np.ndarray):
+                    candidate = value
+                    break
+            if candidate is None and raw and all(
+                isinstance(value, (list, tuple, float, int, np.floating, np.integer))
+                for value in raw
+            ):
+                candidate = np.asarray(raw)
+
+        if candidate is None:
+            return None
+
+        try:
+            rows = np.asarray(candidate)
+        except Exception:
+            return None
+
+        while rows.ndim > 2 and rows.shape[0] == 1:
+            rows = rows[0]
+        if rows.ndim == 1 and rows.size >= 5:
+            rows = rows.reshape(1, -1)
+        if rows.ndim != 2:
+            return None
+        if rows.shape[0] in (5, 6, 7, 8) and rows.shape[1] > rows.shape[0]:
+            rows = rows.T
+        if rows.shape[1] < 5:
+            return None
+        return rows
+
+    def _yolo26_rows_to_detections(self, rows: np.ndarray, frame: Any) -> list[dict[str, Any]]:
+        filtered: list[dict[str, Any]] = []
+        refined = 0
+        for row in rows:
+            try:
+                values = np.asarray(row, dtype=np.float32).reshape(-1)
+            except Exception:
+                continue
+            if values.size < 5:
+                continue
+
+            class_id: int | None = None
+            score = 0.0
+            if values.size >= 6 and self._looks_like_direct_yolo26_row(values):
+                score = float(values[4])
+                try:
+                    class_id = int(round(float(values[5])))
+                except Exception:
+                    class_id = None
+            else:
+                class_scores = values[4:]
+                if class_scores.size <= 0:
+                    continue
+                class_id = int(np.argmax(class_scores))
+                score = float(class_scores[class_id])
+
+            if score <= self._threshold:
+                continue
+
+            bbox = self._decode_yolo26_bbox(values[:4], frame)
+            if bbox is None:
+                continue
+
+            det = self._build_detection_entry(
+                label=None,
+                class_id=class_id,
+                score=score,
+                bbox=bbox,
+                frame=frame,
+                refined_count=refined,
+            )
+            if det is None:
+                continue
+            if bool(det.pop("_refined_poly", False)):
+                refined += 1
+            filtered.append(det)
+        return filtered
+
+    def _looks_like_direct_yolo26_row(self, values: np.ndarray) -> bool:
+        if values.size < 6:
+            return False
+        try:
+            score = float(values[4])
+            class_token = float(values[5])
+        except Exception:
+            return False
+        if not np.isfinite(score) or not (0.0 <= score <= 1.0):
+            return False
+        if not np.isfinite(class_token) or class_token < 0.0:
+            return False
+        return abs(class_token - round(class_token)) <= 1e-3
+
+    def _decode_yolo26_bbox(self, values: Any, frame: Any) -> list[int] | None:
+        try:
+            coords = [float(values[idx]) for idx in range(4)]
+        except Exception:
+            return None
+        if not all(np.isfinite(coord) for coord in coords):
+            return None
+
+        frame_h, frame_w = frame.shape[:2]
+        if frame_w <= 0 or frame_h <= 0:
+            return None
+
+        x1_raw, y1_raw, x2_raw, y2_raw = coords
+        if x2_raw > x1_raw and y2_raw > y1_raw:
+            x1, y1, x2, y2 = x1_raw, y1_raw, x2_raw, y2_raw
+        else:
+            cx, cy, w_raw, h_raw = coords
+            if w_raw <= 0.0 or h_raw <= 0.0:
+                return None
+            x1 = cx - (w_raw / 2.0)
+            y1 = cy - (h_raw / 2.0)
+            x2 = cx + (w_raw / 2.0)
+            y2 = cy + (h_raw / 2.0)
+
+        scale_x = 1.0
+        scale_y = 1.0
+        coord_max = max(abs(x1), abs(y1), abs(x2), abs(y2))
+        if coord_max <= 1.5:
+            scale_x = float(frame_w)
+            scale_y = float(frame_h)
+        elif (
+            max(abs(x1), abs(x2)) <= float(self._model_input_width) + 1.0
+            and max(abs(y1), abs(y2)) <= float(self._model_input_height) + 1.0
+        ):
+            scale_x = float(frame_w) / float(max(1, self._model_input_width))
+            scale_y = float(frame_h) / float(max(1, self._model_input_height))
+
+        x1_i = int(round(max(0.0, min(float(frame_w), x1 * scale_x))))
+        y1_i = int(round(max(0.0, min(float(frame_h), y1 * scale_y))))
+        x2_i = int(round(max(0.0, min(float(frame_w), x2 * scale_x))))
+        y2_i = int(round(max(0.0, min(float(frame_h), y2 * scale_y))))
+        if x2_i <= x1_i or y2_i <= y1_i:
+            return None
+        return [x1_i, y1_i, x2_i - x1_i, y2_i - y1_i]
+
+    def _build_detection_entry(
+        self,
+        *,
+        label: str | None,
+        class_id: int | None,
+        score: float,
+        bbox: list[int],
+        frame: Any | None,
+        refined_count: int,
+    ) -> dict[str, Any] | None:
+        det: dict[str, Any] = {
+            "label": str(label or (f"class_{class_id}" if class_id is not None else "object")),
+            "score": round(float(score), 4),
+            "confidence": round(float(score), 4),
+            "bbox": list(bbox),
+            "class_id": class_id,
+        }
+        refined = False
+        if (
+            frame is not None
+            and self._polygon_refine
+            and refined_count < self._polygon_refine_max
+        ):
+            refined = bool(self._refine_polygon(frame, det))
+        self._ensure_polygon(det)
+        if isinstance(det.get("poly"), list) and len(det.get("poly", [])) >= 3:
+            det["shape"] = self._shape_from_polygon(det["poly"])
+        if refined:
+            det["_refined_poly"] = True
+        if not det.get("bbox") and not det.get("poly"):
+            return None
+        return det
 
     def _normalize_polygon(self, poly: list[Any]) -> list[list[int]]:
         normalized: list[list[int]] = []
